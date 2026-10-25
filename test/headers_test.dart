@@ -78,6 +78,15 @@ void main() {
     h.set('x-id', 'a\tb ~!');
     expect(h.value('x-id'), 'a\tb ~!');
   });
+
+  test('a bad value keeps the old header', () {
+    NativeHeaders h = NativeHeaders.response(NativeHeaders.empty());
+    h.set('x-id', 'old');
+    expect(() => h.set('x-id', 'a\nb'), throwsFormatException);
+    expect(() => h.set('x-id', <String>['ok', 'a\nb']), throwsFormatException);
+    expect(() => h.add('x-id', <String>['ok', 'a\nb']), throwsFormatException);
+    expect(h['x-id'], <String>['old']);
+  });
 }
 
 /// the header block like Rust writes it

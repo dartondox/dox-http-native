@@ -72,7 +72,7 @@
 //! - One send to the client may take [SEND_WAIT], a close frame plus the
 //!   wait for the answer [CLOSE_WAIT]. Then the socket is dropped (1006).
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdListener};
@@ -144,6 +144,8 @@ const MIN_QUEUE: usize = 1 << 20;
 /// Client message bytes Dart may have unacknowledged before Rust stops
 /// reading WebSocket frames, for all sockets of the server together.
 const WS_UNACKED: usize = 8 << 20;
+/// Most answer bytes held back for one write, see [Ahead::hold].
+const HOLD_MAX: usize = 64 * 1024;
 
 // ---- Dart API DL -------------------------------------------------------
 // `NativeApi.initializeApiDLData` points to this table. We only need
@@ -595,11 +597,47 @@ fn unbind(key: Key) {
 /// it, unread bytes from the client would make the OS send a reset, and the
 /// client could lose our last answer (eg. 431 or 413). So first close our
 /// side, then read and drop what is left for up to one second.
-struct Lingering(Option<TcpStream>, Arc<Server>);
+///
+/// It also shows each read to [Ahead], and holds back answers while the
+/// next pipelined answer is ready, so they go out in one write.
+struct Lingering {
+    io: Option<TcpStream>,
+    ahead: Local,
+    /// answers held back, see [Ahead::hold]
+    out: Vec<u8>,
+}
+
+/// The [Ahead] of a [Lingering]. hyper wants the stream to be `Send`
+/// because of upgrades (`Upgraded` is a `Box<dyn Io + Send>`).
+struct Local(Rc<Ahead>);
+
+// SAFETY: all of a server runs on its own thread: a `current_thread`
+// runtime with a `LocalSet`, every task is `spawn_local`. The stream (and
+// after an upgrade the WebSocket task that owns it) never leaves that
+// thread, so the `Rc` is never used or dropped on another thread.
+unsafe impl Send for Local {}
 
 impl Lingering {
-    fn io(self: Pin<&mut Self>) -> Pin<&mut TcpStream> {
-        Pin::new(self.get_mut().0.as_mut().expect("stream"))
+    fn io(&mut self) -> Pin<&mut TcpStream> {
+        Pin::new(self.io.as_mut().expect("stream"))
+    }
+
+    /// Writes the held answers.
+    fn poll_out(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        while !self.out.is_empty() {
+            let out = std::mem::take(&mut self.out);
+            let sent = self.io().poll_write(cx, &out);
+            self.out = out;
+            let n = std::task::ready!(sent)?;
+            if n == 0 {
+                return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
+            }
+            self.out.drain(..n);
+        }
+        if self.out.capacity() > 2 * HOLD_MAX {
+            self.out = Vec::new(); // do not keep a big buffer forever
+        }
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -609,7 +647,13 @@ impl AsyncRead for Lingering {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        self.io().poll_read(cx, buf)
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let r = this.io().poll_read(cx, buf);
+        if buf.filled().len() > before {
+            this.ahead.0.scan(&buf.filled()[before..]);
+        }
+        r
     }
 }
 
@@ -619,7 +663,13 @@ impl AsyncWrite for Lingering {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        self.io().poll_write(cx, buf)
+        let this = self.get_mut();
+        if this.out.is_empty() && !this.ahead.0.hold(0) {
+            return this.io().poll_write(cx, buf);
+        }
+        // poll_flush sends it
+        this.out.extend_from_slice(buf);
+        Poll::Ready(Ok(buf.len()))
     }
 
     fn poll_write_vectored(
@@ -627,7 +677,16 @@ impl AsyncWrite for Lingering {
         cx: &mut Context<'_>,
         bufs: &[std::io::IoSlice<'_>],
     ) -> Poll<std::io::Result<usize>> {
-        self.io().poll_write_vectored(cx, bufs)
+        let this = self.get_mut();
+        if this.out.is_empty() && !this.ahead.0.hold(0) {
+            return this.io().poll_write_vectored(cx, bufs);
+        }
+        let mut n = 0;
+        for b in bufs {
+            this.out.extend_from_slice(b);
+            n += b.len();
+        }
+        Poll::Ready(Ok(n))
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -635,24 +694,35 @@ impl AsyncWrite for Lingering {
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        self.io().poll_flush(cx)
+        let this = self.get_mut();
+        if !this.out.is_empty() {
+            if this.ahead.0.hold(this.out.len()) {
+                return Poll::Ready(Ok(())); // the next answer adds to it
+            }
+            std::task::ready!(this.poll_out(cx))?;
+        }
+        this.io().poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        self.io().poll_shutdown(cx)
+        let this = self.get_mut();
+        std::task::ready!(this.poll_out(cx))?;
+        this.io().poll_shutdown(cx)
     }
 }
 
 impl Drop for Lingering {
     fn drop(&mut self) {
-        let Some(mut stream) = self.0.take() else {
+        let Some(mut stream) = self.io.take() else {
             return;
         };
-        if self.1.stopped.load(Ordering::Acquire) {
+        if self.ahead.0.ctx.server.stopped.load(Ordering::Acquire) {
             return; // the server stops: close at once
         }
+        let out = std::mem::take(&mut self.out);
         tokio::task::spawn_local(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let _ = tokio::time::timeout(Duration::from_secs(1), stream.write_all(&out)).await;
             let _ = stream.shutdown().await;
             let mut buf = [0u8; 4096];
             let drain = async {
@@ -666,6 +736,204 @@ impl Drop for Lingering {
             };
             let _ = tokio::time::timeout(Duration::from_secs(1), drain).await;
         });
+    }
+}
+
+/// A pipelined request that went to Dart before hyper asked for it.
+struct Early {
+    method: Method,
+    target: String,
+    headers: hyper::HeaderMap,
+    rx: oneshot::Receiver<Reply>,
+    /// the answer, once [Ahead::hold] took it from `rx`
+    ready: Option<Reply>,
+}
+
+impl Early {
+    async fn answer(self) -> Result<Reply, oneshot::error::RecvError> {
+        match self.ready {
+            Some(r) => Ok(r),
+            None => self.rx.await,
+        }
+    }
+}
+
+/// Reads pipelined requests ahead, for one connection.
+///
+/// hyper serves one request of a connection at a time: it reads the next
+/// one only after the answer to the last one is written. So 16 pipelined
+/// requests would need 16 trips to Dart, one after the other. Here we
+/// parse what the client sent (httparse, like hyper) as hyper reads it.
+/// Each complete GET or HEAD request without a body goes to Dart at once,
+/// in the same batch. When hyper later asks for that request, `handle`
+/// takes its answer from here. It checks that method, target and headers
+/// are the same, so a request never gets the answer of another one.
+///
+/// A request with a body or another method is not sent early, but read
+/// ahead stays in step (it skips `Content-Length` bytes). A chunked body,
+/// an upgrade, `Connection: close`, HTTP/1.0 or a parse error stops read
+/// ahead for the rest of the connection: hyper then does it alone.
+struct Ahead {
+    ctx: Rc<Ctx>,
+    peer: [u8; 18],
+    /// the start of a request head that is not complete yet
+    carry: RefCell<Vec<u8>>,
+    /// body bytes of the last request still to come
+    skip: Cell<usize>,
+    /// read ahead stopped for this connection
+    lost: Cell<bool>,
+    /// one entry per request read and not given to `handle` yet, in
+    /// order. None: `handle` sends that one to Dart itself.
+    queue: RefCell<VecDeque<Option<Early>>>,
+    /// the answer hyper writes now is a streamed body
+    streaming: Cell<bool>,
+}
+
+impl Ahead {
+    fn new(ctx: Rc<Ctx>, peer: [u8; 18]) -> Self {
+        Ahead {
+            ctx,
+            peer,
+            carry: RefCell::new(Vec::new()),
+            skip: Cell::new(0),
+            lost: Cell::new(false),
+            queue: RefCell::new(VecDeque::new()),
+            streaming: Cell::new(false),
+        }
+    }
+
+    /// Reads the requests in bytes that hyper just read.
+    fn scan(&self, new: &[u8]) {
+        if self.lost.get() {
+            return;
+        }
+        let mut carry = self.carry.take();
+        let data: &[u8] = if carry.is_empty() {
+            new
+        } else {
+            carry.extend_from_slice(new);
+            &carry
+        };
+        let mut at = 0;
+        loop {
+            let skip = self.skip.get().min(data.len() - at);
+            at += skip;
+            self.skip.set(self.skip.get() - skip);
+            if at == data.len() {
+                return;
+            }
+            let mut headers = [httparse::EMPTY_HEADER; 100];
+            let mut req = httparse::Request::new(&mut headers);
+            match req.parse(&data[at..]) {
+                Ok(httparse::Status::Complete(n)) if n <= MAX_HEAD => {
+                    at += n;
+                    // the only request, and hyper is not busy: hyper sends
+                    // it now anyway. No need for the extra work.
+                    let alone = at == data.len() && self.queue.borrow().is_empty();
+                    match self.add(&req, alone) {
+                        Some(body) => self.skip.set(body),
+                        None => break,
+                    }
+                }
+                Ok(httparse::Status::Partial) if data.len() - at <= MAX_HEAD => {
+                    *self.carry.borrow_mut() = data[at..].to_vec();
+                    return;
+                }
+                _ => break,
+            }
+        }
+        self.lost.set(true);
+    }
+
+    /// Adds one parsed request to the queue, and sends it to Dart when it
+    /// can go early. Returns its body length, or None: stop read ahead.
+    fn add(&self, req: &httparse::Request, alone: bool) -> Option<usize> {
+        let (Some(method), Some(target), Some(1)) = (req.method, req.path, req.version) else {
+            return None;
+        };
+        let mut early = matches!(method, "GET" | "HEAD") && target.starts_with('/') && !alone;
+        let mut body = 0;
+        for h in req.headers.iter() {
+            let is = |name: &str| h.name.eq_ignore_ascii_case(name);
+            if is("content-length") {
+                body = std::str::from_utf8(h.value).ok()?.trim().parse().ok()?;
+                early = false;
+            } else if is("transfer-encoding") || is("upgrade") {
+                return None;
+            } else if is("connection") {
+                if h.value
+                    .to_ascii_lowercase()
+                    .windows(5)
+                    .any(|w| w == b"close")
+                {
+                    return None;
+                }
+            } else if is("expect") {
+                early = false;
+            }
+        }
+        if !early {
+            self.queue.borrow_mut().push_back(None);
+            return Some(body);
+        }
+        let mut map = hyper::HeaderMap::with_capacity(req.headers.len());
+        for h in req.headers.iter() {
+            let k = HeaderName::from_bytes(h.name.as_bytes()).ok()?;
+            map.append(k, HeaderValue::from_bytes(h.value).ok()?);
+        }
+        let rx = enqueue(&self.ctx, 0, method, target, &map, &self.peer, Vec::new());
+        self.queue.borrow_mut().push_back(Some(Early {
+            method: if method == "GET" {
+                Method::GET
+            } else {
+                Method::HEAD
+            },
+            target: target.to_owned(),
+            headers: map,
+            rx,
+            ready: None,
+        }));
+        Some(0)
+    }
+
+    /// The early answer of the request that hyper asks for now, if it went
+    /// to Dart early.
+    fn take<B>(&self, req: &Request<B>) -> Option<Early> {
+        let mut queue = self.queue.borrow_mut();
+        let e = queue.pop_front().flatten()?;
+        let target = req.uri().path_and_query().map(|p| p.as_str());
+        if e.method == req.method()
+            && req.version() == Version::HTTP_11
+            && target == Some(e.target.as_str())
+            && e.headers == *req.headers()
+        {
+            return Some(e);
+        }
+        // out of step: drop what was read ahead, hyper goes on alone
+        queue.clear();
+        self.lost.set(true);
+        None
+    }
+
+    /// true: keep the answer that hyper writes now (`held` bytes so far),
+    /// because the answer of the next request is ready too. hyper writes
+    /// that one right after, in the same turn, and both go out in one
+    /// write. Only for plain answers, never over [HOLD_MAX].
+    fn hold(&self, held: usize) -> bool {
+        if held >= HOLD_MAX || self.streaming.get() {
+            return false;
+        }
+        let mut queue = self.queue.borrow_mut();
+        let Some(Some(e)) = queue.front_mut() else {
+            return false;
+        };
+        if e.ready.is_none()
+            && let Ok(r) = e.rx.try_recv()
+        {
+            e.ready = Some(r);
+        }
+        matches!(&e.ready, Some((a, None))
+            if matches!(a.body(), Payload::Full(_)) && a.extensions().get::<Gzip>().is_none())
     }
 }
 
@@ -758,20 +1026,24 @@ async fn connection(stream: TcpStream, peer: [u8; 18], ctx: Rc<Ctx>) {
     let watch = ctx.clone();
     let closing = watch.closing.notified();
     let shut_down = ctx.server.draining.load(Ordering::Acquire);
-    let ctx2 = ctx.clone();
-    let svc = service_fn(move |req| handle(req, ctx2.clone(), peer));
+    let ahead = Rc::new(Ahead::new(ctx.clone(), peer));
+    let io = Lingering {
+        io: Some(stream),
+        ahead: Local(ahead.clone()),
+        out: Vec::new(),
+    };
+    let svc = service_fn(move |req| handle(req, ahead.clone()));
     // hyper answers 400 for a bad request and 431 when the
     // head is bigger than MAX_HEAD, then closes the connection.
-    // Do not turn on pipeline_flush: then hyper drops that answer.
+    // Do not turn on pipeline_flush: then hyper drops that answer, and an
+    // answer waits while the next request is busy in Dart. Lingering holds
+    // answers back itself, only while the next answer is ready.
     let conn = http1::Builder::new()
         .timer(TokioTimer::new())
         .keep_alive(true)
         .half_close(true)
         .max_buf_size(MAX_HEAD)
-        .serve_connection(
-            TokioIo::new(Lingering(Some(stream), ctx.server.clone())),
-            svc,
-        )
+        .serve_connection(TokioIo::new(io), svc)
         .with_upgrades();
     let mut conn = std::pin::pin!(conn);
     if !shut_down {
@@ -872,57 +1144,26 @@ fn leave_shared() {
     }
 }
 
-async fn handle(
-    mut req: Request<Incoming>,
-    ctx: Rc<Ctx>,
-    peer: [u8; 18],
-) -> Result<Answer, Infallible> {
-    let ws_key = ws_key(&req);
-    let on_upgrade = ws_key.is_some().then(|| hyper::upgrade::on(&mut req));
-    let (parts, body) = req.into_parts();
-    let max = ctx.limits.max_for(&parts.headers);
-    let declared = parts
-        .headers
-        .get(CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
-    let waits = parts
-        .headers
-        .get(EXPECT)
-        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"100-continue"));
-    if waits && declared.is_some_and(|n| n > max as u64) {
-        // too big, and the client waits for our go before it sends the
-        // body: say no at once. Any other client is already sending, so
-        // read_body drops its bytes first. Else it sees a reset, not 413.
-        return Ok(simple(StatusCode::PAYLOAD_TOO_LARGE));
-    }
-    let body = if body.is_end_stream() {
-        Vec::new()
-    } else {
-        let hint = declared.unwrap_or(0).min(MAX_RESERVE) as usize;
-        match read_body(body, max, hint, ctx.limits.timeout).await {
-            Ok(b) => b,
-            Err(code) => return Ok(simple(code)),
+async fn handle(mut req: Request<Incoming>, ahead: Rc<Ahead>) -> Result<Answer, Infallible> {
+    let ctx = &ahead.ctx;
+    let got = match ahead.take(&req) {
+        // it went to Dart early (pipelined), see [Ahead]
+        Some(early) => early.answer().await.map(|reply| (reply, None, None)),
+        None => {
+            let ws_key = ws_key(&req);
+            let on_upgrade = ws_key.is_some().then(|| hyper::upgrade::on(&mut req));
+            match send(req, ws_key.is_some(), ctx, &ahead.peer).await {
+                Ok(rx) => rx.await.map(|reply| (reply, ws_key, on_upgrade)),
+                Err(code) => return Ok(simple(code)),
+            }
         }
     };
-    let target = parts
-        .uri
-        .path_and_query()
-        .map(|p| p.as_str())
-        .unwrap_or("/");
-    let flags = u32::from(parts.version == Version::HTTP_10) | (u32::from(ws_key.is_some()) << 1);
-    let rx = enqueue(
-        &ctx,
-        flags,
-        parts.method.as_str(),
-        target,
-        &parts.headers,
-        &peer,
-        body,
-    );
-    let Ok((mut answer, accepted)) = rx.await else {
+    let Ok(((mut answer, accepted), ws_key, on_upgrade)) = got else {
         return Ok(simple(StatusCode::SERVICE_UNAVAILABLE));
     };
+    ahead
+        .streaming
+        .set(matches!(answer.body(), Payload::Stream(_)));
     if answer.extensions_mut().remove::<Gzip>().is_some()
         && let Payload::Full(Some(raw)) = answer.body_mut()
     {
@@ -939,7 +1180,7 @@ async fn handle(
     let (Some(key), Some(on_upgrade)) = (ws_key, on_upgrade) else {
         // Dart accepted a request that can not upgrade
         ctx.sockets.borrow_mut().remove(&accepted.id);
-        enqueue_ws(&ctx, accepted.id, WS_CLOSED, 1006, b"");
+        enqueue_ws(ctx, accepted.id, WS_CLOSED, 1006, b"");
         return Ok(simple(StatusCode::BAD_REQUEST));
     };
     *answer.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
@@ -953,6 +1194,54 @@ async fn handle(
     while tasks.try_join_next().is_some() {} // forget closed ones
     tasks.spawn_local(websocket(on_upgrade, accepted, ctx.clone()));
     Ok(answer)
+}
+
+/// Reads the body of a request and adds it to the batch. Returns where
+/// the answer will arrive, or the status of an answer Rust gives itself.
+async fn send(
+    req: Request<Incoming>,
+    upgrade: bool,
+    ctx: &Ctx,
+    peer: &[u8; 18],
+) -> Result<oneshot::Receiver<Reply>, StatusCode> {
+    let (parts, body) = req.into_parts();
+    let max = ctx.limits.max_for(&parts.headers);
+    let declared = parts
+        .headers
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    let waits = parts
+        .headers
+        .get(EXPECT)
+        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"100-continue"));
+    if waits && declared.is_some_and(|n| n > max as u64) {
+        // too big, and the client waits for our go before it sends the
+        // body: say no at once. Any other client is already sending, so
+        // read_body drops its bytes first. Else it sees a reset, not 413.
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    let body = if body.is_end_stream() {
+        Vec::new()
+    } else {
+        let hint = declared.unwrap_or(0).min(MAX_RESERVE) as usize;
+        read_body(body, max, hint, ctx.limits.timeout).await?
+    };
+    let target = parts
+        .uri
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/");
+    let flags = u32::from(parts.version == Version::HTTP_10) | (u32::from(upgrade) << 1);
+    Ok(enqueue(
+        ctx,
+        flags,
+        parts.method.as_str(),
+        target,
+        &parts.headers,
+        peer,
+        body,
+    ))
 }
 
 /// The `Sec-WebSocket-Key` of a request that can upgrade to a WebSocket.

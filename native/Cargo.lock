@@ -104,6 +104,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "http-body-util",
+ "httparse",
  "hyper",
  "hyper-util",
  "slab",
