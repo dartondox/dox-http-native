@@ -20,11 +20,11 @@ import 'package:code_assets/code_assets.dart';
 import 'package:crypto/crypto.dart';
 import 'package:hooks/hooks.dart';
 
-const String _releases = 'https://github.com/dartondox/dox/releases/download';
+const String _releases = 'https://github.com/dartondox/dox-http-native/releases/download';
 
-/// sha256 of each release asset. Fill it from `SHA256SUMS` of the release
-/// (see .github/workflows/native.yaml) before publishing to pub.dev:
-/// `dart run bin/native_hashes.dart dox_http_native-v<version>`
+/// sha256 of each release asset. The release workflow
+/// (.github/workflows/ci.yaml) fills it from `SHA256SUMS` of the release:
+/// `dart run tool/native_hashes.dart v<version>`
 const Map<String, String> _sha256 = <String, String>{
   'dox_http_native-linux-arm64.so':
       'a101ed384aa236e54e430f0bf0c4375c79ab30210ac186404eca2df52a72b0fc',
@@ -120,7 +120,7 @@ Future<Uri?> _download(
     ..connectionTimeout = const Duration(seconds: 30);
   try {
     HttpClientRequest req = await client.getUrl(
-      Uri.parse('$_releases/dox_http_native-v$version/$asset'),
+      Uri.parse('$_releases/v$version/$asset'),
     );
     HttpClientResponse res = await req.close();
     if (res.statusCode != 200) {

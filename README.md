@@ -3,10 +3,10 @@
 Native HTTP/1.1 server for Dart. It is the default HTTP server of Dox.
 
 [![pub package](https://img.shields.io/pub/v/dox_http_native.svg)](https://pub.dev/packages/dox_http_native)
-[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/dartondox/dox/blob/develop/LICENSE)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/dartondox/dox-http-native/blob/main/LICENSE)
 
 Part of [Dox](https://dartondox.dev), a web backend framework for Dart, like Laravel.
-Source code: [github.com/dartondox/dox](https://github.com/dartondox/dox).
+Source code: [github.com/dartondox/dox-http-native](https://github.com/dartondox/dox-http-native).
 
 ## Install
 
@@ -105,4 +105,4 @@ How it works:
 
 ## License
 
-MIT. See [LICENSE](https://github.com/dartondox/dox/blob/develop/LICENSE).
+MIT. See [LICENSE](https://github.com/dartondox/dox-http-native/blob/main/LICENSE).

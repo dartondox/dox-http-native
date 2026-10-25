@@ -1,4 +1,6 @@
-## Unreleased
+## 3.0.0-alpha.7
+
+- The package moved to its own repository: https://github.com/dartondox/dox-http-native. The ready-built libraries are on its releases (tag `v<version>`).
 
 - New: a streamed response (`addStream`, eg. a file or a download) over 64 KB goes out in parts. Before, the whole body was kept in memory until `close()`, and the client got nothing until then. Now the client gets the first bytes early, and at most 1 MB waits in Rust. Dart reads more only when the client has read what was sent. When the client leaves, `addStream` stops reading the source. A small response still goes out in one piece. A streamed response with `contentLength` set sends `Content-Length`, else it is chunked.
 - Perf: a request body of 64 KB or more goes to Dart without a copy (external typed data). Before, it was copied 3 times.
