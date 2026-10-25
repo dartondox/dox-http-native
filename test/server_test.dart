@@ -53,6 +53,8 @@ void handle(HttpRequest req) async {
               .join(),
         }),
       );
+    case String path when path.startsWith('/n/'):
+      res.write(path.substring(3));
     case '/bad-cookie':
       res.cookies.add(Cookie('a', 'b')..domain = 'x\r\nset-cookie: c=d');
       try {
@@ -195,6 +197,36 @@ void main() {
       RegExp(r'HTTP/1.1 (\d+)').allMatches(out).map((Match m) => m[1]),
       <String>['200', '404', '200'],
     );
+  });
+
+  test('16 pipelined requests in one write: 16 answers in order', () async {
+    // 3 is slow (Dart answers it last), 9 has a body: the order must hold
+    String request(int i) => switch (i) {
+      3 => 'GET /slow HTTP/1.1\r\nHost: a\r\n\r\n',
+      9 => 'POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 4\r\n\r\nbody',
+      15 => 'GET /n/15 HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n',
+      _ => 'GET /n/$i HTTP/1.1\r\nHost: a\r\n\r\n',
+    };
+    String out = await raw(
+      port,
+      <String>[for (int i = 0; i < 16; i++) request(i)].join(),
+    );
+    List<String> bodies = <String>[];
+    int at = 0;
+    while (true) {
+      int head = out.indexOf('\r\n\r\n', at);
+      if (head < 0) break;
+      String length = RegExp(
+        r'content-length: (\d+)',
+        caseSensitive: false,
+      ).firstMatch(out.substring(at, head))![1]!;
+      at = head + 4 + int.parse(length);
+      bodies.add(out.substring(head + 4, at));
+    }
+    expect(bodies, <String>[
+      for (int i = 0; i < 16; i++)
+        i == 3 ? 'slow done' : (i == 9 ? 'body' : '$i'),
+    ]);
   });
 
   test('400 for garbage', () async {

@@ -182,14 +182,17 @@ class NativeHeaders implements HttpHeaders {
   void add(String name, Object value, {bool preserveHeaderCase = false}) {
     name = _checkName(name.toLowerCase());
     if (_special(name, value)) return;
-    Map<String, List<String>> map = _own();
+    // check all values first: a bad one changes nothing
+    List<String> values = _values(value);
+    (_own()[name] ??= <String>[]).addAll(values);
+  }
+
+  /// the checked text of a value or of each value of a list
+  static List<String> _values(Object value) {
     if (value is Iterable<Object?>) {
-      for (Object? v in value) {
-        (map[name] ??= <String>[]).add(checkHeaderValue(_text(v)));
-      }
-    } else {
-      (map[name] ??= <String>[]).add(checkHeaderValue(_text(value)));
+      return <String>[for (Object? v in value) checkHeaderValue(_text(v))];
     }
+    return <String>[checkHeaderValue(_text(value))];
   }
 
   /// a name must be a token, like dart:io. Rust reads the record up to `:`.
@@ -209,10 +212,11 @@ class NativeHeaders implements HttpHeaders {
 
   @override
   void set(String name, Object value, {bool preserveHeaderCase = false}) {
-    name = name.toLowerCase();
+    name = _checkName(name.toLowerCase());
     if (_special(name, value)) return;
-    _own().remove(name);
-    add(name, value);
+    // check first, so a bad value keeps the old one
+    List<String> values = _values(value);
+    _own()[name] = values;
   }
 
   /// content-length is kept as a number, like dart:io.

@@ -1,3 +1,8 @@
+## 3.0.0-alpha.8
+
+- Perf: pipelined requests are faster. Before, hyper served the requests of one connection one at a time. So 16 pipelined requests needed 16 trips to Dart, one after the other, and 16 writes. Now Rust reads the pipelined GET and HEAD requests ahead and sends them to Dart in the same batch. The answers still go out in order, and the ones that are ready go out in one write. A request with a body, a chunked body, an upgrade or `Connection: close` stops the read ahead, and hyper serves the rest alone like before.
+- Fix: `headers.set()` and `headers.add()` with a bad value (eg. a line break) threw, but `set()` had already removed the old value. Now all values are checked first, so a bad value leaves the headers unchanged.
+
 ## 3.0.0-alpha.7
 
 - The package moved to its own repository: https://github.com/dartondox/dox-http-native. The ready-built libraries are on its releases (tag `v<version>`).
