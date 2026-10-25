@@ -28,15 +28,15 @@ const String _releases =
 /// `dart run tool/native_hashes.dart v<version>`
 const Map<String, String> _sha256 = <String, String>{
   'dox_http_native-linux-arm64.so':
-      'e511efba567c3b4b8e35e637b3d169e27364fa7d11a66b679d566e47dffb1996',
+      '92746f0f2f8b60009a534ac3cebf45522141f5566d0b9194c1dc74c86386fba1',
   'dox_http_native-linux-x64.so':
-      '47df209ba42583911945ecd83431a327e3caf6adf2aa41ca225030bfaab10eb7',
+      '3b0ecfb839f7ff2c6d727e0905c8680df813f0aee84a4c192224b92a130099b9',
   'dox_http_native-macos-arm64.dylib':
-      '560101060d6f3b5abb505650277bc9eff0589bbfcc92900d1248baeb750c5a4f',
+      'a5c3399fcedc3f0beffce9ed5709936e3da859727be3b603bec3eca0f41f4d34',
   'dox_http_native-macos-x64.dylib':
-      'fb843a392ba9a9186617927a3f3fc7484bf463f3a93f1ad29637d4fd73c70b66',
+      '4ab754c5e4139fded5607ac6250469a37387da716bf857540fa22f298d4554ba',
   'dox_http_native-windows-x64.dll':
-      '6f51c6247c59e0acc38546b2347870c5b60fbaa9ff30622e21f72e8341c6dee6',
+      '57c34d054251ff1dcaa3a642b0c168850564a70e6153fce836cfde06379e9b17',
 };
 
 void main(List<String> args) async {
