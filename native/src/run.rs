@@ -202,6 +202,7 @@ struct Conn {
     sock: TcpStream,
     peer: [u8; 18],
     /// read bytes: `rpos..rlen` is not parsed yet. All of it is initialized.
+    /// Empty while nothing waits (see `read`).
     rbuf: Vec<u8>,
     rpos: usize,
     rlen: usize,
@@ -286,6 +287,9 @@ struct Limits {
     multipart: usize,
     /// max idle time with no body bytes. Longer gets 408.
     timeout: Duration,
+    /// most open connections (0: no limit). At the limit Rust stops
+    /// accepting until one closes. New clients wait in the listen queue.
+    conns: usize,
 }
 
 /// How to write the head of an answer.
@@ -572,7 +576,8 @@ impl Conn {
         Conn {
             sock,
             peer,
-            rbuf: vec![0; READ_ROOM],
+            // made by the first read: an idle connection holds no buffer
+            rbuf: Vec::new(),
             rpos: 0,
             rlen: 0,
             wbuf: Vec::new(),
@@ -649,7 +654,13 @@ impl Conn {
                         return true;
                     }
                 }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => return true,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    if self.rlen == 0 {
+                        // nothing came: an idle connection holds no buffer
+                        self.rbuf = Vec::new();
+                    }
+                    return true;
+                }
                 Err(e) if e.kind() == ErrorKind::Interrupted => {}
                 Err(_) => return false,
             }
@@ -1493,6 +1504,11 @@ impl Core {
             let Some(listener) = &self.listener else {
                 return;
             };
+            if self.limits.conns > 0 && self.conns.len() >= self.limits.conns {
+                // at the limit: try again soon, like after an accept error
+                self.accept_at = Some(self.now + ACCEPT_RETRY);
+                return;
+            }
             match listener.accept() {
                 Ok((mut sock, addr)) => {
                     let _ = sock.set_nodelay(true);
@@ -2296,11 +2312,12 @@ impl Conn {
 
 /// The limits from Dart's values. A timeout is at most [MAX_TIMEOUT], so
 /// `Instant + timeout` can not overflow.
-fn limits_of(max_body: i64, max_multipart: i64, body_timeout_ms: i64) -> Limits {
+fn limits_of(max_body: i64, max_multipart: i64, body_timeout_ms: i64, max_conns: i64) -> Limits {
     Limits {
         body: max_body.max(0) as usize,
         multipart: max_multipart.max(0) as usize,
         timeout: Duration::from_millis(body_timeout_ms.max(0) as u64).min(MAX_TIMEOUT),
+        conns: max_conns.max(0) as usize,
     }
 }
 
@@ -2416,7 +2433,8 @@ impl Native {
 /// `family`, `addr_hi` and `addr_lo` are the host, see [Key]. Family 0 is
 /// all interfaces. Bodies over `max_body` bytes (`max_multipart` for a
 /// multipart form) get 413. A body with no new bytes for
-/// `body_timeout_ms` gets 408. Returns a handle (> 0), or < 0: -1 not
+/// `body_timeout_ms` gets 408. With `max_conns` > 0 it holds at most that
+/// many connections open. Returns a handle (> 0), or < 0: -1 not
 /// initialized, -2 no poller or thread, -(1000 + errno) when the bind
 /// fails.
 #[unsafe(no_mangle)]
@@ -2429,6 +2447,7 @@ pub extern "C" fn dox_bind(
     family: i32,
     addr_hi: u64,
     addr_lo: u64,
+    max_conns: i64,
 ) -> i64 {
     if POST.get().is_none() {
         return -1;
@@ -2437,7 +2456,7 @@ pub extern "C" fn dox_bind(
         Ok(l) => l,
         Err(e) => return -(1000 + i64::from(e.raw_os_error().unwrap_or(0))),
     };
-    let limits = limits_of(max_body, max_multipart, body_timeout_ms);
+    let limits = limits_of(max_body, max_multipart, body_timeout_ms, max_conns);
     let Ok(core) = Core::new(listener, key, limits) else {
         unbind(key);
         return -2;

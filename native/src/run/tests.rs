@@ -9,6 +9,7 @@ fn limits() -> Limits {
         body: 10,
         multipart: 20,
         timeout: Duration::from_millis(50),
+        conns: 0,
     }
 }
 
@@ -854,7 +855,33 @@ fn raw_bytes_in_the_target_are_escaped() {
 /// A huge body timeout from Dart does not overflow the clock.
 #[test]
 fn huge_body_timeout_is_cut() {
-    let lim = limits_of(1, 1, i64::MAX);
+    let lim = limits_of(1, 1, i64::MAX, 0);
     assert_eq!(lim.timeout, MAX_TIMEOUT);
     let _ = Instant::now() + lim.timeout; // no panic
+}
+
+/// With a connection limit, Rust stops accepting at the limit, and accepts
+/// again when a connection closes. An idle connection holds no read buffer.
+#[test]
+fn connection_limit_and_no_buffer_for_idle_connections() {
+    let (mut core, port) = new_core(Limits {
+        conns: 1,
+        ..limits()
+    });
+    let mut inb = vec![0u8; 1 << 18];
+    let a = connect(port);
+    for _ in 0..20 {
+        core.run(&[], &mut inb, 1000).unwrap();
+    }
+    assert_eq!(core.conns.len(), 1);
+    let (_, c) = core.conns.iter().next().unwrap();
+    assert_eq!(c.rbuf.capacity(), 0, "an idle connection holds a buffer");
+    let mut b = connect(port); // waits in the listen queue
+    b.write_all(b"GET /b HTTP/1.1\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    assert!(collect(&mut core, &mut inb, 1).is_empty(), "over the limit");
+    assert_eq!(core.conns.len(), 1);
+    drop(a);
+    let got = collect(&mut core, &mut inb, 1);
+    assert_eq!(got.first().map(|r| r.target.as_str()), Some("/b"));
 }

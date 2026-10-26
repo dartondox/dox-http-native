@@ -88,7 +88,7 @@ use std::time::Duration;
 use socket2::{Domain, Protocol, Socket, Type};
 
 /// Bump when the FFI functions or the record layout change.
-const ABI_VERSION: i32 = 8;
+const ABI_VERSION: i32 = 9;
 /// Max size of the request line plus headers. Bigger gets 431.
 const MAX_HEAD: usize = 16 * 1024;
 const RES_HEAD: usize = 20;

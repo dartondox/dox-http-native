@@ -505,10 +505,40 @@ void main() {
     expect(res, endsWith('\r\n\r\n%C3%A9'));
   });
 
-  test('a port out of range is refused', () async {
+  test('a port out of range or a bad limit is refused', () async {
     for (int bad in <int>[-1, 65536, 70000]) {
       await expectLater(NativeHttpServer.bind(bad), throwsArgumentError);
     }
+    await expectLater(
+      NativeHttpServer.bind(0, maxConnections: 0),
+      throwsArgumentError,
+    );
+  });
+
+  test('maxConnections: at the limit new clients wait', () async {
+    NativeHttpServer one = await NativeHttpServer.bind(
+      0,
+      address: '127.0.0.1',
+      maxConnections: 1,
+    );
+    one.listen(handle);
+    Socket first = await Socket.connect('127.0.0.1', one.port);
+    first.write('GET / HTTP/1.1\r\n\r\n');
+    await first.first; // its answer: the connection is open
+    // the second waits in the listen queue while the first is open
+    Future<String> second = raw(
+      one.port,
+      'GET /n/two HTTP/1.1\r\nConnection: close\r\n\r\n',
+    );
+    String early = await raw(
+      one.port,
+      'GET /n/three HTTP/1.1\r\nConnection: close\r\n\r\n',
+      wait: const Duration(milliseconds: 300),
+    );
+    expect(early, isEmpty);
+    first.destroy();
+    expect(await second, endsWith('two'));
+    await one.close(force: true);
   });
 
   test('bind to one host only', () async {

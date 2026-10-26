@@ -84,16 +84,27 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   /// so the client sees the 413 and not a reset.
   /// A client that sends no body bytes for [bodyTimeout] (idle time) gets
   /// 408. A slow but steady upload is fine.
+  /// With [maxConnections], this server holds at most that many connections
+  /// open. Then it stops accepting until one closes, and new clients wait
+  /// in the listen queue of the OS. Default: no limit.
   static Future<NativeHttpServer> bind(
     int port, {
     Object? address,
     int maxBodySize = 100 * 1024 * 1024,
     int? maxMultipartSize,
     Duration bodyTimeout = const Duration(seconds: 120),
+    int? maxConnections,
   }) async {
     ensureAvailable();
     if (port < 0 || port > 65535) {
       throw ArgumentError.value(port, 'port', 'must be 0 to 65535');
+    }
+    if (maxConnections != null && maxConnections < 1) {
+      throw ArgumentError.value(
+        maxConnections,
+        'maxConnections',
+        'must be 1 or more',
+      );
     }
     InternetAddress? ip = await _resolve(address);
     List<int> raw = ip?.rawAddress ?? const <int>[];
@@ -124,6 +135,7 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
       family,
       hi,
       lo,
+      maxConnections ?? 0,
     );
     if (handle <= 0) {
       receive.close();
