@@ -26,7 +26,8 @@
 //! uses thread locals.
 //!
 //! The helper also checks every [PROBE] that the isolate is alive (an empty
-//! post). When the post fails, the isolate is gone and the server closes.
+//! post), also while Dart owns the sockets. When the post fails, the
+//! isolate is gone and the server closes: the port is free.
 //!
 //! Request ids: (connection index << 32) | sequence number. The sequence
 //! number comes from one counter per server, so a late answer for a closed
@@ -77,7 +78,7 @@ const LISTENER: Token = Token(0);
 const WAKER: Token = Token(usize::MAX);
 /// Smallest free room in a read buffer before a read.
 const READ_ROOM: usize = 16 * 1024;
-/// How often the idle helper checks that the isolate is alive.
+/// How often the helper checks that the isolate is alive.
 const PROBE: Duration = Duration::from_millis(100);
 /// Most requests of one connection that wait for an answer. Then Rust
 /// stops reading that connection until answers go out.
@@ -2307,14 +2308,35 @@ impl Native {
         core
     }
 
-    /// The idle helper: watches the sockets while Dart is idle.
+    /// The isolate is gone and did not stop the server (eg. an uncaught
+    /// error). Close the sockets: the port is free, and new clients get
+    /// "connection refused" and not a wait.
+    fn gone(&self, mut core: MutexGuard<'_, Core>) {
+        self.stopped.store(true, Ordering::Release);
+        core.stopped = true;
+        core.close_listener();
+        core.conns.clear();
+        core.zip = None; // ends the gzip thread
+    }
+
+    /// The idle helper: watches the sockets while Dart is idle. Also checks
+    /// every [PROBE] that the isolate is alive, idle or not.
     fn helper(&self) {
         let mut probed = Instant::now();
         loop {
             {
                 let mut k = self.kick.lock().unwrap();
                 while !*k && !self.stopped.load(Ordering::Acquire) {
-                    k = self.cv.wait(k).unwrap();
+                    k = self.cv.wait_timeout(k, PROBE).unwrap().0;
+                    if !*k && probed.elapsed() >= PROBE {
+                        // Dart owns the sockets. A dead isolate never
+                        // calls `dox_run` again, so check it here too.
+                        probed = Instant::now();
+                        if !post(self.dart_port, &[]) {
+                            drop(k);
+                            return self.gone(self.core.lock().unwrap());
+                        }
+                    }
                 }
                 *k = false;
             }
@@ -2349,12 +2371,7 @@ impl Native {
                 if probed.elapsed() >= PROBE {
                     probed = Instant::now();
                     if !post(self.dart_port, &[]) {
-                        // the isolate is gone and did not stop the server
-                        self.stopped.store(true, Ordering::Release);
-                        core.stopped = true;
-                        core.close_listener();
-                        core.conns.clear();
-                        return;
+                        return self.gone(core);
                     }
                 }
             }

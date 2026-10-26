@@ -169,6 +169,19 @@ void spawned(List<Object> args) async {
   ready.send(true);
 }
 
+/// A server whose isolate dies on its first request (an uncaught error),
+/// while Dart owns the sockets. Sends its port to [args].
+void dies(SendPort ready) async {
+  NativeHttpServer server = await NativeHttpServer.bind(
+    0,
+    address: '127.0.0.1',
+  );
+  server.listen((HttpRequest req) {
+    scheduleMicrotask(() => throw StateError('the isolate dies'));
+  });
+  ready.send(server.port);
+}
+
 void main() {
   late NativeHttpServer server;
   late int port;
@@ -561,6 +574,35 @@ void main() {
     NativeHttpServer b = await start(p);
     expect(b.port, p);
     await b.close();
+  });
+
+  test('the port of an isolate that died is closed', () async {
+    ReceivePort ready = ReceivePort();
+    ReceivePort exit = ReceivePort();
+    ReceivePort errors = ReceivePort(); // keeps the error out of the output
+    await Isolate.spawn(
+      dies,
+      ready.sendPort,
+      onExit: exit.sendPort,
+      onError: errors.sendPort,
+    );
+    int p = await ready.first as int;
+    Socket socket = await Socket.connect('127.0.0.1', p);
+    socket.write('GET / HTTP/1.1\r\n\r\n');
+    await exit.first;
+    socket.destroy();
+    errors.close();
+    // new clients get "connection refused", not a wait
+    Object? refused;
+    for (int i = 0; i < 40 && refused == null; i++) {
+      try {
+        (await Socket.connect('127.0.0.1', p)).destroy();
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      } on SocketException catch (e) {
+        refused = e;
+      }
+    }
+    expect(refused, isA<SocketException>());
   });
 
   test('many isolates on one port share the connections', () async {
