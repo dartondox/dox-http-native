@@ -107,6 +107,8 @@ const WS_OUT_MAX: usize = 4 * WS_HOLD;
 const MAX_PENDING: usize = 1 << 20;
 /// A write buffer bigger than this is freed once it is empty.
 const BIG_BUF: usize = 1 << 20;
+/// The longest body timeout (a year). Longer is cut to this.
+const MAX_TIMEOUT: Duration = Duration::from_secs(365 * 24 * 3600);
 /// Most headers of one request. More gets 431.
 const MAX_HEADERS: usize = 100;
 
@@ -1056,10 +1058,7 @@ fn parse_one(
         match name.first().map(u8::to_ascii_lowercase) {
             Some(b'c') => {
                 if name.eq_ignore_ascii_case(b"content-length") {
-                    match std::str::from_utf8(h.value)
-                        .ok()
-                        .and_then(|v| v.trim().parse().ok())
-                    {
+                    match parse_len(h.value).and_then(|v| usize::try_from(v).ok()) {
                         Some(v) if clen.is_none_or(|c| c == v) => clen = Some(v),
                         _ => return Step::Fail(400),
                     }
@@ -1104,6 +1103,13 @@ fn parse_one(
     }
     let method = req.method.unwrap_or("").as_bytes();
     let target = req.path.unwrap_or("").as_bytes();
+    let escaped;
+    let target = if target.is_ascii() {
+        target
+    } else {
+        escaped = escape_target(target);
+        &escaped[..]
+    };
     let clen = clen.unwrap_or(0);
     let has_body = chunked || clen > 0;
     let upgrade =
@@ -1178,6 +1184,21 @@ fn parse_one(
     };
     let more = data.len() < head + clen || chunked;
     Step::Body(head, Box::new(body), expect && more)
+}
+
+/// A target with raw bytes over 0x7f (eg. UTF-8 from a client that does
+/// not encode): those bytes as `%XX`. Dart reads the target as ASCII, and
+/// `Uri` decodes `%XX` as UTF-8.
+fn escape_target(target: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(target.len() * 3);
+    for &c in target {
+        if c.is_ascii() {
+            out.push(c);
+        } else {
+            let _ = write!(out, "%{c:02X}");
+        }
+    }
+    out
 }
 
 /// Writes method, target and headers. Returns the bytes written.
@@ -2273,6 +2294,16 @@ impl Conn {
     }
 }
 
+/// The limits from Dart's values. A timeout is at most [MAX_TIMEOUT], so
+/// `Instant + timeout` can not overflow.
+fn limits_of(max_body: i64, max_multipart: i64, body_timeout_ms: i64) -> Limits {
+    Limits {
+        body: max_body.max(0) as usize,
+        multipart: max_multipart.max(0) as usize,
+        timeout: Duration::from_millis(body_timeout_ms.max(0) as u64).min(MAX_TIMEOUT),
+    }
+}
+
 /// One server. Dart holds an `Arc` of it as handle.
 struct Native {
     core: Mutex<Core>,
@@ -2406,11 +2437,7 @@ pub extern "C" fn dox_bind(
         Ok(l) => l,
         Err(e) => return -(1000 + i64::from(e.raw_os_error().unwrap_or(0))),
     };
-    let limits = Limits {
-        body: max_body.max(0) as usize,
-        multipart: max_multipart.max(0) as usize,
-        timeout: Duration::from_millis(body_timeout_ms.max(0) as u64),
-    };
+    let limits = limits_of(max_body, max_multipart, body_timeout_ms);
     let Ok(core) = Core::new(listener, key, limits) else {
         unbind(key);
         return -2;

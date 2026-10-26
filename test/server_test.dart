@@ -496,6 +496,21 @@ void main() {
     expect(out, endsWith('\r\n\r\n'));
   });
 
+  test('a raw UTF-8 path is read as UTF-8', () async {
+    String res = await raw(
+      port,
+      'GET /n/é HTTP/1.1\r\nConnection: close\r\n\r\n',
+    );
+    // uri.path keeps the %XX: é is C3 A9 in UTF-8 (not C3 83 C2 A9)
+    expect(res, endsWith('\r\n\r\n%C3%A9'));
+  });
+
+  test('a port out of range is refused', () async {
+    for (int bad in <int>[-1, 65536, 70000]) {
+      await expectLater(NativeHttpServer.bind(bad), throwsArgumentError);
+    }
+  });
+
   test('bind to one host only', () async {
     NativeHttpServer local = await NativeHttpServer.bind(
       0,

@@ -814,3 +814,47 @@ fn streamed_body_keeps_to_its_content_length() {
     let short = two("/short");
     assert!(short.ends_with("\r\n\r\nabcde"), "{short:?}");
 }
+
+/// `Content-Length` is ASCII digits only. `+5`, a list or other white
+/// space gets 400, so no proxy in front can read another length.
+#[test]
+fn content_length_is_digits_only() {
+    let (port, _) = serve(limits());
+    for cl in [
+        "+5",
+        "5, 5",
+        "5\u{a0}",
+        "0x5",
+        "-5",
+        "",
+        "99999999999999999999999",
+    ] {
+        let req = format!("POST / HTTP/1.1\r\nContent-Length: {cl}\r\n\r\nhello");
+        let r = send(port, req.as_bytes());
+        assert!(r.starts_with("HTTP/1.1 400"), "{cl:?}: {r:?}");
+    }
+    let r = send(
+        port,
+        b"POST /p HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+    );
+    assert!(r.ends_with("/phello"), "the same length twice: {r:?}");
+}
+
+/// A raw UTF-8 byte in the target goes to Dart as `%XX`.
+#[test]
+fn raw_bytes_in_the_target_are_escaped() {
+    let (port, _) = serve(limits());
+    let r = send(
+        port,
+        b"GET /\xc3\xa9?q=\xc3\xa9 HTTP/1.1\r\nConnection: close\r\n\r\n",
+    );
+    assert!(r.ends_with("\r\n\r\n/%C3%A9?q=%C3%A9"), "{r:?}");
+}
+
+/// A huge body timeout from Dart does not overflow the clock.
+#[test]
+fn huge_body_timeout_is_cut() {
+    let lim = limits_of(1, 1, i64::MAX);
+    assert_eq!(lim.timeout, MAX_TIMEOUT);
+    let _ = Instant::now() + lim.timeout; // no panic
+}

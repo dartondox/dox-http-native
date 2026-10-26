@@ -92,6 +92,9 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
     Duration bodyTimeout = const Duration(seconds: 120),
   }) async {
     ensureAvailable();
+    if (port < 0 || port > 65535) {
+      throw ArgumentError.value(port, 'port', 'must be 0 to 65535');
+    }
     InternetAddress? ip = await _resolve(address);
     List<int> raw = ip?.rawAddress ?? const <int>[];
     int family = ip == null ? 0 : (raw.length == 4 ? 4 : 6);
