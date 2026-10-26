@@ -1,3 +1,7 @@
+## Unreleased
+
+- README: streamed bodies (over 64 KB with `addStream`) are supported. The build hook has 4 steps, not 3.
+
 ## 3.0.0-alpha.8
 
 - Perf: pipelined requests are faster. Before, hyper served the requests of one connection one at a time. So 16 pipelined requests needed 16 trips to Dart, one after the other, and 16 writes. Now Rust reads the pipelined GET and HEAD requests ahead and sends them to Dart in the same batch. The answers still go out in order, and the ones that are ready go out in one write. A request with a body, a chunked body, an upgrade or `Connection: close` stops the read ahead, and hyper serves the rest alone like before.
