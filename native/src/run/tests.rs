@@ -77,16 +77,21 @@ fn ans(out: &mut Vec<u8>, id: u64, status: u16, kind: u16, lines: &[u8], body: &
     out.extend_from_slice(body);
 }
 
-/// The test app. `/ws`, `/bye`, `/flood` and `/big` accept a WebSocket
-/// (ws id = request id, max message 8 bytes, `/big` 16 MiB). `/bye` then
+/// The test app. `/ws`, `/bye`, `/flood`, `/big` and `/wide` accept a
+/// WebSocket (ws id = request id, max message 8 bytes, `/big` and `/wide`
+/// 16 MiB). `/bye` then
 /// closes with 4000, `/flood` sends 2 MB at once, `/big` 8 MiB. Messages
 /// are echoed. `/stream` sends "ab", "cde" as a streamed body. `/zip`
 /// gzips. Anything else: the target and the body.
 fn app(r: &Rec, out: &mut Vec<u8>) {
     match r.kind() {
         0 => match r.target.as_str() {
-            t @ ("/ws" | "/bye" | "/flood" | "/big") if r.flags & 2 != 0 => {
-                let max: u64 = if t == "/big" { 16 << 20 } else { 8 };
+            t @ ("/ws" | "/bye" | "/flood" | "/big" | "/wide") if r.flags & 2 != 0 => {
+                let max: u64 = if t == "/big" || t == "/wide" {
+                    16 << 20
+                } else {
+                    8
+                };
                 ans(
                     out,
                     r.id,
@@ -467,6 +472,12 @@ fn ws_on(
         }
         std::thread::sleep(Duration::from_secs(10)); // never reads
     });
+    (upgrade(core, inb), tx)
+}
+
+/// Answers the next upgrade request and runs until the WebSocket is live.
+/// Returns the ws id (= the request id).
+fn upgrade(core: &mut Core, inb: &mut [u8]) -> u64 {
     let req = collect(core, inb, 1).pop().expect("upgrade request");
     let mut out = Vec::new();
     app(&req, &mut out);
@@ -474,7 +485,71 @@ fn ws_on(
     for _ in 0..50 {
         core.run(&[], inb, 1000).unwrap();
     }
-    (req.id, tx)
+    req.id
+}
+
+/// A client that sends `bytes` of ping frames (125 bytes each) after the
+/// upgrade. With `read` it reads and drops the pongs, else it never reads.
+/// Returns the index of its connection.
+fn ping_flood(core: &mut Core, inb: &mut [u8], port: u16, read: bool, bytes: usize) -> usize {
+    std::thread::spawn(move || {
+        let ws = ws_client(port, "/wide");
+        let mut s = ws.get_ref().try_clone().unwrap();
+        // big buffers: many frames wait at once, more than one turn reads
+        let _ = socket2::SockRef::from(&s).set_send_buffer_size(4 << 20);
+        if read {
+            let mut r = s.try_clone().unwrap();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 65536];
+                while r.read(&mut buf).is_ok_and(|k| k > 0) {}
+            });
+        }
+        let mut frame = vec![0x89, 0x80 | 125, 0, 0, 0, 0];
+        frame.extend_from_slice(&[b'p'; 125]);
+        let _ = s.write_all(&frame.repeat(bytes / frame.len()));
+        std::thread::sleep(Duration::from_secs(10));
+    });
+    let idx = (upgrade(core, inb) >> 32) as usize;
+    let _ = socket2::SockRef::from(&core.conns[idx].sock).set_recv_buffer_size(4 << 20);
+    idx
+}
+
+/// A client floods pings: one call reads only a share of them, and the
+/// request of another client gets its turn in the same call.
+#[test]
+fn websocket_ping_flood_does_not_hold_the_loop() {
+    let (mut core, port) = new_core(limits());
+    let mut inb = vec![0u8; 1 << 18];
+    let idx = ping_flood(&mut core, &mut inb, port, true, 64 << 20);
+    std::thread::sleep(Duration::from_millis(200));
+    let mut s = connect(port);
+    s.write_all(b"GET /other HTTP/1.1\r\n\r\n").unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    let n = core.run(&[], &mut inb, 0).unwrap();
+    assert!(
+        records(&inb[..n]).iter().any(|r| r.target == "/other"),
+        "the other request"
+    );
+    assert!(
+        core.ready.contains(&idx),
+        "the flood waits for its next turn"
+    );
+}
+
+/// A client sends pings and never reads the pongs: Rust stops reading its
+/// frames, so the pongs do not fill the memory.
+#[test]
+fn websocket_pongs_for_a_client_that_does_not_read_are_capped() {
+    let (mut core, port) = new_core(limits());
+    let mut inb = vec![0u8; 1 << 18];
+    let idx = ping_flood(&mut core, &mut inb, port, false, 8 << 20);
+    let end = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < end {
+        core.run(&[], &mut inb, 1000).unwrap();
+    }
+    let c = &core.conns[idx];
+    assert!(c.pending() <= WS_OUT_MAX + WS_READ, "{} waits", c.pending());
+    assert!(c.ws.as_ref().unwrap().paused, "reading stopped");
 }
 
 /// While Dart has too many bytes not acknowledged, Rust reads no frame.

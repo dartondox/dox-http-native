@@ -92,6 +92,14 @@ const LINGER_MAX: usize = 1 << 20;
 const ACCEPT_RETRY: Duration = Duration::from_millis(10);
 /// Bytes not written yet before Rust gives tungstenite the next message.
 const WS_HOLD: usize = 64 * 1024;
+/// Most bytes one `ws_read` call takes from a socket. Then the socket
+/// waits for the next turn, so a client that sends many small frames (eg.
+/// pings) can not hold the isolate.
+const WS_READ: usize = 256 * 1024;
+/// Over this many bytes not written yet (eg. pongs to a client that does
+/// not read), Rust stops reading the frames of that WebSocket. It reads on
+/// once less than [WS_HOLD] waits.
+const WS_OUT_MAX: usize = 4 * WS_HOLD;
 /// A write buffer bigger than this is freed once it is empty.
 const BIG_BUF: usize = 1 << 20;
 /// Most headers of one request. More gets 431.
@@ -469,12 +477,22 @@ impl Drop for Msgs {
 struct WsIo<'a> {
     sock: &'a TcpStream,
     out: &'a mut Vec<u8>,
+    /// bytes it may still read in this turn
+    left: usize,
 }
 
 impl Read for WsIo<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.left == 0 {
+            // the share of this turn is used up: the caller queues the
+            // socket again
+            return Err(ErrorKind::WouldBlock.into());
+        }
+        let max = buf.len().min(self.left);
         let mut sock = self.sock;
-        sock.read(buf)
+        let k = sock.read(&mut buf[..max])?;
+        self.left -= k;
+        Ok(k)
     }
 }
 
@@ -1491,6 +1509,7 @@ impl Core {
                 let mut io = WsIo {
                     sock,
                     out: &mut *wbuf,
+                    left: 0,
                 };
                 if let Message::Close(frame) = m {
                     let _ = ws.ctx.close(&mut io, frame);
@@ -1527,6 +1546,16 @@ impl Core {
         let mut go_on = false;
         if c.paused && c.can_parse() && !c.closing && c.linger.is_none() && !c.live_ws() {
             c.paused = false;
+            go_on = true;
+        }
+        let pending = c.pending();
+        if let Some(ws) = c.ws.as_mut()
+            && ws.paused
+            && pending < WS_HOLD
+            && self.msgs.ws_unacked <= WS_UNACKED
+        {
+            // the client read what waited: read its frames again
+            ws.paused = false;
             go_on = true;
         }
         let mut linger = false;
@@ -1576,8 +1605,20 @@ impl Core {
     /// Reads WebSocket frames: messages go to Dart.
     fn ws_read(&mut self, idx: usize) {
         let c = &mut self.conns[idx];
-        let Conn { ws, sock, wbuf, .. } = c;
+        let Conn {
+            ws,
+            sock,
+            wbuf,
+            wpos,
+            ..
+        } = c;
         let ws = ws.as_mut().unwrap();
+        let mut io = WsIo {
+            sock,
+            out: wbuf,
+            left: WS_READ,
+        };
+        let mut again = false;
         let fail = loop {
             if self.msgs.ws_unacked > WS_UNACKED {
                 // Dart is behind: read on after its ack
@@ -1585,10 +1626,12 @@ impl Core {
                 self.ws_paused.push(idx);
                 break None;
             }
-            let mut io = WsIo {
-                sock,
-                out: &mut *wbuf,
-            };
+            if io.out.len() - *wpos > WS_OUT_MAX {
+                // the client does not read (eg. the pongs of its pings):
+                // read on once they are written, see `service`
+                ws.paused = true;
+                break None;
+            }
             match ws.ctx.read(&mut io) {
                 Ok(Message::Text(t)) => self.msgs.ws(ws.id, WS_TEXT, 0, t.as_bytes()),
                 Ok(Message::Binary(b)) => self.msgs.ws(ws.id, WS_BINARY, 0, &b),
@@ -1601,7 +1644,11 @@ impl Core {
                 }
                 // tungstenite answers a ping itself
                 Ok(_) => {}
-                Err(WsError::Io(e)) if e.kind() == ErrorKind::WouldBlock => break None,
+                Err(WsError::Io(e)) if e.kind() == ErrorKind::WouldBlock => {
+                    // the share of this turn is used up: more may wait
+                    again = io.left == 0;
+                    break None;
+                }
                 Err(WsError::Io(e)) if e.kind() == ErrorKind::Interrupted => {}
                 // the close handshake is over
                 Err(WsError::ConnectionClosed | WsError::AlreadyClosed) => break Some(None),
@@ -1627,12 +1674,17 @@ impl Core {
                 let mut io = WsIo {
                     sock: &c.sock,
                     out: &mut c.wbuf,
+                    left: 0,
                 };
                 let _ = ws.ctx.close(&mut io, close_frame(code));
                 c.shut = true;
             }
         }
         self.service(idx);
+        if again {
+            // read the rest in a later turn (see `fill`)
+            self.queue(idx);
+        }
     }
 
     /// Writes the answers in `out` (response records).
@@ -1964,7 +2016,14 @@ impl Core {
             self.accept_all();
         }
         let mut n = 0;
-        while let Some(&idx) = self.ready.front() {
+        // each connection gets one turn per call. One queued again in this
+        // call (eg. a WebSocket with more frames) waits for the next call,
+        // so Dart gets the requests of the others first.
+        let mut turns = self.ready.len();
+        while turns > 0
+            && let Some(&idx) = self.ready.front()
+        {
+            turns -= 1;
             let Some(c) = self.conns.get_mut(idx) else {
                 self.ready.pop_front();
                 continue;
@@ -2100,6 +2159,9 @@ impl Core {
         let mut got = self.fill(inb);
         if got == Ok(0) && budget_us > 0 {
             let mut wait = Duration::from_micros(budget_us as u64);
+            if !self.ready.is_empty() {
+                wait = Duration::ZERO; // a connection waits for its next turn
+            }
             if let Some(t) = self.next_timer() {
                 wait = wait.min(t.saturating_duration_since(self.now));
             }
