@@ -30,9 +30,12 @@ Dox 3.x is in alpha (`3.0.0-alpha.x`). The API can still change before the stabl
 A build hook (`hook/build.dart`) gets the Rust library. It tries these in order:
 
 1. A path you set in your app `pubspec.yaml` (`hooks: user_defines: dox_http_native: lib_path: ...`).
-2. A ready-built library from the GitHub release, checked with sha256.
+2. A local build in `native/target/release`, for the same OS and CPU.
+3. A ready-built library from the GitHub release, checked with sha256.
    There are builds for macOS (arm64, x64), Linux (x64, arm64) and Windows (x64).
-3. A build from source with `cargo`, when Rust is installed.
+4. A build from source with `cargo`, when Rust is installed.
+
+Outside the pub cache (this repo, or a path or git dependency), step 4 runs before step 3. The source there may be newer than the release.
 
 So on these systems you do not need Rust.
 Use `dart run`, `dart test` or `dart build cli`. `dart compile exe` does not run build hooks.
@@ -96,7 +99,7 @@ How it works:
 - `close()` is graceful: no new connections, open requests get their answer, then it completes. `close(force: true)` closes every connection at once.
 - WebSocket upgrade with `NativeWebSocket.upgrade`, see above. `detachSocket` is not supported.
 - On a graceful `close()`, every open WebSocket gets close code `1001` (going away).
-- Not yet: streaming a response while it is written. The body is sent on `close`.
+- Streaming: a small body is sent in one piece on `close`. When `addStream` passes 64 KB, the answer starts and the rest of the body goes out in parts. A big file never sits in memory.
 
 ## Documentation
 
