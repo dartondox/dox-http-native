@@ -1,4 +1,4 @@
-## Unreleased
+## 3.0.1
 
 - Perf: one thread per isolate. The socket work (accept, read, parse, write) now runs on the isolate's own thread, in a loop of FFI calls (`dox_run`). Before, each isolate had its own Rust network thread, and every request and answer went from one thread to the other. A small helper thread now only watches the sockets while the isolate is idle, and wakes it when a request comes.
 - All features stay the same: WebSocket (now the sync `tungstenite` crate), streamed answers, big bodies without a copy, gzip (on a helper thread), `Expect: 100-continue`, `400`/`413`/`431`/`408`, lingering close, graceful `close()` and `close(force: true)`.
@@ -7,7 +7,7 @@
 - New: a request with both `Content-Length` and `Transfer-Encoding: chunked` gets `400`. A `Transfer-Encoding` other than `chunked` gets `501`.
 - Removed: the hyper and tokio server and the `DOX_HTTP_THREAD=shared` setting.
 - New: `NativeHttpServer.bind(maxConnections: ...)`. At the limit the server stops accepting until a connection closes. Default: no limit.
-- Breaking: native ABI 9 (new FFI calls, the big bodies come as native memory with a finalizer, `dox_bind` takes the connection limit). Needs a new native library build. The build hook builds it with cargo until the next release.
+- Native ABI 9 (new FFI calls, the big bodies come as native memory with a finalizer, `dox_bind` takes the connection limit). Needs a new native library build. The build hook builds it with cargo until the next release.
 
 ### Security
 
