@@ -310,8 +310,11 @@ class NativeHeaders implements HttpHeaders {
     // apps set the same const types (eg. ContentType.json) again and
     // again. Keep the text of the last one, so it is not built each time.
     if (!identical(type, _lastType)) {
+      // ContentType does not check its parts, so a line break there
+      // would add a header. Checked once per type, as the text is kept.
+      String checked = checkHeaderValue(type.toString());
       _lastType = type;
-      _lastTypeText = type.toString();
+      _lastTypeText = checked;
     }
     String text = _lastTypeText!;
     if (_shared) {
