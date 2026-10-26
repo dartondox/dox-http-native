@@ -36,7 +36,13 @@
 //! Per connection:
 //! - Answers go out in the order of the requests, also when Dart answers
 //!   them in another order. At most [MAX_INFLIGHT] requests may wait for an
-//!   answer. Then Rust stops reading that connection until answers go out.
+//!   answer, and at most [MAX_PENDING] answer bytes may wait to be written.
+//!   Then Rust stops reading that connection until answers go out.
+//! - A write that makes no progress for [SEND_WAIT] closes the connection:
+//!   the client does not read.
+//! - Each connection gets one turn per `dox_run` call. A WebSocket reads at
+//!   most [WS_READ] bytes in one turn, so one busy client can not hold the
+//!   isolate.
 //! - A body that is not whole in the first read is read apart (a length or
 //!   chunked). Too big: 413. With `Expect: 100-continue` the 413 comes at
 //!   once, else the body is read and dropped first (up to [DRAIN_MAX]), so

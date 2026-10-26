@@ -76,6 +76,11 @@
 //!   frames. No data is dropped. HTTP is not paused.
 //! - A send to the client may make no progress for [SEND_WAIT], a close
 //!   handshake may take [CLOSE_WAIT]. Then the socket is dropped (1006).
+//!   The same send limit holds for HTTP answers.
+//! - One `dox_run` call reads at most 256 KB of one WebSocket. While more
+//!   than 256 KB (eg. pongs) waits to be written, Rust reads no frames of it.
+//! - HTTP: while 1 MB of answers waits to be written, Rust reads no new
+//!   requests of that connection. See `run.rs` for the other limits.
 mod run;
 
 use std::ffi::{CStr, c_char, c_int, c_void};

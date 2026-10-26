@@ -94,8 +94,11 @@ How it works:
 
 - Each isolate can bind the same port (`SO_REUSEPORT` on Linux, one shared socket on macOS).
 - One thread per isolate: the socket work (accept, read, parse, write) runs on the isolate's own thread. A small helper thread only watches the sockets while the isolate is idle, and wakes it when a request comes.
-- Keep-alive and pipelining. At most 64 requests of one connection wait for an answer. Then the server stops reading that connection until answers go out.
-- A request head must arrive within 30 seconds. A connection with no request for 30 seconds is closed.
+- Keep-alive and pipelining. At most 64 requests of one connection wait for an answer, and at most 1 MB of answers waits to be written. Then the server stops reading that connection until answers go out.
+- A request head must arrive within 30 seconds. A connection with no request for 30 seconds after its last answer is closed.
+- A client that reads nothing of its answer for 30 seconds is closed.
+- `bind(port, maxConnections: 1000)` holds at most that many connections open. At the limit new clients wait in the listen queue of the OS. Default: no limit.
+- When the isolate dies without `close()` (eg. an uncaught error), the server closes within about 100 ms. New clients get "connection refused".
 - Chunked request bodies and `Expect: 100-continue`.
 - `400` for bad requests, `431` for headers over 16 KB, `413` for bodies over `maxBodySize` (`maxMultipartSize` for a multipart form). A too big `Content-Length` with `Expect: 100-continue` gets `413` before the body is sent. Any other too big body is read and dropped first, so the client sees the `413`.
 - `408` when the client sends no body bytes for `bodyTimeout` (idle time, default 120 seconds). A slow but steady upload is fine.
@@ -105,6 +108,16 @@ How it works:
 - On a graceful `close()`, every open WebSocket gets close code `1001` (going away).
 - `autoCompress`: Rust gzips the body on a helper thread, not on the isolate.
 - Streaming: a small body is sent in one piece on `close`. When `addStream` passes 64 KB, the answer starts and the rest of the body goes out in parts. A big file never sits in memory.
+
+## Security notes
+
+- Run it behind a reverse proxy (eg. nginx or a load balancer) on the open internet. The proxy should end TLS, limit the request rate and drop slow clients.
+- Set limits that fit your app: `maxBodySize`, `maxMultipartSize`, `bodyTimeout` and `maxConnections`.
+- Another process can bind the same port and take some of the connections. On Linux that is a process of the same OS user (`SO_REUSEPORT`). On macOS it is a process that binds a more specific address (eg. `127.0.0.1` while the server listens on all interfaces). Run the server as its own user, on a host you control.
+- `req.uri` is the target as the client sent it. `..` and `%2e%2e` are not removed. Check paths before you use them for files.
+- A request head with bare LF line ends (no CR) is accepted, like most servers do. A proxy in front should normalize it.
+- `Content-Length` must be ASCII digits. A request with two different lengths, or with both `Content-Length` and `Transfer-Encoding: chunked`, gets `400`.
+- A streamed answer must keep to its `contentLength`. More bytes throw, and fewer fail `close()`. In both cases the connection is cut, so the client can not mix the rest up with the next answer.
 
 ## Documentation
 
