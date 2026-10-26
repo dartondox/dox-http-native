@@ -1,5 +1,8 @@
 //! Native HTTP/1.1 server for Dart (dox_http_native).
 //!
+//! ABI 7: Dart uses the single thread mode in `run.rs` (`dox_bind`,
+//! `dox_run`). The thread per server mode below stays for now (prototype).
+//!
 //! Rust only owns the sockets and parses HTTP (hyper 1.x). All app code
 //! stays in Dart. One Dart isolate starts one server. All servers of the
 //! process gets its own `dox-http` thread with one tokio `current_thread`
@@ -71,6 +74,8 @@
 //!   reading WebSocket frames. No data is dropped. HTTP is not paused.
 //! - One send to the client may take [SEND_WAIT], a close frame plus the
 //!   wait for the answer [CLOSE_WAIT]. Then the socket is dropped (1006).
+mod run;
+
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
@@ -110,7 +115,7 @@ use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role, WebSocketConfig
 use tokio_tungstenite::tungstenite::{Error as WsError, Message, Utf8Bytes};
 
 /// Bump when the FFI functions or the record layout change.
-const ABI_VERSION: i32 = 6;
+const ABI_VERSION: i32 = 7;
 /// Max size of the request line plus headers. Bigger gets 431.
 const MAX_HEAD: usize = 16 * 1024;
 const RES_HEAD: usize = 20;

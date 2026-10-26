@@ -4,7 +4,7 @@ import 'dart:ffi';
 /// the library as the code asset of this file.
 
 /// The ABI version the Dart side expects. Must match `ABI_VERSION` in Rust.
-const int abiVersion = 6;
+const int abiVersion = 7;
 
 @Native<Int32 Function()>(symbol: 'dox_version', isLeaf: true)
 external int doxVersion();
@@ -43,3 +43,48 @@ external void doxStop(int handle);
   isLeaf: true,
 )
 external void doxRespondBatch(int handle, Pointer<Uint8> data, int length);
+
+// ---- single thread mode (ABI 7) ----
+
+/// Same arguments as [doxStart]. Returns a handle for [doxRun].
+@Native<
+  Int64 Function(Int32, Int64, Int64, Int64, Int64, Int32, Uint64, Uint64)
+>(symbol: 'dox_bind')
+external int doxBind(
+  int port,
+  int sendPort,
+  int maxBody,
+  int maxMultipart,
+  int bodyTimeoutMs,
+  int family,
+  int addrHi,
+  int addrLo,
+);
+
+@Native<Int32 Function(Int64)>(symbol: 'dox_bound_port', isLeaf: true)
+external int doxBoundPort(int handle);
+
+/// Writes the answers in [out], reads new requests into [inBuf]. Waits up
+/// to [budgetUs] for them. Returns the request bytes, 0 for none (Rust
+/// then posts to the port when there are some), or -size when one request
+/// needs a bigger [inBuf]. Not a leaf call: it may wait on the sockets.
+@Native<
+  Int64 Function(Int64, Pointer<Uint8>, Int64, Pointer<Uint8>, Int64, Int64)
+>(symbol: 'dox_run')
+external int doxRun(
+  int handle,
+  Pointer<Uint8> out,
+  int outLength,
+  Pointer<Uint8> inBuf,
+  int inCapacity,
+  int budgetUs,
+);
+
+@Native<Void Function(Int64)>(symbol: 'dox_unbind')
+external void doxUnbind(int handle);
+
+@Native<Pointer<Uint8> Function(Int64)>(symbol: 'dox_alloc', isLeaf: true)
+external Pointer<Uint8> doxAlloc(int size);
+
+@Native<Void Function(Pointer<Uint8>, Int64)>(symbol: 'dox_free', isLeaf: true)
+external void doxFree(Pointer<Uint8> ptr, int size);
