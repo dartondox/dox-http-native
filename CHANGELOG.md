@@ -1,4 +1,4 @@
-## Unreleased
+## 3.0.0
 
 - README: streamed bodies (over 64 KB with `addStream`) are supported. The build hook has 4 steps, not 3.
 
