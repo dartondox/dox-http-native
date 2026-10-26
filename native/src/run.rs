@@ -1710,8 +1710,11 @@ impl Core {
             return;
         };
         let c = &mut self.conns[idx];
+        // the last answer of a closing connection (eg. a shutdown) says so
+        let last = c.closing && i + 1 == c.slots.len() && c.body.is_none();
         let s = &mut c.slots[i];
         s.answered = true;
+        s.close |= last && s.key.is_none();
         if kind & 0x200 != 0 {
             s.close = true;
             c.closing = true;
@@ -1873,7 +1876,7 @@ impl Core {
             ws.told = true;
             self.msgs.ws(id, WS_CLOSED, 1008, b"");
             let c = &mut self.conns[idx];
-            if c.pending() > 0 {
+            if c.live_ws() && c.pending() > 0 {
                 // a send waits for a client that does not read: drop it
                 self.dead.push(idx);
                 return;
@@ -2066,9 +2069,14 @@ impl Core {
     }
 
     /// true once after a graceful shutdown is over: all connections are
-    /// closed and Dart has all messages.
+    /// closed (or only drop the last bytes of a lingering close) and Dart
+    /// has all messages.
     fn done_due(&mut self) -> bool {
-        if self.draining && !self.done_sent && self.conns.is_empty() && self.msgs.buf.is_empty() {
+        if self.draining
+            && !self.done_sent
+            && self.msgs.buf.is_empty()
+            && self.conns.iter().all(|(_, c)| c.linger.is_some())
+        {
             self.done_sent = true;
             return true;
         }

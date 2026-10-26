@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:dox_http_native/dox_http_native.dart';
@@ -21,6 +22,10 @@ void handle(HttpRequest req) async {
     case '/slow':
       await Future<void>.delayed(const Duration(milliseconds: 500));
       res.write('slow done');
+    case '/timer':
+      // no other request is open: the answer must not wait for Rust
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      res.write('timer done');
     case '/who':
       res.write(Isolate.current.debugName);
     case '/json':
@@ -115,6 +120,28 @@ Future<String> raw(int port, String request, {Duration? wait}) async {
   return out.toString();
 }
 
+/// Load from another isolate: 32 clients send requests to [args] port
+/// one after the other, until [args] milliseconds passed.
+void load(List<Object> args) async {
+  int port = args[0] as int;
+  Stopwatch clock = Stopwatch()..start();
+  HttpClient client = HttpClient()..maxConnectionsPerHost = 32;
+  Future<void> one() async {
+    while (clock.elapsedMilliseconds < (args[1] as int)) {
+      HttpClientResponse res = await (await client.get(
+        '127.0.0.1',
+        port,
+        '/',
+      )).close();
+      await res.drain<void>();
+    }
+  }
+
+  await Future.wait(<Future<void>>[for (int i = 0; i < 32; i++) one()]);
+  client.close(force: true);
+  (args[2] as SendPort).send(true);
+}
+
 void spawned(List<Object> args) async {
   SendPort ready = args[1] as SendPort;
   await start(args[0] as int);
@@ -175,6 +202,44 @@ void main() {
     HttpClientResponse res = await req.close();
     expect(res.statusCode, 200);
     expect(<int>[for (List<int> c in await res.toList()) ...c], body);
+  });
+
+  test('a chunked request body comes back the same', () async {
+    HttpClientRequest req = await client.post('127.0.0.1', port, '/echo');
+    req.contentLength = -1; // chunked
+    req.add(List<int>.filled(300, 7));
+    req.add(List<int>.filled(200, 8));
+    HttpClientResponse res = await req.close();
+    expect(res.statusCode, 200);
+    expect(
+      <int>[for (List<int> c in await res.toList()) ...c],
+      <int>[...List<int>.filled(300, 7), ...List<int>.filled(200, 8)],
+    );
+  });
+
+  test('a handler that awaits a timer answers on time', () async {
+    // warm up the connection, then time a request with no other one open
+    await get('/');
+    for (int i = 0; i < 5; i++) {
+      Stopwatch clock = Stopwatch()..start();
+      expect(await get('/timer'), (200, 'timer done'));
+      expect(clock.elapsedMilliseconds, lessThan(100));
+    }
+  });
+
+  test('a timer on the server isolate runs on time under load', () async {
+    ReceivePort done = ReceivePort();
+    await Isolate.spawn(load, <Object>[port, 1500, done.sendPort]);
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+    // like a database reply: a short wait on the isolate that serves
+    int worst = 0;
+    for (int i = 0; i < 20; i++) {
+      Stopwatch clock = Stopwatch()..start();
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      worst = max(worst, clock.elapsedMilliseconds - 10);
+    }
+    expect(worst, lessThan(50), reason: 'late by $worst ms');
+    await done.first;
   });
 
   test('a line break in a cookie domain or server header is refused', () async {
