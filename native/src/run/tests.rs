@@ -713,3 +713,72 @@ fn graceful_shutdown_finishes_open_requests() {
     }
     panic!("not done");
 }
+
+/// A client pipelines requests and never reads the answers: Rust stops
+/// reading its requests while the answers wait, so memory stays small.
+#[test]
+fn pipelined_requests_stop_while_answers_wait() {
+    let (mut core, port) = new_core(limits());
+    let mut inb = vec![0u8; 1 << 18];
+    let mut s = connect(port);
+    let all: String = (0..300)
+        .map(|i| format!("GET /{i} HTTP/1.1\r\n\r\n"))
+        .collect();
+    s.write_all(all.as_bytes()).unwrap();
+    let body = vec![b'x'; 200_000];
+    let (mut seen, mut out) = (0, Vec::new());
+    let end = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < end {
+        let n = core.run(&out, &mut inb, 1000).unwrap();
+        out.clear();
+        for r in records(&inb[..n]) {
+            seen += 1;
+            ans(&mut out, r.id, 200, 0, b"", &body);
+        }
+    }
+    let pending: usize = core.conns.iter().map(|(_, c)| c.pending()).sum();
+    assert!(seen < 300, "read all {seen} requests");
+    assert!(
+        pending < MAX_PENDING + MAX_INFLIGHT * body.len(),
+        "{pending} bytes wait"
+    );
+}
+
+/// A client that never reads its answer: when the write makes no progress
+/// for SEND_WAIT, the connection is closed.
+#[test]
+fn answer_to_a_client_that_does_not_read_times_out() {
+    let (mut core, port) = new_core(limits());
+    let mut inb = vec![0u8; 1 << 18];
+    let mut s = connect(port);
+    s.write_all(b"GET /big HTTP/1.1\r\n\r\n").unwrap();
+    let req = collect(&mut core, &mut inb, 1).pop().unwrap();
+    let mut out = Vec::new();
+    ans(&mut out, req.id, 200, 0, b"", &vec![0u8; 16 << 20]);
+    core.run(&out, &mut inb, 0).unwrap();
+    assert!(core.conns.iter().any(|(_, c)| c.pending() > 0), "waits");
+    after(&mut core, &mut inb, SEND_WAIT / 2);
+    assert_eq!(core.conns.len(), 1, "too early");
+    after(&mut core, &mut inb, SEND_WAIT + Duration::from_secs(1));
+    assert_eq!(core.conns.len(), 0, "closed");
+}
+
+/// The idle time of a keep-alive connection counts from its last answer,
+/// not from its last request.
+#[test]
+fn idle_time_counts_from_the_answer() {
+    let (mut core, port) = new_core(limits());
+    let mut inb = vec![0u8; 1 << 18];
+    let mut s = connect(port);
+    s.write_all(b"GET /slow HTTP/1.1\r\n\r\n").unwrap();
+    let req = collect(&mut core, &mut inb, 1).pop().unwrap();
+    // Dart answers 20 seconds later
+    core.now = Instant::now() + Duration::from_secs(20);
+    let mut out = Vec::new();
+    ans(&mut out, req.id, 200, 0, b"", b"done");
+    core.respond(&out);
+    after(&mut core, &mut inb, HEAD_WAIT + Duration::from_secs(5));
+    assert_eq!(core.conns.len(), 1, "closed 5 seconds after the answer");
+    after(&mut core, &mut inb, HEAD_WAIT + Duration::from_secs(25));
+    assert_eq!(core.conns.len(), 0, "idle for HEAD_WAIT");
+}

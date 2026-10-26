@@ -100,6 +100,10 @@ const WS_READ: usize = 256 * 1024;
 /// not read), Rust stops reading the frames of that WebSocket. It reads on
 /// once less than [WS_HOLD] waits.
 const WS_OUT_MAX: usize = 4 * WS_HOLD;
+/// Over this many answer bytes not written yet, Rust stops reading new
+/// requests of that connection (pipelining by a client that does not read
+/// the answers). It reads on once they are written.
+const MAX_PENDING: usize = 1 << 20;
 /// A write buffer bigger than this is freed once it is empty.
 const BIG_BUF: usize = 1 << 20;
 /// Most headers of one request. More gets 431.
@@ -217,11 +221,13 @@ struct Conn {
     eof: bool,
     /// lingering close: (started, bytes dropped)
     linger: Option<(Instant, usize)>,
-    /// when the last request ended (or the accept)
+    /// when the last request came or the last answer went out (or the
+    /// accept): the idle time counts from here
     since: Instant,
     /// the time of the one timer entry this connection relies on
     timer: Option<Instant>,
-    /// writes that wait: when they last made progress
+    /// writes that wait: when they last made progress. No progress for
+    /// [SEND_WAIT] closes the connection (HTTP and WebSocket).
     stuck: Option<Instant>,
 }
 
@@ -254,6 +260,7 @@ enum Due {
     Body,
     Head,
     Ws,
+    Send,
 }
 
 /// Body limits of one server.
@@ -586,7 +593,7 @@ impl Conn {
 
     /// true when it may read and parse more requests now
     fn can_parse(&self) -> bool {
-        self.slots.len() < MAX_INFLIGHT && !self.upgrading
+        self.slots.len() < MAX_INFLIGHT && !self.upgrading && self.pending() < MAX_PENDING
     }
 
     /// Reads what the socket has. False on a socket error.
@@ -1527,6 +1534,8 @@ impl Core {
             self.kill(idx);
             return;
         }
+        // a write starts to wait: make sure its timer runs
+        let wait_starts = c.stuck.is_none() && c.pending() > 0;
         while let Some(&(end, sid, n)) = c.marks.front() {
             if end > c.written {
                 break;
@@ -1536,6 +1545,10 @@ impl Core {
         }
         if c.pending() == 0 {
             c.stuck = None;
+            if c.written > before && c.slots.is_empty() {
+                // the last answer is out: the idle time starts now
+                c.since = now;
+            }
         } else if c.written > before || c.stuck.is_none() {
             c.stuck = Some(now);
         }
@@ -1576,7 +1589,7 @@ impl Core {
         if go_on {
             self.queue(idx);
         }
-        if linger || close_started {
+        if linger || close_started || wait_starts {
             self.arm_timer(idx);
         }
     }
@@ -2180,19 +2193,20 @@ impl Conn {
         if let Some((t, _)) = self.linger {
             return Some((t + LINGER, Due::Linger));
         }
-        if let Some(ws) = &self.ws {
-            if let Some(t) = ws.closing {
-                return Some((t + CLOSE_WAIT, Due::Ws));
-            }
-            if let Some(t) = self.stuck
-                && ws.live
-            {
-                return Some((t + SEND_WAIT, Due::Ws));
-            }
-            return None;
+        if let Some(t) = self.ws.as_ref().and_then(|w| w.closing) {
+            return Some((t + CLOSE_WAIT, Due::Ws));
         }
-        if let Some(b) = &self.body {
-            return (!b.whole).then_some((b.last + body_timeout, Due::Body));
+        if let Some(b) = &self.body
+            && !b.whole
+        {
+            return Some((b.last + body_timeout, Due::Body));
+        }
+        // a write makes no progress: the client does not read
+        if let Some(t) = self.stuck {
+            return Some((t + SEND_WAIT, Due::Send));
+        }
+        if self.ws.is_some() || self.body.is_some() {
+            return None;
         }
         if self.slots.is_empty() && self.pending() == 0 {
             return Some((self.since + HEAD_WAIT, Due::Head));
