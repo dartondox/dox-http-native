@@ -1,3 +1,13 @@
+## Unreleased
+
+- Perf: one thread per isolate. The socket work (accept, read, parse, write) now runs on the isolate's own thread, in a loop of FFI calls (`dox_run`). Before, each isolate had its own Rust network thread, and every request and answer went from one thread to the other. A small helper thread now only watches the sockets while the isolate is idle, and wakes it when a request comes.
+- All features stay the same: WebSocket (now the sync `tungstenite` crate), streamed answers, big bodies without a copy, gzip (on a helper thread), `Expect: 100-continue`, `400`/`413`/`431`/`408`, lingering close, graceful `close()` and `close(force: true)`.
+- New: at most 64 requests of one connection wait for an answer. Then the server stops reading that connection until answers go out, so one client can not fill the memory with pipelined requests.
+- New: a request head must arrive within 30 seconds, and a connection with no request for 30 seconds is closed (like hyper before).
+- New: a request with both `Content-Length` and `Transfer-Encoding: chunked` gets `400`. A `Transfer-Encoding` other than `chunked` gets `501`.
+- Removed: the hyper and tokio server and the `DOX_HTTP_THREAD=shared` setting.
+- Breaking: native ABI 8 (new FFI calls, the big bodies come as native memory with a finalizer). Needs a new native library build. The build hook builds it with cargo until the next release.
+
 ## 3.0.0
 
 - README: streamed bodies (over 64 KB with `addStream`) are supported. The build hook has 4 steps, not 3.
