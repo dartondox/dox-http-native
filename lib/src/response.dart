@@ -54,6 +54,11 @@ class NativeResponse implements HttpResponse {
   /// the stream id, once the body goes out in parts
   int? _stream;
   int _unsent = 0;
+
+  /// the content length of a streamed body (-1: none), and the bytes it
+  /// still may have
+  int _length = -1;
+  int _left = 0;
   Completer<void>? _room;
   bool _gone = false;
 
@@ -129,6 +134,17 @@ class NativeResponse implements HttpResponse {
     int? stream = _stream;
     if (stream != null) {
       if (_gone) return;
+      if (_length >= 0) {
+        // like dart:io: more bytes than the content length is an error
+        if (data.length > _left) {
+          throw HttpException(
+            'Content size exceeds specified contentLength. '
+            '${_length - _left + data.length} bytes written while expected '
+            '$_length.',
+          );
+        }
+        _left -= data.length;
+      }
       _request.server.sendPart(stream, data);
       _unsent += data.length;
       return;
@@ -189,6 +205,15 @@ class NativeResponse implements HttpResponse {
   /// Sends the head and the body so far. Later parts go out at once.
   void _startStream() {
     _checkCookies();
+    int length = headers.contentLength;
+    if (length >= 0 && _size > length) {
+      throw HttpException(
+        'Content size exceeds specified contentLength. '
+        '$_size bytes written while expected $length.',
+      );
+    }
+    _length = length;
+    _left = length - _size;
     List<int> first = takeBody();
     _stream = _request.server.startStream(_request, this, first);
     _unsent += first.length;
@@ -215,6 +240,16 @@ class NativeResponse implements HttpResponse {
       _closed = true;
       if (stream == null) {
         _request.server.send(_request, this);
+      } else if (_length >= 0 && _left > 0 && !_gone) {
+        // like dart:io: fewer bytes than the content length is an error.
+        // Rust cuts the connection, so the client sees it.
+        _request.server.endStream(stream, ok: false);
+        HttpException error = HttpException(
+          'Content size below specified contentLength. '
+          '${_length - _left} bytes written but expected $_length.',
+        );
+        (_done ??= Completer<HttpResponse>()).completeError(error);
+        return done;
       } else {
         _request.server.endStream(stream);
       }

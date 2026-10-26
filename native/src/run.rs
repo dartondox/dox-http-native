@@ -127,10 +127,21 @@ struct Slot {
     key: Option<Box<[u8]>>,
     /// Dart accepted the upgrade: the connection is a WebSocket after it
     upgrade: bool,
-    /// a streamed body: (stream id, chunked)
-    stream: Option<(u64, bool)>,
+    /// a streamed body: (stream id, how it ends)
+    stream: Option<(u64, Tail)>,
     /// stream body bytes in `out`, told to Dart once they are written
     unsent: u64,
+}
+
+/// How a streamed body is framed and how it ends.
+#[derive(Clone, Copy, PartialEq)]
+enum Tail {
+    /// in chunks, then `0\r\n\r\n`
+    Chunked,
+    /// the connection closes after it
+    Close,
+    /// Dart sent `content-length`: this many bytes are still due
+    Left(u64),
 }
 
 /// A request body that is read apart from its head.
@@ -973,6 +984,30 @@ impl Conn {
         }
         Ok(())
     }
+}
+
+/// A length: ASCII digits only, with spaces or tabs around. Not `+5`, not
+/// `5, 5`, not other white space.
+fn parse_len(v: &[u8]) -> Option<u64> {
+    let v = v.trim_ascii();
+    if v.is_empty() || !v.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    v.iter().try_fold(0u64, |n, &d| {
+        n.checked_mul(10)?.checked_add(u64::from(d - b'0'))
+    })
+}
+
+/// The `content-length` of Dart's header lines: None when there is none,
+/// Some(None) when it is not a number.
+fn length_line(lines: &[u8]) -> Option<Option<u64>> {
+    lines.split(|&c| c == b'\n').find_map(|line| {
+        let at = line.iter().position(|&c| c == b':')?;
+        line[..at]
+            .trim_ascii()
+            .eq_ignore_ascii_case(b"content-length")
+            .then(|| parse_len(&line[at + 1..]))
+    })
 }
 
 fn has_token(value: &[u8], token: &str) -> bool {
@@ -1845,18 +1880,23 @@ impl Core {
                 }
                 let sid = u64::from_le_bytes(body[..8].try_into().unwrap());
                 let first = &body[8..];
-                // Dart sends `content-length` itself when it knows it
-                let sized = lines
-                    .windows(15)
-                    .any(|w| w.eq_ignore_ascii_case(b"content-length:"));
-                let len = if way.head || sized {
-                    Len::Open
-                } else if way.http10 {
-                    way.close = true; // the end of the body is the close
-                    s.close = true;
-                    Len::Open
-                } else {
-                    Len::Chunked
+                // Dart sends `content-length` itself when it knows it. Rust
+                // counts the bytes: a wrong count closes the connection, so
+                // the rest can not look like the next answer.
+                let (len, tail) = match length_line(lines) {
+                    _ if way.head => (Len::Open, Tail::Close),
+                    Some(Some(n)) => (Len::Open, Tail::Left(n)),
+                    sized => {
+                        if sized.is_some() || way.http10 {
+                            // a length Rust can not read, or HTTP/1.0: the
+                            // end of the body is the close
+                            way.close = true;
+                            s.close = true;
+                            (Len::Open, Tail::Close)
+                        } else {
+                            (Len::Chunked, Tail::Chunked)
+                        }
+                    }
                 };
                 let mut out = Vec::new();
                 render_head(&mut out, status, lines, b"", date, way, len);
@@ -1866,7 +1906,7 @@ impl Core {
                     c.put(i, &out, 0);
                     self.msgs.push(sid, STREAM_GONE, 0, b"");
                 } else {
-                    s.stream = Some((sid, len == Len::Chunked));
+                    s.stream = Some((sid, tail));
                     c.put(i, &out, 0);
                     self.streams.insert(sid, (idx, seq));
                     self.touch(idx);
@@ -1888,7 +1928,24 @@ impl Core {
         let Some(i) = c.slots.iter().position(|s| s.seq == seq) else {
             return;
         };
-        let chunked = c.slots[i].stream.is_some_and(|s| s.1);
+        let Some((_, tail)) = c.slots[i].stream else {
+            return;
+        };
+        let (mut data, mut end, mut ok) = (data, end, ok);
+        if let Tail::Left(left) = tail {
+            let k = data.len() as u64;
+            if k > left {
+                // more bytes than `content-length`: send what it said, then
+                // close. Dart stops.
+                data = &data[..left as usize];
+                (end, ok) = (true, false);
+                self.msgs.push(sid, STREAM_GONE, 0, b"");
+            } else if end && k < left {
+                ok = false; // too few: the client sees the body is not whole
+            }
+            c.slots[i].stream = Some((sid, Tail::Left(left.saturating_sub(k))));
+        }
+        let chunked = tail == Tail::Chunked;
         let mut out = Vec::new();
         frame_part(&mut out, data, chunked);
         if end {

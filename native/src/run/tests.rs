@@ -81,8 +81,9 @@ fn ans(out: &mut Vec<u8>, id: u64, status: u16, kind: u16, lines: &[u8], body: &
 /// WebSocket (ws id = request id, max message 8 bytes, `/big` and `/wide`
 /// 16 MiB). `/bye` then
 /// closes with 4000, `/flood` sends 2 MB at once, `/big` 8 MiB. Messages
-/// are echoed. `/stream` sends "ab", "cde" as a streamed body. `/zip`
-/// gzips. Anything else: the target and the body.
+/// are echoed. `/stream` sends "ab", "cde" as a streamed body. `/exact`,
+/// `/liar` and `/short` do the same with `content-length` 5, 3 and 9.
+/// `/zip` gzips. Anything else: the target and the body.
 fn app(r: &Rec, out: &mut Vec<u8>) {
     match r.kind() {
         0 => match r.target.as_str() {
@@ -111,13 +112,19 @@ fn app(r: &Rec, out: &mut Vec<u8>) {
                     _ => {}
                 }
             }
-            "/stream" => {
+            t @ ("/stream" | "/exact" | "/liar" | "/short") => {
+                let lines: &[u8] = match t {
+                    "/exact" => b"content-length: 5\r\n",
+                    "/liar" => b"content-length: 3\r\n",
+                    "/short" => b"content-length: 9\r\n",
+                    _ => b"",
+                };
                 ans(
                     out,
                     r.id,
                     200,
                     6,
-                    b"",
+                    lines,
                     &[&r.id.to_le_bytes()[..], b"ab"].concat(),
                 );
                 ans(out, r.id, 0, 7, b"", b"cde");
@@ -781,4 +788,29 @@ fn idle_time_counts_from_the_answer() {
     assert_eq!(core.conns.len(), 1, "closed 5 seconds after the answer");
     after(&mut core, &mut inb, HEAD_WAIT + Duration::from_secs(25));
     assert_eq!(core.conns.len(), 0, "idle for HEAD_WAIT");
+}
+
+/// A streamed body with `content-length`: the right count keeps the
+/// connection. Too many bytes stop at the length, too few cut the body.
+/// Both close the connection, so the next request gets no answer that a
+/// client could mix up with the rest of the body.
+#[test]
+fn streamed_body_keeps_to_its_content_length() {
+    let (port, log) = serve(limits());
+    let two = |path: &str| {
+        let req =
+            format!("GET {path} HTTP/1.1\r\n\r\nGET /next HTTP/1.1\r\nConnection: close\r\n\r\n");
+        send(port, req.as_bytes())
+    };
+    let exact = two("/exact");
+    assert!(
+        exact.contains("content-length: 5\r\n") && exact.contains("\r\n\r\nabcdeHTTP/1.1 200"),
+        "{exact:?}"
+    );
+    assert!(exact.ends_with("/next"), "{exact:?}");
+    let liar = two("/liar");
+    assert!(liar.ends_with("\r\n\r\nabc"), "{liar:?}");
+    wait_for(&log, |r| r.kind() == STREAM_GONE);
+    let short = two("/short");
+    assert!(short.ends_with("\r\n\r\nabcde"), "{short:?}");
 }

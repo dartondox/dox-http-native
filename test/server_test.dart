@@ -40,6 +40,24 @@ void handle(HttpRequest req) async {
         res.contentLength = 80 * 65536;
       }
       await res.addStream(parts(80));
+    case '/liar':
+      // a content length that is too small for the streamed body
+      res.contentLength = 100000;
+      try {
+        await res.addStream(parts(2));
+      } on HttpException catch (e) {
+        lengthErrors.add(e.message);
+      }
+    case '/short':
+      // a content length that is too big for the streamed body
+      res.contentLength = 200000;
+      await res.addStream(parts(2));
+      try {
+        await res.close();
+      } on HttpException catch (e) {
+        lengthErrors.add(e.message);
+      }
+      return;
     case '/forever':
       // never ends on its own: only a client that leaves stops it
       await res.addStream(parts(null));
@@ -85,6 +103,9 @@ Stream<List<int>> parts(int? count) async* {
 }
 
 int sentParts = 0;
+
+/// errors of streamed bodies that did not keep to their content length
+List<String> lengthErrors = <String>[];
 Completer<int> foreverDone = Completer<int>();
 
 Future<NativeHttpServer> start(int port, {int maxBodySize = 1024}) async {
@@ -406,6 +427,19 @@ void main() {
       }
       expect(at, 80 * 65536, reason: path);
     }
+  });
+
+  test('a streamed body must keep to its content length', () async {
+    // the next request on the connection must not get an answer: the
+    // client could take it for the rest of the body
+    String next = 'GET / HTTP/1.1\r\n\r\n';
+    String liar = await raw(port, 'GET /liar HTTP/1.1\r\n\r\n$next');
+    expect(liar, contains('content-length: 100000'));
+    expect(liar, isNot(contains('Hello World')));
+    String short = await raw(port, 'GET /short HTTP/1.1\r\n\r\n$next');
+    expect(short, contains('content-length: 200000'));
+    expect(short, isNot(contains('Hello World')));
+    expect(lengthErrors, <Matcher>[contains('exceeds'), contains('below')]);
   });
 
   test('a streamed body stops when the client leaves', () async {
