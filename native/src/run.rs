@@ -12,14 +12,15 @@
 //! found nothing. Else Dart may have other work (timers, database replies,
 //! other ports), and a wait here would hold it up.
 //!
-//! When a call finds nothing, it returns 0 and hands the sockets to the
-//! idle helper: one small thread per server. It sleeps while Dart runs.
-//! Then it waits on the sockets (epoll or kqueue via mio) and runs the
-//! timers. When there is something for Dart, it posts one byte to the Dart
-//! port and goes back to sleep. Dart then calls `dox_run` again. Only one
-//! side owns the sockets at a time: the `core` mutex. When Dart calls
-//! `dox_run` while the helper waits, Dart sets `want` and wakes the helper
-//! with the mio `Waker`, so the helper gives the mutex back at once.
+//! When a call finds nothing, it returns 0 and the idle helper takes over:
+//! one small thread per server. It sleeps while Dart runs. Then it waits
+//! until the poll file (epoll or kqueue) has an event, or until the next
+//! timer is due. It never takes the `core` mutex for that: it only checks
+//! that the poll file is readable, it does not read the events. So Dart
+//! never waits for the helper. When there is something, the helper posts
+//! one byte to the Dart port and goes back to sleep. Dart then calls
+//! `dox_run` again, which reads the events and does the work. The flag
+//! `armed` makes sure only one side tells Dart: the one that clears it.
 //!
 //! A Dart isolate may move to another OS thread between two event loop
 //! turns. So all state here is `Send` and lives behind the mutex. Nothing
@@ -61,7 +62,7 @@ use std::ffi::c_void;
 use std::io::{ErrorKind, Read, Write};
 use std::mem::MaybeUninit;
 use std::net::Shutdown;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1270,8 +1271,6 @@ struct Core {
     accept: bool,
     /// accept again at this time (after an accept error)
     accept_at: Option<Instant>,
-    /// the idle helper watches the sockets
-    armed: bool,
     seq: u32,
     limits: Limits,
     /// (second, `date: ...\r\n`)
@@ -1317,7 +1316,6 @@ impl Core {
             ready: VecDeque::new(),
             accept: true,
             accept_at: None,
-            armed: true,
             seq: 0,
             limits,
             date: (0, Vec::new()),
@@ -2330,9 +2328,17 @@ fn limits_of(max_body: i64, max_multipart: i64, body_timeout_ms: i64, max_conns:
 /// One server. Dart holds an `Arc` of it as handle.
 struct Native {
     core: Mutex<Core>,
+    /// wakes a `poll` on the poll file (dox_unbind)
     waker: Arc<Waker>,
-    /// Dart waits for the core: the helper gives it back
-    want: AtomicBool,
+    /// the poll file (epoll or kqueue), watched by the idle helper
+    #[cfg(unix)]
+    fd: i32,
+    /// Dart is idle: the helper watches, and tells Dart when work comes
+    armed: AtomicBool,
+    /// the next timer of the core, in nanoseconds after `base`. `u64::MAX`:
+    /// none.
+    due: AtomicU64,
+    base: Instant,
     /// wakes the helper: Dart went idle
     kick: Mutex<bool>,
     cv: Condvar,
@@ -2348,18 +2354,46 @@ impl Native {
         self.cv.notify_one();
     }
 
-    /// Takes the core from the idle helper (it gives way at once).
-    fn lock(&self) -> MutexGuard<'_, Core> {
-        let core = match self.core.try_lock() {
-            Ok(c) => c,
-            Err(_) => {
-                self.want.store(true, Ordering::Release);
-                let _ = self.waker.wake();
-                self.core.lock().unwrap()
-            }
+    fn set_due(&self, at: Option<Instant>) {
+        let ns = at.map_or(u64::MAX, |t| {
+            t.saturating_duration_since(self.base)
+                .as_nanos()
+                .min(u128::from(u64::MAX - 1)) as u64
+        });
+        self.due.store(ns, Ordering::Release);
+    }
+
+    /// How long until the next timer of the core. None: no timer.
+    fn due_in(&self) -> Option<Duration> {
+        let ns = self.due.load(Ordering::Acquire);
+        (ns != u64::MAX).then(|| {
+            (self.base + Duration::from_nanos(ns)).saturating_duration_since(Instant::now())
+        })
+    }
+
+    /// true when the poll file has an event within `wait`. Does not read
+    /// the event and does not take the core: `dox_run` does that.
+    #[cfg(unix)]
+    fn ready_within(&self, wait: Duration) -> bool {
+        let mut p = libc::pollfd {
+            fd: self.fd,
+            events: libc::POLLIN,
+            revents: 0,
         };
-        self.want.store(false, Ordering::Release);
-        core
+        // round up, so a timer a bit in the future does not spin
+        let ms = wait.as_micros().div_ceil(1000).min(i32::MAX as u128) as i32;
+        let r = unsafe { libc::poll(&mut p, 1, ms) };
+        r > 0 && p.revents & libc::POLLIN != 0
+    }
+
+    /// Windows has no poll file to watch: take the core for at most 1 ms
+    /// at a time, so Dart waits at most that long.
+    #[cfg(not(unix))]
+    fn ready_within(&self, wait: Duration) -> bool {
+        let mut core = self.core.lock().unwrap();
+        core.update_clock();
+        core.wait(Some(wait.min(Duration::from_millis(1))));
+        core.has_work()
     }
 
     /// The isolate is gone and did not stop the server (eg. an uncaught
@@ -2373,8 +2407,8 @@ impl Native {
         core.zip = None; // ends the gzip thread
     }
 
-    /// The idle helper: watches the sockets while Dart is idle. Also checks
-    /// every [PROBE] that the isolate is alive, idle or not.
+    /// The idle helper: watches the poll file while Dart is idle. Also
+    /// checks every [PROBE] that the isolate is alive, idle or not.
     fn helper(&self) {
         let mut probed = Instant::now();
         loop {
@@ -2394,40 +2428,33 @@ impl Native {
                 }
                 *k = false;
             }
-            if self.stopped.load(Ordering::Acquire) {
-                return;
-            }
-            let mut core = self.core.lock().unwrap();
-            loop {
-                if !core.armed || self.stopped.load(Ordering::Acquire) {
-                    break; // Dart owns the sockets again
+            while self.armed.load(Ordering::Acquire) && !self.stopped.load(Ordering::Acquire) {
+                let wait = self.due_in().map_or(PROBE, |d| d.min(PROBE));
+                let ready = self.ready_within(wait);
+                if self.stopped.load(Ordering::Acquire) {
+                    return;
                 }
-                core.update_clock();
-                core.take_zipped();
-                core.run_timers();
-                if core.done_due() {
-                    post(self.dart_port, &[2]);
-                }
-                if core.has_work() {
-                    core.armed = false;
-                    drop(core);
-                    post(self.dart_port, &[1]);
-                    break;
-                }
-                let mut wait = PROBE;
-                if let Some(t) = core.next_timer() {
-                    wait = wait.min(t.saturating_duration_since(core.now));
-                }
-                let (_, woke) = core.wait(Some(wait));
-                if woke && self.want.load(Ordering::Acquire) {
+                if ready || self.due_in() == Some(Duration::ZERO) {
+                    // only the side that clears `armed` tells Dart
+                    if self
+                        .armed
+                        .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                        && !post(self.dart_port, &[1])
+                    {
+                        return self.gone(self.core.lock().unwrap());
+                    }
                     break;
                 }
                 if probed.elapsed() >= PROBE {
                     probed = Instant::now();
                     if !post(self.dart_port, &[]) {
-                        return self.gone(core);
+                        return self.gone(self.core.lock().unwrap());
                     }
                 }
+            }
+            if self.stopped.load(Ordering::Acquire) {
+                return;
             }
         }
     }
@@ -2467,10 +2494,20 @@ pub extern "C" fn dox_bind(
         unbind(key);
         return -2;
     };
+    #[cfg(unix)]
+    let fd = {
+        use std::os::fd::AsRawFd;
+        core.poll.as_raw_fd()
+    };
     let native = Arc::new(Native {
         waker: core.waker.clone(),
         core: Mutex::new(core),
-        want: AtomicBool::new(false),
+        #[cfg(unix)]
+        fd,
+        // a new server may have connections waiting: Dart reads at once
+        armed: AtomicBool::new(true),
+        due: AtomicU64::new(u64::MAX),
+        base: Instant::now(),
         kick: Mutex::new(true),
         cv: Condvar::new(),
         stopped: AtomicBool::new(false),
@@ -2523,8 +2560,8 @@ pub unsafe extern "C" fn dox_run(
     budget_us: i64,
 ) -> i64 {
     let s = unsafe { &*(handle as *const Native) };
-    let mut core = s.lock();
-    core.armed = false;
+    let mut core = s.core.lock().unwrap();
+    s.armed.store(false, Ordering::Release);
     let out: &[u8] = if out_len > 0 {
         unsafe { std::slice::from_raw_parts(out, out_len as usize) }
     } else {
@@ -2536,8 +2573,16 @@ pub unsafe extern "C" fn dox_run(
         post(s.dart_port, &[2]);
     }
     match got {
+        Ok(0) if core.has_work() => {
+            // a connection waits for its next turn: come back after a turn
+            // of the event loop
+            drop(core);
+            post(s.dart_port, &[1]);
+            0
+        }
         Ok(0) => {
-            core.armed = true;
+            s.set_due(core.next_timer());
+            s.armed.store(true, Ordering::Release);
             drop(core);
             s.arm();
             0
@@ -2557,14 +2602,14 @@ pub unsafe extern "C" fn dox_run(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dox_shutdown(handle: i64) {
     let s = unsafe { &*(handle as *const Native) };
-    let mut core = s.lock();
+    let mut core = s.core.lock().unwrap();
     core.update_clock();
     core.start_drain();
-    if core.armed {
-        // the helper watches on, and posts `[2]` or the messages
-        drop(core);
-        s.arm();
+    if core.done_due() {
+        post(s.dart_port, &[2]);
     }
+    // the lingering closes have timers: the helper must wake for them
+    s.set_due(core.next_timer());
 }
 
 /// Stops a server, closes its sockets and frees the handle.
@@ -2575,8 +2620,7 @@ pub unsafe extern "C" fn dox_shutdown(handle: i64) {
 pub unsafe extern "C" fn dox_unbind(handle: i64) {
     let s = unsafe { Arc::from_raw(handle as *const Native) };
     s.stopped.store(true, Ordering::Release);
-    s.want.store(true, Ordering::Release);
-    let _ = s.waker.wake();
+    let _ = s.waker.wake(); // ends a `poll` of the helper
     s.arm();
     let helper = s.helper.lock().unwrap().take();
     if let Some(t) = helper {

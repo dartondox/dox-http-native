@@ -98,6 +98,7 @@ dependencies = [
  "flate2",
  "httparse",
  "httpdate",
+ "libc",
  "mio",
  "slab",
  "socket2",

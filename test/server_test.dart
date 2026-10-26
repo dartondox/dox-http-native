@@ -698,4 +698,167 @@ void main() {
     expect(ok, 20);
     await main.close();
   });
+
+  group('answers that come later', () {
+    test(
+      'a reply from another isolate (like a database) is fast under load',
+      () async {
+        // the bug: the idle helper held the sockets and Dart waited for it,
+        // so each late answer waited up to seconds
+        SendPort db = await replier();
+        NativeHttpServer server = await NativeHttpServer.bind(0);
+        server.listen((HttpRequest req) async {
+          ReceivePort reply = ReceivePort();
+          db.send(<Object>[reply.sendPort, req.uri.queryParameters['id']!, 0]);
+          req.response.write(await reply.first);
+          await req.response.close();
+        });
+        List<int> r = await clientLoad(server.port, '/db', 32, 100);
+        expect(r[1], 0, reason: 'wrong answers');
+        expect(r[0], lessThan(5000), reason: '3200 requests took ${r[0]} ms');
+        await server.close();
+      },
+    );
+
+    test('answers after timers of different lengths', () async {
+      NativeHttpServer server = await NativeHttpServer.bind(0);
+      server.listen((HttpRequest req) async {
+        String id = req.uri.queryParameters['id']!;
+        await Future<void>.delayed(Duration(milliseconds: int.parse(id) % 7));
+        req.response.write(id);
+        await req.response.close();
+      });
+      List<int> r = await clientLoad(server.port, '/t', 32, 50);
+      expect(r[1], 0, reason: 'wrong answers');
+      expect(r[0], lessThan(5000), reason: '1600 requests took ${r[0]} ms');
+      await server.close();
+    });
+
+    test('a long task does not hold the other requests', () async {
+      NativeHttpServer server = await NativeHttpServer.bind(0);
+      server.listen((HttpRequest req) async {
+        if (req.uri.path == '/long') {
+          await Future<void>.delayed(const Duration(milliseconds: 1500));
+          req.response.write('long');
+        } else {
+          req.response.write(req.uri.queryParameters['id']);
+        }
+        await req.response.close();
+      });
+      Stopwatch clock = Stopwatch()..start();
+      HttpClient longClient = HttpClient();
+      Future<String> long() async {
+        HttpClientResponse res = await (await longClient.get(
+          '127.0.0.1',
+          server.port,
+          '/long',
+        )).close();
+        return utf8.decodeStream(res);
+      }
+
+      List<Future<String>> longs = <Future<String>>[
+        for (int i = 0; i < 4; i++) long(),
+      ];
+      List<int> fast = await clientLoad(server.port, '/fast', 16, 25);
+      expect(fast[1], 0, reason: 'wrong answers');
+      expect(
+        fast[0],
+        lessThan(1000),
+        reason: '400 fast requests took ${fast[0]} ms',
+      );
+      expect(await Future.wait(longs), everyElement('long'));
+      expect(clock.elapsedMilliseconds, inInclusiveRange(1500, 3000));
+      longClient.close(force: true);
+      await server.close();
+    });
+
+    test('a long synchronous task answers, and the server goes on', () async {
+      NativeHttpServer server = await NativeHttpServer.bind(0);
+      server.listen((HttpRequest req) async {
+        if (req.uri.path == '/busy') {
+          Stopwatch work = Stopwatch()..start();
+          while (work.elapsedMilliseconds < 300) {}
+          req.response.write('busy');
+        } else {
+          req.response.write(req.uri.queryParameters['id']);
+        }
+        await req.response.close();
+      });
+      HttpClient one = HttpClient();
+      HttpClientResponse res = await (await one.get(
+        '127.0.0.1',
+        server.port,
+        '/busy',
+      )).close();
+      expect(await utf8.decodeStream(res), 'busy');
+      List<int> r = await clientLoad(server.port, '/after', 8, 25);
+      expect(r[1], 0, reason: 'wrong answers');
+      expect(r[0], lessThan(2000), reason: '200 requests took ${r[0]} ms');
+      one.close(force: true);
+      await server.close();
+    });
+  });
+}
+
+/// A stand-in for a database driver: another isolate that answers each
+/// message `[reply port, id, delay ms]` with the id.
+Future<SendPort> replier() async {
+  ReceivePort ready = ReceivePort();
+  await Isolate.spawn(_replier, ready.sendPort);
+  return await ready.first as SendPort;
+}
+
+void _replier(SendPort out) {
+  ReceivePort inbox = ReceivePort();
+  out.send(inbox.sendPort);
+  inbox.listen((Object? msg) {
+    List<Object?> m = msg as List<Object?>;
+    (m[0] as SendPort).send(m[1]);
+  });
+}
+
+/// Load from another isolate: [clients] clients each send [count] requests
+/// to `path?id=<n>`, one after the other, and check that the body is `<n>`.
+/// Returns [milliseconds, wrong answers].
+Future<List<int>> clientLoad(
+  int port,
+  String path,
+  int clients,
+  int count,
+) async {
+  ReceivePort done = ReceivePort();
+  await Isolate.spawn(_clientLoad, <Object>[
+    done.sendPort,
+    port,
+    path,
+    clients,
+    count,
+  ]);
+  return (await done.first as List<Object?>).cast<int>();
+}
+
+void _clientLoad(List<Object> args) async {
+  SendPort out = args[0] as SendPort;
+  int port = args[1] as int;
+  String path = args[2] as String;
+  int clients = args[3] as int;
+  int count = args[4] as int;
+  HttpClient client = HttpClient()..maxConnectionsPerHost = clients;
+  int wrong = 0;
+  Stopwatch clock = Stopwatch()..start();
+  Future<void> one(int c) async {
+    for (int i = 0; i < count; i++) {
+      String id = '${c * count + i}';
+      HttpClientResponse res = await (await client.get(
+        '127.0.0.1',
+        port,
+        '$path?id=$id',
+      )).close();
+      if (await utf8.decodeStream(res) != id) wrong++;
+    }
+  }
+
+  await Future.wait(<Future<void>>[for (int c = 0; c < clients; c++) one(c)]);
+  client.close(force: true);
+  out.send(<int>[clock.elapsedMilliseconds, wrong]);
 }
