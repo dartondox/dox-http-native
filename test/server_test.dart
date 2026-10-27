@@ -76,6 +76,10 @@ void handle(HttpRequest req) async {
               .join(),
         }),
       );
+    case String path when path.startsWith('/status/'):
+      // a body for 204 or 304 must not go out
+      res.statusCode = int.parse(path.substring(8));
+      res.write('x');
     case String path when path.startsWith('/n/'):
       res.write(path.substring(3));
     case '/bad-cookie':
@@ -340,6 +344,95 @@ void main() {
       'GET / HTTP/1.1\r\nHost: a\r\nX-Big: $big\r\n\r\n',
     );
     expect(out, startsWith('HTTP/1.1 431'));
+  });
+
+  group('HTTP edge cases', () {
+    test('204 and 304 have no body, the connection goes on', () async {
+      String out = await raw(
+        port,
+        'GET /status/204 HTTP/1.1\r\n\r\n'
+        'GET /status/304 HTTP/1.1\r\n\r\n'
+        'GET / HTTP/1.1\r\nConnection: close\r\n\r\n',
+      );
+      expect(out, startsWith('HTTP/1.1 204'));
+      expect(out, contains('HTTP/1.1 304'));
+      expect(out, endsWith('\r\n\r\nHello World'));
+      // each head is followed by the next answer, with no body between
+      expect(out, contains('\r\n\r\nHTTP/1.1 304'));
+      expect(out, contains('\r\n\r\nHTTP/1.1 200'));
+    });
+
+    test('a request sent one byte at a time', () async {
+      Socket socket = await Socket.connect('127.0.0.1', port);
+      StringBuffer out = StringBuffer();
+      Future<void> done = socket
+          .listen((List<int> data) => out.write(latin1.decode(data)))
+          .asFuture<void>();
+      for (int b in latin1.encode(
+        'POST /echo HTTP/1.1\r\nContent-Length: 5\r\n'
+        'Connection: close\r\n\r\nhello',
+      )) {
+        socket.add(<int>[b]);
+        await socket.flush();
+      }
+      await done.timeout(const Duration(seconds: 5));
+      socket.destroy();
+      expect(out.toString(), startsWith('HTTP/1.1 200'));
+      expect(out.toString(), endsWith('hello'));
+    });
+
+    test('a client that stops sending still gets its answer', () async {
+      Socket socket = await Socket.connect('127.0.0.1', port);
+      StringBuffer out = StringBuffer();
+      Future<void> done = socket
+          .listen((List<int> data) => out.write(latin1.decode(data)))
+          .asFuture<void>();
+      socket.write('GET /slow HTTP/1.1\r\n\r\n');
+      await socket.close(); // closes the sending side only
+      await done.timeout(const Duration(seconds: 5));
+      expect(out.toString(), startsWith('HTTP/1.1 200'));
+      expect(out.toString(), endsWith('slow done'));
+    });
+
+    test(
+      'a GET with a body: the body is read, the next request works',
+      () async {
+        String out = await raw(
+          port,
+          'GET /echo HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc'
+          'GET / HTTP/1.1\r\nConnection: close\r\n\r\n',
+        );
+        expect(out, contains('\r\n\r\nabcHTTP/1.1 200'));
+        expect(out, endsWith('Hello World'));
+      },
+    );
+
+    test('two different Content-Length values get 400', () async {
+      String out = await raw(
+        port,
+        'POST /echo HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 4\r\n'
+        '\r\nabcd',
+      );
+      expect(out, startsWith('HTTP/1.1 400'));
+    });
+
+    test('a request with no Host', () async {
+      String out = await raw(
+        port,
+        'GET / HTTP/1.1\r\nConnection: close\r\n\r\n',
+      );
+      // accepted, like dart:io and hyper. RFC 9112 asks for 400.
+      expect(out, startsWith('HTTP/1.1 200'));
+    });
+
+    test('a very long URL', () async {
+      String out = await raw(
+        port,
+        'GET /${'a' * 20000} HTTP/1.1\r\nConnection: close\r\n\r\n',
+      );
+      // the URL counts toward the head limit
+      expect(out, startsWith('HTTP/1.1 431'));
+    });
   });
 
   test('413 for a body over the limit, with and without length', () async {
