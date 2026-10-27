@@ -10,8 +10,9 @@ import 'package:dox_http_native/src/request.dart';
 import 'package:dox_http_native/src/response.dart';
 import 'package:dox_http_native/src/websocket.dart';
 
-/// An [HttpServer] where Rust (hyper) owns the sockets and parses HTTP.
-/// Handlers run in Dart, like with `dart:io`.
+/// An [HttpServer] where Rust owns the sockets and parses HTTP. The socket
+/// work runs on the thread of this isolate. Handlers run in Dart, like
+/// with `dart:io`.
 ///
 /// ```
 /// NativeHttpServer server = await NativeHttpServer.bind(3000);
@@ -83,14 +84,28 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   /// so the client sees the 413 and not a reset.
   /// A client that sends no body bytes for [bodyTimeout] (idle time) gets
   /// 408. A slow but steady upload is fine.
+  /// With [maxConnections], this server holds at most that many connections
+  /// open. Then it stops accepting until one closes, and new clients wait
+  /// in the listen queue of the OS. Default: no limit.
   static Future<NativeHttpServer> bind(
     int port, {
     Object? address,
     int maxBodySize = 100 * 1024 * 1024,
     int? maxMultipartSize,
     Duration bodyTimeout = const Duration(seconds: 120),
+    int? maxConnections,
   }) async {
     ensureAvailable();
+    if (port < 0 || port > 65535) {
+      throw ArgumentError.value(port, 'port', 'must be 0 to 65535');
+    }
+    if (maxConnections != null && maxConnections < 1) {
+      throw ArgumentError.value(
+        maxConnections,
+        'maxConnections',
+        'must be 1 or more',
+      );
+    }
     InternetAddress? ip = await _resolve(address);
     List<int> raw = ip?.rawAddress ?? const <int>[];
     int family = ip == null ? 0 : (raw.length == 4 ? 4 : 6);
@@ -103,13 +118,15 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
       }
     }
     late NativeHttpServer server;
+    // Rust posts [1] when the sockets have something while Dart is idle,
+    // and [2] when a graceful close is done. An empty message is a probe:
+    // "is this isolate alive?"
     RawReceivePort receive = RawReceivePort((Object? msg) {
-      if (msg is Uint8List) return server._onBatch(msg, const <Object?>[]);
-      // a batch with big bodies: [batch, body, body, ...]
-      List<Object?> parts = msg as List<Object?>;
-      server._onBatch(parts[0] as Uint8List, parts);
+      if (msg is! Uint8List || msg.isEmpty) return;
+      if (msg[0] == 2) return server._done();
+      server._pump();
     }, 'dox_http_native');
-    int handle = doxStart(
+    int handle = doxBind(
       port,
       receive.sendPort.nativePort,
       maxBodySize,
@@ -118,6 +135,7 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
       family,
       hi,
       lo,
+      maxConnections ?? 0,
     );
     if (handle <= 0) {
       receive.close();
@@ -132,7 +150,7 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
     server = NativeHttpServer._(
       handle,
       receive,
-      doxPort(handle),
+      doxBoundPort(handle),
       ip ?? InternetAddress.anyIPv6,
     );
     return server;
@@ -174,8 +192,8 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   @override
   bool autoCompress = false;
 
-  // ponytail: idle keep-alive is not cut by this value. hyper closes a
-  // connection that sends no headers for 30 seconds.
+  // ponytail: idle keep-alive is not cut by this value. Rust closes a
+  // connection that sends no whole request head for 30 seconds.
   @override
   Duration? idleTimeout = const Duration(seconds: 120);
 
@@ -231,12 +249,15 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
       if (drained == null) {
         drained = _drained = Completer<void>();
         doxShutdown(_handle);
+        _schedulePump();
       }
       await drained.future;
     }
     if (_handle != 0) {
-      doxStop(_handle);
+      doxUnbind(_handle);
       _handle = 0;
+      doxFree(_outPtr, _out.length);
+      doxFree(_inPtr, _inList.length);
       _receive.close();
       // not awaited: with no listener the close future never completes
       unawaited(_requests.close());
@@ -262,14 +283,14 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
 
   bool _inBatch = false;
 
-  /// [parts] holds the big bodies from index 1, in the order of the
-  /// records that have flag bit 2.
-  void _onBatch(Uint8List b, List<Object?> parts) {
-    if (b.isEmpty) return; // a probe from Rust: "is this isolate alive?"
-    if (b.length == 1) return _done(); // a graceful close is done
+  /// Frees an external body when Dart is done with it.
+  static final Pointer<NativeFinalizerFunction> _freeBody =
+      Native.addressOf<NativeFinalizerFunction>(doxFreeBody);
+
+  /// The requests and messages from one `dox_run` call.
+  void _onBatch(Uint8List b) {
     ByteData d = ByteData.sublistView(b);
     int p = 0;
-    int nextPart = 1;
     // bytes of WebSocket messages in this batch, acknowledged at the end
     int wsBytes = 0;
     _inBatch = true;
@@ -291,8 +312,17 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
         q += tlen;
         Uint8List headers = Uint8List.sublistView(b, q, q + hlen);
         q += hlen;
+        // flag bit 2: the body is in native memory (address, token,
+        // length), freed by its finalizer
         Uint8List body = flags & 4 == 4
-            ? parts[nextPart++] as Uint8List
+            ? Pointer<Uint8>.fromAddress(d.getUint64(q, Endian.little))
+                  .asTypedList(
+                    d.getUint64(q + 16, Endian.little),
+                    finalizer: _freeBody,
+                    token: Pointer<Void>.fromAddress(
+                      d.getUint64(q + 8, Endian.little),
+                    ),
+                  )
             : Uint8List.sublistView(b, q, q + blen);
         p = q + blen;
         int kind = (flags >> 8) & 0xff;
@@ -305,10 +335,11 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
         }
         if (kind != 0) {
           // a WebSocket message or close. The port field is the close code.
-          if (kind != 3) wsBytes += blen;
+          if (kind != 3) wsBytes += body.length;
           sockets[id]?.receive(kind, remotePort, body);
           continue;
         }
+        _open++;
         _requests.add(
           NativeRequest(
             this,
@@ -330,7 +361,8 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
         sendWebSocket(wsBytes, NativeWebSocket.kindAck, 0, const <int>[]);
       }
       _inBatch = false;
-      _flush();
+      // more requests may wait: always ask Rust again
+      _schedulePump();
     }
   }
 
@@ -345,10 +377,29 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
 
   // ---- responses to Rust ----
 
-  Uint8List _out = Uint8List(1 << 16);
+  // native memory: `dox_run` is not a leaf call, so it can not take
+  // bytes of the Dart heap
+  Pointer<Uint8> _outPtr = doxAlloc(1 << 16);
+  late Uint8List _out = _outPtr.asTypedList(1 << 16);
   late ByteData _outData = ByteData.sublistView(_out);
   int _len = 0;
-  bool _flushQueued = false;
+
+  Pointer<Uint8> _inPtr = doxAlloc(1 << 18);
+  late Uint8List _inList = _inPtr.asTypedList(1 << 18);
+
+  /// requests given to the app and not answered yet
+  int _open = 0;
+  bool _pumpQueued = false;
+  int _chain = 0;
+
+  /// the last `dox_run` call found nothing
+  bool _lastEmpty = true;
+
+  /// How long `dox_run` may wait for new requests. Only when no request is
+  /// open and the last call found nothing: else Dart may have other work
+  /// (timers, database replies, other ports) and must not wait here. When
+  /// none comes, Rust hands the sockets to its idle thread.
+  static const int _budgetUs = 1000;
 
   Uint8List _defaultLines = Uint8List(0);
   int _defaultVersion = -1;
@@ -360,7 +411,10 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
     while (size < need) {
       size *= 2;
     }
-    Uint8List grown = Uint8List(size)..setRange(0, _len, _out);
+    Pointer<Uint8> ptr = doxAlloc(size);
+    Uint8List grown = ptr.asTypedList(size)..setRange(0, _len, _out);
+    doxFree(_outPtr, _out.length);
+    _outPtr = ptr;
     _out = grown;
     _outData = ByteData.sublistView(grown);
   }
@@ -369,6 +423,10 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
     if (name == HttpHeaders.contentLengthHeader ||
         name == HttpHeaders.transferEncodingHeader) {
       return; // Rust sets these from the body
+    }
+    if (name == HttpHeaders.connectionHeader &&
+        value.toLowerCase().contains('close')) {
+      _closeLine = true;
     }
     _ensure(name.length + value.length + 4);
     Uint8List o = _out;
@@ -424,6 +482,9 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   /// Starts a record: the 20 byte head. Header lines may follow, then
   /// [_endRecord] adds the body.
   int _startRecord(int id, int status, int kind) {
+    // an answer to a request (whole, WebSocket accept or streamed)
+    int k = kind & 0xff;
+    if (k == 0 || k == 1 || k == 6) _open--;
     _ensure(20);
     int start = _len;
     _outData.setUint64(start, id, Endian.little);
@@ -479,9 +540,17 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
     // kind bit 8: Rust gzips the body, off this isolate
     bool zip = autoCompress && body.length > 256 && _gzip(req, res);
     int start = _startRecord(req.id, res.statusCode, zip ? 0x100 : 0);
+    _closeLine = false;
     _headerLines(res);
+    // kind bit 9: the lines say `connection: close`, Rust closes after
+    if (_closeLine) {
+      _outData.setUint16(start + 10, (zip ? 0x100 : 0) | 0x200, Endian.little);
+    }
     _endRecord(start, body);
   }
+
+  /// [_line] wrote `connection: close`
+  bool _closeLine = false;
 
   /// Starts the answer of [req] with a body in parts. [first] is the first
   /// part. Returns the stream id for [sendPart] and [endStream].
@@ -538,9 +607,18 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   }
 
   void _queueFlush() {
-    if (!_inBatch && !_flushQueued) {
-      _flushQueued = true;
-      scheduleMicrotask(_flush);
+    if (!_inBatch) _schedulePump();
+  }
+
+  void _schedulePump() {
+    if (_pumpQueued || _handle == 0) return;
+    _pumpQueued = true;
+    // now and then through the event loop, so timers and other ports
+    // (eg. a database) get a turn under load
+    if (++_chain & 15 == 0) {
+      Timer.run(_pump);
+    } else {
+      scheduleMicrotask(_pump);
     }
   }
 
@@ -556,14 +634,50 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
     return true;
   }
 
-  void _flush() {
-    _flushQueued = false;
-    if (_len == 0 || _handle == 0) return;
-    doxRespondBatch(_handle, _out.address, _len);
+  /// Sends the queued answers and takes the next requests, in one call.
+  void _pump() {
+    _pumpQueued = false;
+    if (_handle == 0) return;
+    int n = doxRun(
+      _handle,
+      _outPtr,
+      _len,
+      _inPtr,
+      _inList.length,
+      _open <= 0 && _lastEmpty ? _budgetUs : 0,
+    );
     _len = 0;
     if (_out.length > 1 << 20) {
-      _out = Uint8List(1 << 16); // do not keep a big body buffer forever
+      // do not keep a big body buffer forever
+      doxFree(_outPtr, _out.length);
+      _outPtr = doxAlloc(1 << 16);
+      _out = _outPtr.asTypedList(1 << 16);
       _outData = ByteData.sublistView(_out);
+    }
+    while (n < 0) {
+      // one request is bigger than the buffer
+      doxFree(_inPtr, _inList.length);
+      int size = _inList.length * 2;
+      while (size < -n) {
+        size *= 2;
+      }
+      _inPtr = doxAlloc(size);
+      _inList = _inPtr.asTypedList(size);
+      n = doxRun(_handle, _outPtr, 0, _inPtr, size, 0);
+    }
+    _lastEmpty = n == 0;
+    if (n == 0) {
+      _chain = 0;
+      return; // Rust posts to the port when more comes
+    }
+    // a copy: Rust writes the next batch into the same buffer, and the
+    // requests keep views of this one
+    _onBatch(_inList.sublist(0, n));
+    if (_inList.length > 1 << 20) {
+      // do not keep a big buffer forever
+      doxFree(_inPtr, _inList.length);
+      _inPtr = doxAlloc(1 << 18);
+      _inList = _inPtr.asTypedList(1 << 18);
     }
   }
 }

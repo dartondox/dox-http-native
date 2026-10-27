@@ -10,19 +10,12 @@ crate-type = ["cdylib"]
 [dependencies]
 bytes = "1.12.1"
 flate2 = "1.1.10"
-futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }
-http-body-util = "0.1.5"
 httparse = "1.10.1"
-hyper = { version = "1.12.0", features = ["http1", "server"] }
-hyper-util = { version = "0.1.21", features = ["tokio"] }
+httpdate = "1.0.3"
+mio = { version = "1.2.4", features = ["os-poll", "net"] }
 slab = "0.4.12"
 socket2 = { version = "0.6.5", features = ["all"] }
-tokio = { version = "1.54.0", features = ["rt", "net", "sync", "macros", "time", "io-util"] }
-tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
-
-[dev-dependencies]
-# paused time, so the timeout tests do not wait for real
-tokio = { version = "1.54.0", features = ["test-util"] }
+tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 
 [profile.release]
 opt-level = 3
@@ -30,3 +23,6 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191"

@@ -29,6 +29,23 @@ void main() {
     expect(names, <String>['x-test-long', 'x-test', 'accept', 'content-type']);
   });
 
+  test('a line break in a content type is refused', () {
+    NativeHeaders h = NativeHeaders.response(NativeHeaders.empty());
+    for (ContentType bad in <ContentType>[
+      ContentType('text', 'html\r\nx-injected: yes'),
+      ContentType(
+        'text',
+        'html',
+        parameters: <String, String?>{'a': 'b\r\nx-injected: yes'},
+      ),
+    ]) {
+      expect(() => h.contentType = bad, throwsFormatException);
+      expect(h.value(HttpHeaders.contentTypeHeader), isNull);
+    }
+    h.contentType = ContentType.json;
+    expect(h.value(HttpHeaders.contentTypeHeader), ContentType.json.toString());
+  });
+
   test('response content type is kept without a parse', () {
     NativeHeaders h = NativeHeaders.response(NativeHeaders.empty());
     h.contentType = ContentType.json;

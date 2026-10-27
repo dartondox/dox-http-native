@@ -1,3 +1,31 @@
+## Unreleased
+
+- Fix (Linux): a client that sent its request and then closed its sending side never had its connection closed. The close came in the same event as the request, and the server waited for a new event that never came. Now the server keeps the close from the event and reads on until it sees it. Test: a client that stops sending still gets its answer, and the connection closes.
+- Fix: an answer that comes later (eg. after a database query) could wait up to seconds. The idle helper thread held the sockets, and Dart had to wait until the helper gave them back. Now the helper only watches the poll file (epoll or kqueue) and never holds the sockets, so Dart never waits for it. Tests: answers after a reply from another isolate, after timers of different lengths, a long async task next to fast requests, and a long synchronous task.
+- Perf: one thread per isolate. The socket work (accept, read, parse, write) now runs on the isolate's own thread, in a loop of FFI calls (`dox_run`). Before, each isolate had its own Rust network thread, and every request and answer went from one thread to the other. A small helper thread now only watches the sockets while the isolate is idle, and wakes it when a request comes.
+- All features stay the same: WebSocket (now the sync `tungstenite` crate), streamed answers, big bodies without a copy, gzip (on a helper thread), `Expect: 100-continue`, `400`/`413`/`431`/`408`, lingering close, graceful `close()` and `close(force: true)`.
+- New: at most 64 requests of one connection wait for an answer. Then the server stops reading that connection until answers go out, so one client can not fill the memory with pipelined requests.
+- New: a request head must arrive within 30 seconds, and a connection with no request for 30 seconds is closed (like hyper before).
+- New: a request with both `Content-Length` and `Transfer-Encoding: chunked` gets `400`. A `Transfer-Encoding` other than `chunked` gets `501`.
+- Removed: the hyper and tokio server and the `DOX_HTTP_THREAD=shared` setting.
+- New: `NativeHttpServer.bind(maxConnections: ...)`. At the limit the server stops accepting until a connection closes. Default: no limit.
+- Breaking: native ABI 7 (new FFI calls, the big bodies come as native memory with a finalizer, `dox_bind` takes the connection limit). Needs a new native library build. The build hook builds it with cargo until the next release.
+
+### Security
+
+- A WebSocket client that sent ping frames without end held the isolate, so other requests waited for seconds. Now one call reads at most 256 KB of one WebSocket, and each connection gets one turn per call.
+- A WebSocket client that sent pings and never read the pongs made memory grow without limit. Now the server stops reading its frames while more than 256 KB waits to be written.
+- A client that pipelined requests and never read the answers made memory grow without limit. Now the server stops reading its requests while 1 MB of answers waits.
+- A client that never read its HTTP answer kept the connection open forever. Now a write with no progress for 30 seconds closes it.
+- A streamed answer with a wrong `contentLength` could look like two answers to the client (response desync). Now Rust counts the bytes and closes the connection on a mismatch. In Dart, like `dart:io`, `add()` throws when the body passes the length, and `close()` fails when it is shorter.
+- When the isolate died while it owned the sockets, the port stayed open and clients waited forever. Now the helper thread checks every 100 ms that the isolate lives, and closes the server when it is gone.
+- `headers.contentType` with a line break in a part could add a header. Now it throws a `FormatException`.
+- `Content-Length` took `+5` and other white space. Now only ASCII digits pass, else `400`.
+- An idle connection no longer holds a 16 KB read buffer.
+- The idle time of a keep-alive connection now counts from its last answer, not its last request.
+- A huge `bodyTimeout` no longer overflows the clock (it is cut to one year). A port out of range throws an `ArgumentError`.
+- A raw UTF-8 byte in the request target now reaches `req.uri` as `%XX` of that byte, not as Latin-1 text.
+
 ## 3.0.0
 
 - README: streamed bodies (over 64 KB with `addStream`) are supported. The build hook has 4 steps, not 3.
