@@ -1,4 +1,4 @@
-## Unreleased
+## 3.0.1
 
 - Fix (Linux): a client that sent its request and then closed its sending side never had its connection closed. The close came in the same event as the request, and the server waited for a new event that never came. Now the server keeps the close from the event and reads on until it sees it. Test: a client that stops sending still gets its answer, and the connection closes.
 - Fix: an answer that comes later (eg. after a database query) could wait up to seconds. The idle helper thread held the sockets, and Dart had to wait until the helper gave them back. Now the helper only watches the poll file (epoll or kqueue) and never holds the sockets, so Dart never waits for it. Tests: answers after a reply from another isolate, after timers of different lengths, a long async task next to fast requests, and a long synchronous task.
@@ -9,7 +9,7 @@
 - New: a request with both `Content-Length` and `Transfer-Encoding: chunked` gets `400`. A `Transfer-Encoding` other than `chunked` gets `501`.
 - Removed: the hyper and tokio server and the `DOX_HTTP_THREAD=shared` setting.
 - New: `NativeHttpServer.bind(maxConnections: ...)`. At the limit the server stops accepting until a connection closes. Default: no limit.
-- Breaking: native ABI 7 (new FFI calls, the big bodies come as native memory with a finalizer, `dox_bind` takes the connection limit). Needs a new native library build. The build hook builds it with cargo until the next release.
+- Breaking: native ABI 7 (new FFI calls, the big bodies come as native memory with a finalizer, `dox_bind` takes the connection limit). The build hook gets the new native library.
 
 ### Security
 
@@ -45,7 +45,7 @@
 - Perf: a response with the default headers and one content type (eg. JSON) copies no headers, and its header bytes are cached.
 - Perf: request headers are parsed into a map on the second lookup, not scanned again and again.
 - Perf: a request path with no query skips the full `Uri.parse`. Rust takes the lock of the answers once per batch.
-- Breaking: native ABI 6 (streamed body records, gzip flag, big bodies as their own part of the message). Needs a new native library build. The build hook builds it with cargo until the next release.
+- Breaking: native ABI 6 (streamed body records, gzip flag, big bodies as their own part of the message). The build hook gets the new native library.
 
 - New: WebSocket upgrade on the native server. `NativeWebSocket.upgrade(request, protocol: ..., maxMessageSize: ...)` accepts it and gives a `dart:io` `WebSocket`. Rust (tokio-tungstenite) speaks the protocol: ping and pong, the close handshake, the UTF-8 check and the size limit (a bigger message closes with `1009`). Compression is never agreed. `NativeWebSocket.isUpgradeRequest(request)` tells if a request asks for one.
 - On a graceful `close()`, open WebSockets get close code `1001`.
@@ -54,7 +54,7 @@
   - A message that can not be sent in 30 seconds drops the socket (`1006`). The close handshake (our close frame and the answer) has 5 seconds in all, then the socket is dropped (`1006`).
   - When Dart has more than 8 MiB of client messages not yet handled, Rust stops reading from WebSocket clients until it catches up. No message is lost. HTTP is not paused.
 - New: `NativeHttpServer.ensureAvailable()` throws an error that says why the library did not load and how to fix it. `bind` throws the same error.
-- Breaking: native ABI 5 (new WebSocket records, and an ack record from Dart). Needs a new native library build. The build hook builds it with cargo until the next release.
+- Breaking: native ABI 5 (new WebSocket records, and an ack record from Dart). The build hook gets the new native library.
 - Breaking: Dox has no `dart:io` server any more. When this library does not load, Dox stops at start with the reason.
 - Security: a multipart form may be up to `maxMultipartSize` bytes (new `bind` option, default `maxBodySize`). Any other body, eg. JSON, raw or text, is limited to `maxBodySize`. Dox passes its own two limits, so a JSON body over 10 MB now gets `413` from Rust.
 - Security: a body with a too big `Content-Length` and `Expect: 100-continue` gets `413` at once. Without `Expect`, Rust reads and drops the body (up to 64 MB more, no memory kept), then sends `413`, so the client sees the `413` and not a connection reset.
