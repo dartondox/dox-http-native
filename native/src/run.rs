@@ -241,6 +241,10 @@ struct Conn {
     shut: bool,
     /// the client closed its side
     eof: bool,
+    /// the poll saw the client close its side. A short read must then go on
+    /// until the 0: on Linux the close comes in the same event as the last
+    /// bytes, and no new event follows.
+    hup: bool,
     /// lingering close: (started, bytes dropped)
     linger: Option<(Instant, usize)>,
     /// when the last request came or the last answer went out (or the
@@ -602,6 +606,7 @@ impl Conn {
             switch: false,
             shut: false,
             eof: false,
+            hup: false,
             linger: None,
             since: now,
             timer: None,
@@ -657,7 +662,7 @@ impl Conn {
                     self.rlen += k;
                     // a short read: the socket is empty now. New bytes give
                     // a new edge, so no extra read that ends in WouldBlock.
-                    if self.rlen < self.rbuf.len() {
+                    if self.rlen < self.rbuf.len() && !self.hup {
                         return true;
                     }
                 }
@@ -1484,9 +1489,10 @@ impl Core {
                         ev.is_writable(),
                         ev.is_readable() || ev.is_read_closed() || ev.is_error(),
                     );
-                    let Some(c) = self.conns.get(idx) else {
+                    let Some(c) = self.conns.get_mut(idx) else {
                         continue;
                     };
+                    c.hup |= ev.is_read_closed();
                     let paused = c.paused || c.ws.as_ref().is_some_and(|w| w.paused);
                     if readable && !paused {
                         self.queue(idx);
