@@ -9,7 +9,7 @@
 - New: a request with both `Content-Length` and `Transfer-Encoding: chunked` gets `400`. A `Transfer-Encoding` other than `chunked` gets `501`.
 - Removed: the hyper and tokio server and the `DOX_HTTP_THREAD=shared` setting.
 - New: `NativeHttpServer.bind(maxConnections: ...)`. At the limit the server stops accepting until a connection closes. Default: no limit.
-- Breaking: native ABI 9 (new FFI calls, the big bodies come as native memory with a finalizer, `dox_bind` takes the connection limit). Needs a new native library build. The build hook builds it with cargo until the next release.
+- Breaking: native ABI 7 (new FFI calls, the big bodies come as native memory with a finalizer, `dox_bind` takes the connection limit). Needs a new native library build. The build hook builds it with cargo until the next release.
 
 ### Security
 
