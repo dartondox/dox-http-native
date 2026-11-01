@@ -1,4 +1,4 @@
-## 3.0.3
+## Unreleased
 
 - New: `NativeHttpServer.bind(idleTimeout: ...)`. A keep-alive connection with no new request for this time closes. A request head must also come whole in this time. Default: 30 seconds, as before. Behind a load balancer, set it longer than the idle timeout of the balancer (eg. 65 seconds for AWS ALB, which keeps connections for 60 seconds). Else the server may close a connection the balancer still uses, and clients get 502.
 - The `idleTimeout` field now shows the value given to `bind`. Setting it later still has no effect, and it stays deprecated.
