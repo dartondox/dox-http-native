@@ -192,8 +192,12 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   @override
   bool autoCompress = false;
 
-  // ponytail: idle keep-alive is not cut by this value. Rust closes a
-  // connection that sends no whole request head for 30 seconds.
+  /// Has no effect. The server closes a connection that sends no whole
+  /// request head for 30 seconds, and this value does not change that.
+  /// It stays so code that sets it still compiles.
+  // ponytail: wiring it to Rust needs a new FFI call (a native ABI bump);
+  // add it when someone needs a different idle time.
+  @Deprecated('Has no effect. The idle time is a fixed 30 seconds.')
   @override
   Duration? idleTimeout = const Duration(seconds: 120);
 
@@ -623,16 +627,84 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   }
 
   /// true when the client takes gzip and the body is not encoded yet.
-  /// Then it sets `content-encoding` and Rust gzips the body.
+  /// Then it sets `content-encoding` and Rust gzips the body. When the
+  /// body could be gzipped, it also adds `Vary: Accept-Encoding`, so a
+  /// shared cache does not give gzip to a client that can not read it.
   bool _gzip(NativeRequest req, NativeResponse res) {
-    String? accept = req.headers.value(HttpHeaders.acceptEncodingHeader);
-    if (accept == null || !accept.contains('gzip')) return false;
-    if (res.headers.value(HttpHeaders.contentEncodingHeader) != null) {
+    HttpHeaders headers = res.headers;
+    if (headers.value(HttpHeaders.contentEncodingHeader) != null) {
       return false;
     }
-    res.headers.set(HttpHeaders.contentEncodingHeader, 'gzip');
+    if (_compressed(headers.value(HttpHeaders.contentTypeHeader))) {
+      return false;
+    }
+    if (!_varies(headers[HttpHeaders.varyHeader])) {
+      headers.add(HttpHeaders.varyHeader, 'Accept-Encoding');
+    }
+    if (!_acceptsGzip(req.headers.value(HttpHeaders.acceptEncodingHeader))) {
+      return false;
+    }
+    headers.set(HttpHeaders.contentEncodingHeader, 'gzip');
     return true;
   }
+
+  /// true when [vary] names `Accept-Encoding` (or is `*`) already.
+  static bool _varies(List<String>? vary) {
+    if (vary == null) return false;
+    for (String v in vary) {
+      String l = v.toLowerCase();
+      if (l.contains('accept-encoding') || l.trim() == '*') return true;
+    }
+    return false;
+  }
+
+  /// true when [accept] (an `Accept-Encoding` value) lists gzip with a q
+  /// above 0. `gzip;q=0` means "not gzip".
+  static bool _acceptsGzip(String? accept) {
+    if (accept == null || !accept.contains('gzip')) return false;
+    for (String part in accept.split(',')) {
+      List<String> params = part.split(';');
+      String name = params[0].trim().toLowerCase();
+      if (name != 'gzip' && name != 'x-gzip') continue;
+      for (int i = 1; i < params.length; i++) {
+        String p = params[i].trim().toLowerCase();
+        if (p.startsWith('q=')) {
+          double? q = double.tryParse(p.substring(2).trim());
+          if (q != null && q <= 0) return false;
+        }
+      }
+      return true;
+    }
+    return false;
+  }
+
+  /// true for a content type that is compressed already (images, audio,
+  /// video, archives, fonts). gzip makes those bigger, not smaller.
+  static bool _compressed(String? contentType) {
+    if (contentType == null) return false;
+    String t = contentType.toLowerCase();
+    int semi = t.indexOf(';');
+    if (semi >= 0) t = t.substring(0, semi);
+    t = t.trim();
+    if (t.startsWith('image/')) return t != 'image/svg+xml';
+    if (t.startsWith('audio/') || t.startsWith('video/')) return true;
+    return _compressedTypes.contains(t);
+  }
+
+  static const Set<String> _compressedTypes = <String>{
+    'application/zip',
+    'application/gzip',
+    'application/x-gzip',
+    'application/x-bzip2',
+    'application/x-xz',
+    'application/x-7z-compressed',
+    'application/x-rar-compressed',
+    'application/vnd.rar',
+    'application/zstd',
+    'application/x-brotli',
+    'font/woff',
+    'font/woff2',
+  };
 
   /// Sends the queued answers and takes the next requests, in one call.
   void _pump() {
