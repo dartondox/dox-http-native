@@ -192,8 +192,12 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   @override
   bool autoCompress = false;
 
-  // ponytail: idle keep-alive is not cut by this value. Rust closes a
-  // connection that sends no whole request head for 30 seconds.
+  /// Has no effect. The server closes a connection that sends no whole
+  /// request head for 30 seconds, and this value does not change that.
+  /// It stays so code that sets it still compiles.
+  // ponytail: wiring it to Rust needs a new FFI call (a native ABI bump);
+  // add it when someone needs a different idle time.
+  @Deprecated('Has no effect. The idle time is a fixed 30 seconds.')
   @override
   Duration? idleTimeout = const Duration(seconds: 120);
 
