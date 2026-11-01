@@ -5,7 +5,7 @@
 - Fix: with `autoCompress`, answers that could be gzipped now send `Vary: Accept-Encoding`, so a shared cache does not give a gzip body to a client that can not read it.
 - Fix: `Accept-Encoding: gzip;q=0` means "no gzip", and is now read that way.
 - Fix: bodies that are compressed already (images, audio, video, zip, gz, woff and so on) are not gzipped again. `image/svg+xml` is still gzipped.
-- Native ABI 9 (`dox_bind` takes the idle timeout). The build hook gets the new native library.
+- `dox_bind` takes the idle timeout. The native ABI version goes up at release. The build hook gets the new native library.
 
 ## 3.0.2
 
