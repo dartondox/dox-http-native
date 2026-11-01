@@ -33,6 +33,9 @@ void handle(HttpRequest req) async {
       res.write('{"a":1}');
     case '/long':
       res.write('a' * 1000);
+    case '/jpeg':
+      res.headers.contentType = ContentType('image', 'jpeg');
+      res.add(List<int>.filled(1000, 7));
     case '/stream':
       // 5 MiB in 64 KiB parts. ?length=1 sets the content length.
       res.headers.contentType = ContentType.binary;
@@ -576,6 +579,51 @@ void main() {
       HttpClientResponseCompressionState.decompressed,
     );
     expect(await utf8.decodeStream(res), 'a' * 1000);
+    await zip.close();
+  });
+
+  test('compress: Vary: Accept-Encoding is sent', () async {
+    NativeHttpServer zip = await start(0)
+      ..autoCompress = true;
+    String gz = await raw(
+      zip.port,
+      'GET /long HTTP/1.1\r\nAccept-Encoding: gzip\r\n'
+      'Connection: close\r\n\r\n',
+    );
+    expect(gz.toLowerCase(), contains('vary: accept-encoding'));
+    // also when this client does not take gzip: a cache must still know
+    String plain = await raw(
+      zip.port,
+      'GET /long HTTP/1.1\r\nConnection: close\r\n\r\n',
+    );
+    expect(plain.toLowerCase(), contains('vary: accept-encoding'));
+    expect(plain, endsWith('a' * 1000));
+    await zip.close();
+  });
+
+  test('compress: gzip;q=0 is not gzipped', () async {
+    NativeHttpServer zip = await start(0)
+      ..autoCompress = true;
+    String out = await raw(
+      zip.port,
+      'GET /long HTTP/1.1\r\nAccept-Encoding: gzip;q=0, identity\r\n'
+      'Connection: close\r\n\r\n',
+    );
+    expect(out.toLowerCase(), isNot(contains('content-encoding')));
+    expect(out, endsWith('a' * 1000));
+    await zip.close();
+  });
+
+  test('compress: image/jpeg is not gzipped', () async {
+    NativeHttpServer zip = await start(0)
+      ..autoCompress = true;
+    String out = await raw(
+      zip.port,
+      'GET /jpeg HTTP/1.1\r\nAccept-Encoding: gzip\r\n'
+      'Connection: close\r\n\r\n',
+    );
+    expect(out.toLowerCase(), isNot(contains('content-encoding')));
+    expect(out.toLowerCase(), contains('content-length: 1000'));
     await zip.close();
   });
 
