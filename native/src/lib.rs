@@ -81,6 +81,7 @@
 //!   than 256 KB (eg. pongs) waits to be written, Rust reads no frames of it.
 //! - HTTP: while 1 MB of answers waits to be written, Rust reads no new
 //!   requests of that connection. See `run.rs` for the other limits.
+mod aead;
 mod run;
 
 use std::ffi::{CStr, c_char, c_int, c_void};
@@ -93,7 +94,7 @@ use std::time::Duration;
 use socket2::{Domain, Protocol, Socket, Type};
 
 /// Bump when the FFI functions or the record layout change.
-const ABI_VERSION: i32 = 7;
+const ABI_VERSION: i32 = 8;
 /// Max size of the request line plus headers. Bigger gets 431.
 const MAX_HEAD: usize = 16 * 1024;
 const RES_HEAD: usize = 20;

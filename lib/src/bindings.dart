@@ -4,7 +4,7 @@ import 'dart:ffi';
 /// the library as the code asset of this file.
 
 /// The ABI version the Dart side expects. Must match `ABI_VERSION` in Rust.
-const int abiVersion = 7;
+const int abiVersion = 8;
 
 @Native<Int32 Function()>(symbol: 'dox_version', isLeaf: true)
 external int doxVersion();
@@ -76,3 +76,46 @@ external void doxFree(Pointer<Uint8> ptr, int size);
 /// Frees an external body (the finalizer of its typed list).
 @Native<Void Function(Pointer<Void>)>(symbol: 'dox_free_body', isLeaf: true)
 external void doxFreeBody(Pointer<Void> token);
+
+/// AES-256-GCM, see native/src/aead.rs. [out] gets nonce + ciphertext +
+/// tag (`plainLen + 28` bytes). Returns 0, -1 for bad arguments, -2 when
+/// the system random source fails.
+@Native<
+  Int32 Function(
+    Pointer<Uint8>,
+    Pointer<Uint8>,
+    Int64,
+    Pointer<Uint8>,
+    Int64,
+    Pointer<Uint8>,
+  )
+>(symbol: 'dox_aes_gcm_seal', isLeaf: true)
+external int doxAesGcmSeal(
+  Pointer<Uint8> key,
+  Pointer<Uint8> aad,
+  int aadLen,
+  Pointer<Uint8> plain,
+  int plainLen,
+  Pointer<Uint8> out,
+);
+
+/// The plain text of [data] in [out] (`dataLen - 28` bytes). Returns its
+/// length, or -1 when the data was changed or the key or aad is wrong.
+@Native<
+  Int64 Function(
+    Pointer<Uint8>,
+    Pointer<Uint8>,
+    Int64,
+    Pointer<Uint8>,
+    Int64,
+    Pointer<Uint8>,
+  )
+>(symbol: 'dox_aes_gcm_open', isLeaf: true)
+external int doxAesGcmOpen(
+  Pointer<Uint8> key,
+  Pointer<Uint8> aad,
+  int aadLen,
+  Pointer<Uint8> data,
+  int dataLen,
+  Pointer<Uint8> out,
+);

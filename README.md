@@ -109,6 +109,19 @@ How it works:
 - `autoCompress`: Rust gzips the body on a helper thread, not on the isolate.
 - Streaming: a small body is sent in one piece on `close`. When `addStream` passes 64 KB, the answer starts and the rest of the body goes out in parts. A big file never sits in memory.
 
+## AES-GCM
+
+`AesGcm` is AES-256-GCM in Rust, with the AES and carry-less multiply instructions of the CPU. dox_core uses it for encrypted cookies. It works without a server.
+
+```dart
+Uint8List sealed = AesGcm.seal(key, plain, aad);   // nonce + ciphertext + tag
+Uint8List? plain = AesGcm.open(key, sealed, aad);  // null when changed
+```
+
+- `key` is 32 bytes. `aad` binds the value to a context, like a cookie name.
+- Each `seal` makes a new random 12-byte nonce.
+- One 200-byte cookie takes about 1–2 µs. The same work in pure Dart took about 100 µs.
+
 ## Security notes
 
 - Run it behind a reverse proxy (eg. nginx or a load balancer) on the open internet. The proxy should end TLS, limit the request rate and drop slow clients.

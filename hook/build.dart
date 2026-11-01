@@ -179,8 +179,16 @@ Future<Uri?> _cargo(
   } on ProcessException {
     return null; // no cargo
   }
+  // every Rust file, so a change in any of them builds the library again
   output.dependencies.add(native.resolve('Cargo.toml'));
-  output.dependencies.add(native.resolve('src/lib.rs'));
+  output.dependencies.add(native.resolve('Cargo.lock'));
+  for (FileSystemEntity file in Directory.fromUri(
+    native.resolve('src/'),
+  ).listSync(recursive: true)) {
+    if (file is File && file.path.endsWith('.rs')) {
+      output.dependencies.add(file.uri);
+    }
+  }
   Uri lib = target.resolve('release/$fileName');
   return File.fromUri(lib).existsSync() ? lib : null;
 }
