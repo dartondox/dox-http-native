@@ -1,3 +1,8 @@
+## 3.0.2
+
+- New: `AesGcm.seal` and `AesGcm.open`, AES-256-GCM in Rust. It uses the AES and carry-less multiply instructions of the CPU. dox_core uses it for encrypted cookies and `AESEncryptor`. One cookie took about 100 µs in pure Dart (pointycastle), and now takes under a few µs. The layout (nonce + ciphertext + tag) is the same, so values made before still open.
+- Native ABI 8 (two new FFI calls). The build hook gets the new native library.
+
 ## 3.0.1
 
 - Fix (Linux): a client that sent its request and then closed its sending side never had its connection closed. The close came in the same event as the request, and the server waited for a new event that never came. Now the server keeps the close from the event and reads on until it sees it. Test: a client that stops sending still gets its answer, and the connection closes.
