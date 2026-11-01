@@ -48,7 +48,8 @@
 //!   chunked). Too big: 413. With `Expect: 100-continue` the 413 comes at
 //!   once, else the body is read and dropped first (up to [DRAIN_MAX]), so
 //!   the client sees the 413 and not a reset. No body bytes for the body
-//!   timeout: 408. A request head must be whole in [HEAD_WAIT], and an idle
+//!   timeout: 408. A request head must be whole in the idle timeout
+//!   (Dart's `idleTimeout`, 30 seconds by default), and an idle
 //!   connection closes after it.
 //! - When Rust closes a connection after an answer, it first closes its
 //!   own side, then reads and drops what is left for up to [LINGER]
@@ -90,9 +91,6 @@ const PROBE: Duration = Duration::from_millis(100);
 /// Most requests of one connection that wait for an answer. Then Rust
 /// stops reading that connection until answers go out.
 const MAX_INFLIGHT: usize = 64;
-/// A request head must come whole in this time, and a connection with no
-/// request closes after it.
-const HEAD_WAIT: Duration = Duration::from_secs(30);
 /// Lingering close: how long, and how many bytes, Rust drops.
 const LINGER: Duration = Duration::from_secs(1);
 const LINGER_MAX: usize = 1 << 20;
@@ -114,7 +112,7 @@ const WS_OUT_MAX: usize = 4 * WS_HOLD;
 const MAX_PENDING: usize = 1 << 20;
 /// A write buffer bigger than this is freed once it is empty.
 const BIG_BUF: usize = 1 << 20;
-/// The longest body timeout (a year). Longer is cut to this.
+/// The longest body or idle timeout (a year). Longer is cut to this.
 const MAX_TIMEOUT: Duration = Duration::from_secs(365 * 24 * 3600);
 /// Most headers of one request. More gets 431.
 const MAX_HEADERS: usize = 100;
@@ -298,6 +296,9 @@ struct Limits {
     multipart: usize,
     /// max idle time with no body bytes. Longer gets 408.
     timeout: Duration,
+    /// keep-alive: a connection with no request closes after this. A
+    /// request head must also come whole in this time.
+    idle: Duration,
     /// most open connections (0: no limit). At the limit Rust stops
     /// accepting until one closes. New clients wait in the listen queue.
     conns: usize,
@@ -1414,11 +1415,11 @@ impl Core {
 
     /// Makes sure the timer of `idx` fires by its next due time.
     fn arm_timer(&mut self, idx: usize) {
-        let timeout = self.limits.timeout;
+        let limits = self.limits;
         let Some(c) = self.conns.get_mut(idx) else {
             return;
         };
-        let at = c.due(timeout).map_or(self.now + HEAD_WAIT, |d| d.0);
+        let at = c.due(&limits).map_or(self.now + limits.idle, |d| d.0);
         if c.timer.is_none_or(|t| at < t) {
             c.timer = Some(at);
             self.timers.push(Reverse((at, idx)));
@@ -1437,7 +1438,7 @@ impl Core {
                 break;
             }
             self.timers.pop();
-            let timeout = self.limits.timeout;
+            let limits = self.limits;
             let Some(c) = self.conns.get_mut(idx) else {
                 continue;
             };
@@ -1445,7 +1446,7 @@ impl Core {
                 continue; // an old entry
             }
             c.timer = None;
-            match c.due(timeout) {
+            match c.due(&limits) {
                 Some((at, what)) if at <= now => match what {
                     Due::Body => {
                         c.fail(408, &self.date.1);
@@ -2294,7 +2295,7 @@ impl Core {
 
 impl Conn {
     /// The next due time of this connection, and what is due then.
-    fn due(&self, body_timeout: Duration) -> Option<(Instant, Due)> {
+    fn due(&self, limits: &Limits) -> Option<(Instant, Due)> {
         if let Some((t, _)) = self.linger {
             return Some((t + LINGER, Due::Linger));
         }
@@ -2304,7 +2305,7 @@ impl Conn {
         if let Some(b) = &self.body
             && !b.whole
         {
-            return Some((b.last + body_timeout, Due::Body));
+            return Some((b.last + limits.timeout, Due::Body));
         }
         // a write makes no progress: the client does not read
         if let Some(t) = self.stuck {
@@ -2314,7 +2315,7 @@ impl Conn {
             return None;
         }
         if self.slots.is_empty() && self.pending() == 0 {
-            return Some((self.since + HEAD_WAIT, Due::Head));
+            return Some((self.since + limits.idle, Due::Head));
         }
         None
     }
@@ -2322,11 +2323,18 @@ impl Conn {
 
 /// The limits from Dart's values. A timeout is at most [MAX_TIMEOUT], so
 /// `Instant + timeout` can not overflow.
-fn limits_of(max_body: i64, max_multipart: i64, body_timeout_ms: i64, max_conns: i64) -> Limits {
+fn limits_of(
+    max_body: i64,
+    max_multipart: i64,
+    body_timeout_ms: i64,
+    max_conns: i64,
+    idle_ms: i64,
+) -> Limits {
     Limits {
         body: max_body.max(0) as usize,
         multipart: max_multipart.max(0) as usize,
         timeout: Duration::from_millis(body_timeout_ms.max(0) as u64).min(MAX_TIMEOUT),
+        idle: Duration::from_millis(idle_ms.max(0) as u64).min(MAX_TIMEOUT),
         conns: max_conns.max(0) as usize,
     }
 }
@@ -2473,7 +2481,8 @@ impl Native {
 /// all interfaces. Bodies over `max_body` bytes (`max_multipart` for a
 /// multipart form) get 413. A body with no new bytes for
 /// `body_timeout_ms` gets 408. With `max_conns` > 0 it holds at most that
-/// many connections open. Returns a handle (> 0), or < 0: -1 not
+/// many connections open. A connection with no request for `idle_ms`
+/// closes. Returns a handle (> 0), or < 0: -1 not
 /// initialized, -2 no poller or thread, -(1000 + errno) when the bind
 /// fails.
 #[unsafe(no_mangle)]
@@ -2487,6 +2496,7 @@ pub extern "C" fn dox_bind(
     addr_hi: u64,
     addr_lo: u64,
     max_conns: i64,
+    idle_ms: i64,
 ) -> i64 {
     if POST.get().is_none() {
         return -1;
@@ -2495,7 +2505,7 @@ pub extern "C" fn dox_bind(
         Ok(l) => l,
         Err(e) => return -(1000 + i64::from(e.raw_os_error().unwrap_or(0))),
     };
-    let limits = limits_of(max_body, max_multipart, body_timeout_ms, max_conns);
+    let limits = limits_of(max_body, max_multipart, body_timeout_ms, max_conns, idle_ms);
     let Ok(core) = Core::new(listener, key, limits) else {
         unbind(key);
         return -2;

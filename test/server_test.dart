@@ -654,6 +654,29 @@ void main() {
       NativeHttpServer.bind(0, maxConnections: 0),
       throwsArgumentError,
     );
+    await expectLater(
+      NativeHttpServer.bind(0, idleTimeout: Duration.zero),
+      throwsArgumentError,
+    );
+  });
+
+  test('idleTimeout: an idle keep-alive connection closes after it', () async {
+    NativeHttpServer quick = await NativeHttpServer.bind(
+      0,
+      address: '127.0.0.1',
+      idleTimeout: const Duration(milliseconds: 300),
+    );
+    quick.listen(handle);
+    // ignore: deprecated_member_use_from_same_package
+    expect(quick.idleTimeout, const Duration(milliseconds: 300));
+    Socket s = await Socket.connect('127.0.0.1', quick.port);
+    Stopwatch clock = Stopwatch()..start();
+    s.write('GET / HTTP/1.1\r\n\r\n');
+    // the answer, then the end when the server closes the idle connection
+    await s.drain<void>().timeout(const Duration(seconds: 5));
+    expect(clock.elapsed, greaterThan(const Duration(milliseconds: 250)));
+    s.destroy();
+    await quick.close(force: true);
   });
 
   test('maxConnections: at the limit new clients wait', () async {

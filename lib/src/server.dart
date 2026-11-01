@@ -87,6 +87,11 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   /// With [maxConnections], this server holds at most that many connections
   /// open. Then it stops accepting until one closes, and new clients wait
   /// in the listen queue of the OS. Default: no limit.
+  /// A keep-alive connection with no new request for [idleTimeout] closes.
+  /// A request head must also come whole in this time. Behind a load
+  /// balancer, set it longer than the idle timeout of the balancer (eg.
+  /// 65 seconds for the 60 seconds of AWS ALB). Else the server may close
+  /// a connection the balancer still sends on, and clients get 502.
   static Future<NativeHttpServer> bind(
     int port, {
     Object? address,
@@ -94,6 +99,7 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
     int? maxMultipartSize,
     Duration bodyTimeout = const Duration(seconds: 120),
     int? maxConnections,
+    Duration idleTimeout = const Duration(seconds: 30),
   }) async {
     ensureAvailable();
     if (port < 0 || port > 65535) {
@@ -104,6 +110,13 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
         maxConnections,
         'maxConnections',
         'must be 1 or more',
+      );
+    }
+    if (idleTimeout <= Duration.zero) {
+      throw ArgumentError.value(
+        idleTimeout,
+        'idleTimeout',
+        'must be more than zero',
       );
     }
     InternetAddress? ip = await _resolve(address);
@@ -136,6 +149,7 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
       hi,
       lo,
       maxConnections ?? 0,
+      idleTimeout.inMilliseconds,
     );
     if (handle <= 0) {
       receive.close();
@@ -153,6 +167,8 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
       doxBoundPort(handle),
       ip ?? InternetAddress.anyIPv6,
     );
+    // ignore: deprecated_member_use_from_same_package
+    server.idleTimeout = idleTimeout;
     return server;
   }
 
@@ -192,14 +208,12 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   @override
   bool autoCompress = false;
 
-  /// Has no effect. The server closes a connection that sends no whole
-  /// request head for 30 seconds, and this value does not change that.
-  /// It stays so code that sets it still compiles.
-  // ponytail: wiring it to Rust needs a new FFI call (a native ABI bump);
-  // add it when someone needs a different idle time.
-  @Deprecated('Has no effect. The idle time is a fixed 30 seconds.')
+  /// The idle timeout given to [bind]. Setting it later has no effect:
+  /// Rust gets the value once, at bind. It stays so code that sets it
+  /// still compiles.
+  @Deprecated('Setting it has no effect. Pass idleTimeout to bind.')
   @override
-  Duration? idleTimeout = const Duration(seconds: 120);
+  Duration? idleTimeout = const Duration(seconds: 30);
 
   @override
   String? get serverHeader => _serverHeader;

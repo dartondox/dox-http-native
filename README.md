@@ -95,7 +95,7 @@ How it works:
 - Each isolate can bind the same port (`SO_REUSEPORT` on Linux, one shared socket on macOS).
 - One thread per isolate: the socket work (accept, read, parse, write) runs on the isolate's own thread. A small helper thread only watches the sockets while the isolate is idle, and wakes it when a request comes.
 - Keep-alive and pipelining. At most 64 requests of one connection wait for an answer, and at most 1 MB of answers waits to be written. Then the server stops reading that connection until answers go out.
-- A request head must arrive within 30 seconds. A connection with no request for 30 seconds after its last answer is closed.
+- A request head must arrive within `idleTimeout` (default 30 seconds). A connection with no request for `idleTimeout` after its last answer is closed. Behind a load balancer, set it longer than the balancer's idle timeout (eg. `bind(port, idleTimeout: Duration(seconds: 65))` for AWS ALB).
 - A client that reads nothing of its answer for 30 seconds is closed.
 - `bind(port, maxConnections: 1000)` holds at most that many connections open. At the limit new clients wait in the listen queue of the OS. Default: no limit.
 - When the isolate dies without `close()` (eg. an uncaught error), the server closes within about 100 ms. New clients get "connection refused".
@@ -125,7 +125,7 @@ Uint8List? plain = AesGcm.open(key, sealed, aad);  // null when changed
 ## Security notes
 
 - Run it behind a reverse proxy (eg. nginx or a load balancer) on the open internet. The proxy should end TLS, limit the request rate and drop slow clients.
-- Set limits that fit your app: `maxBodySize`, `maxMultipartSize`, `bodyTimeout` and `maxConnections`.
+- Set limits that fit your app: `maxBodySize`, `maxMultipartSize`, `bodyTimeout`, `maxConnections` and `idleTimeout`.
 - Another process can bind the same port and take some of the connections. On Linux that is a process of the same OS user (`SO_REUSEPORT`). On macOS it is a process that binds a more specific address (eg. `127.0.0.1` while the server listens on all interfaces). Run the server as its own user, on a host you control.
 - `req.uri` is the target as the client sent it. `..` and `%2e%2e` are not removed. Check paths before you use them for files.
 - A request head with bare LF line ends (no CR) is accepted, like most servers do. A proxy in front should normalize it.
