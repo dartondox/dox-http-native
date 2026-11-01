@@ -1,11 +1,11 @@
-## Unreleased
+## 3.0.3
 
 - New: `NativeHttpServer.bind(idleTimeout: ...)`. A keep-alive connection with no new request for this time closes. A request head must also come whole in this time. Default: 30 seconds, as before. Behind a load balancer, set it longer than the idle timeout of the balancer (eg. 65 seconds for AWS ALB, which keeps connections for 60 seconds). Else the server may close a connection the balancer still uses, and clients get 502.
 - The `idleTimeout` field now shows the value given to `bind`. Setting it later still has no effect, and it stays deprecated.
 - Fix: with `autoCompress`, answers that could be gzipped now send `Vary: Accept-Encoding`, so a shared cache does not give a gzip body to a client that can not read it.
 - Fix: `Accept-Encoding: gzip;q=0` means "no gzip", and is now read that way.
 - Fix: bodies that are compressed already (images, audio, video, zip, gz, woff and so on) are not gzipped again. `image/svg+xml` is still gzipped.
-- `dox_bind` takes the idle timeout. The native ABI version goes up at release. The build hook gets the new native library.
+- Native ABI 9 (`dox_bind` takes the idle timeout). The build hook gets the new native library.
 
 ## 3.0.2
 
