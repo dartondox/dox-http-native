@@ -4,7 +4,7 @@ import 'dart:ffi';
 /// the library as the code asset of this file.
 
 /// The ABI version the Dart side expects. Must match `ABI_VERSION` in Rust.
-const int abiVersion = 8;
+const int abiVersion = 9;
 
 @Native<Int32 Function()>(symbol: 'dox_version', isLeaf: true)
 external int doxVersion();
@@ -14,7 +14,8 @@ external int doxInit(Pointer<Void> dlData);
 
 /// Binds [port] and starts the idle helper, which posts to [sendPort].
 /// [family] 0 is all interfaces, 4 is IPv4 (in [addrLo]), 6 is IPv6.
-/// [maxConnections] 0 is no limit. Returns a handle for [doxRun].
+/// [maxConnections] 0 is no limit. A connection with no request for
+/// [idleTimeoutMs] closes. Returns a handle for [doxRun].
 @Native<
   Int64 Function(
     Int32,
@@ -25,6 +26,7 @@ external int doxInit(Pointer<Void> dlData);
     Int32,
     Uint64,
     Uint64,
+    Int64,
     Int64,
   )
 >(symbol: 'dox_bind')
@@ -38,6 +40,7 @@ external int doxBind(
   int addrHi,
   int addrLo,
   int maxConnections,
+  int idleTimeoutMs,
 );
 
 @Native<Int32 Function(Int64)>(symbol: 'dox_bound_port', isLeaf: true)

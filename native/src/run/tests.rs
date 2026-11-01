@@ -4,12 +4,16 @@ use super::*;
 use std::net::{Ipv4Addr, TcpStream as StdStream};
 use tungstenite::WebSocket;
 
+/// The default idle timeout of Dart's `bind`.
+const IDLE: Duration = Duration::from_secs(30);
+
 fn limits() -> Limits {
     Limits {
         body: 10,
         multipart: 20,
         timeout: Duration::from_millis(50),
         conns: 0,
+        idle: IDLE,
     }
 }
 
@@ -627,7 +631,7 @@ fn websocket_send_ends_when_the_client_does_not_read() {
         after(&mut core, &mut inb, SEND_WAIT / 2).is_empty(),
         "too early"
     );
-    let got = after(&mut core, &mut inb, SEND_WAIT + HEAD_WAIT);
+    let got = after(&mut core, &mut inb, SEND_WAIT + IDLE);
     assert_eq!(
         (got[0].id, got[0].kind(), got[0].code),
         (id, WS_CLOSED, 1006)
@@ -785,10 +789,28 @@ fn idle_time_counts_from_the_answer() {
     let mut out = Vec::new();
     ans(&mut out, req.id, 200, 0, b"", b"done");
     core.respond(&out);
-    after(&mut core, &mut inb, HEAD_WAIT + Duration::from_secs(5));
+    after(&mut core, &mut inb, IDLE + Duration::from_secs(5));
     assert_eq!(core.conns.len(), 1, "closed 5 seconds after the answer");
-    after(&mut core, &mut inb, HEAD_WAIT + Duration::from_secs(25));
-    assert_eq!(core.conns.len(), 0, "idle for HEAD_WAIT");
+    after(&mut core, &mut inb, IDLE + Duration::from_secs(25));
+    assert_eq!(core.conns.len(), 0, "idle for IDLE");
+}
+
+/// A longer idle timeout (eg. for a load balancer that keeps connections
+/// for 60 seconds) keeps an idle connection past the default 30 seconds.
+#[test]
+fn idle_timeout_comes_from_the_limits() {
+    let (mut core, port) = new_core(Limits {
+        idle: Duration::from_secs(65),
+        ..limits()
+    });
+    let mut inb = vec![0u8; 1 << 18];
+    let _s = connect(port);
+    after(&mut core, &mut inb, Duration::from_millis(100));
+    assert_eq!(core.conns.len(), 1, "accepted");
+    after(&mut core, &mut inb, Duration::from_secs(60));
+    assert_eq!(core.conns.len(), 1, "open after 60 seconds");
+    after(&mut core, &mut inb, Duration::from_secs(66));
+    assert_eq!(core.conns.len(), 0, "closed after 65 seconds");
 }
 
 /// A streamed body with `content-length`: the right count keeps the
@@ -855,9 +877,10 @@ fn raw_bytes_in_the_target_are_escaped() {
 /// A huge body timeout from Dart does not overflow the clock.
 #[test]
 fn huge_body_timeout_is_cut() {
-    let lim = limits_of(1, 1, i64::MAX, 0);
+    let lim = limits_of(1, 1, i64::MAX, 0, i64::MAX);
     assert_eq!(lim.timeout, MAX_TIMEOUT);
-    let _ = Instant::now() + lim.timeout; // no panic
+    assert_eq!(lim.idle, MAX_TIMEOUT);
+    let _ = Instant::now() + lim.timeout + lim.idle; // no panic
 }
 
 /// With a connection limit, Rust stops accepting at the limit, and accepts
