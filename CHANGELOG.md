@@ -1,3 +1,7 @@
+## Unreleased
+
+- Fix: the build hook now tries the download of the native library up to 3 times (waits 1 s, then 3 s). Before, one bad answer from GitHub (eg. 503 or 504) meant no native library, and the app stopped at start. It tries again on a 5xx or 429 status, a connection error or timeout, and a wrong sha256. A 404 is not tried again. If all 3 tries fail, nothing changes: the hook falls back to cargo or adds no library.
+
 ## 3.0.3
 
 - New: `NativeHttpServer.bind(idleTimeout: ...)`. A keep-alive connection with no new request for this time closes. A request head must also come whole in this time. Default: 30 seconds, as before. Behind a load balancer, set it longer than the idle timeout of the balancer (eg. 65 seconds for AWS ALB, which keeps connections for 60 seconds). Else the server may close a connection the balancer still uses, and clients get 502.
