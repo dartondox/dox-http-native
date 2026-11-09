@@ -41,7 +41,7 @@ const Map<String, String> _sha256 = <String, String>{
   'dox_http_native-macos-x64.dylib':
       '69af91818795a83bb5d9c979e8d153ce857928e3b0926ed059535951f6720604',
   'dox_http_native-windows-x64.dll':
-      'e853da1de0f6ee72d8d0d6ec2e1767fc30caf6183afbab1d054e1d14059441e9',
+      '05dfe436188854f3a88d0b19d5b04e46220238504201b8923577e812589bcfac',
 };
 
 void main(List<String> args) async {
