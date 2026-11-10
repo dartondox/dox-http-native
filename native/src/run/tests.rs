@@ -189,6 +189,18 @@ fn connect(port: u16) -> StdStream {
     s
 }
 
+/// Runs the loop until `count` connections are open, or 5 seconds.
+/// connect() can return before the server side can accept, and one call
+/// that gets WouldBlock does not try again: a test that calls once (or a
+/// few times) after connect() fails on a busy machine.
+fn accept(core: &mut Core, inb: &mut [u8], count: usize) {
+    let end = Instant::now() + Duration::from_secs(5);
+    while core.conns.len() < count && Instant::now() < end {
+        core.run(&[], inb, 1000).unwrap();
+    }
+    assert_eq!(core.conns.len(), count, "accepted");
+}
+
 /// Sends `req`, reads until the server closes (or 3 seconds).
 fn send(port: u16, req: &[u8]) -> String {
     let mut s = connect(port);
@@ -500,10 +512,18 @@ fn upgrade(core: &mut Core, inb: &mut [u8]) -> u64 {
     req.id
 }
 
-/// A client that sends `bytes` of ping frames (125 bytes each) after the
+/// A client that sends `bytes` of ping frames (`size` bytes of data each,
+/// 6 bytes of frame head) after the
 /// upgrade. With `read` it reads and drops the pongs, else it never reads.
 /// Returns the index of its connection.
-fn ping_flood(core: &mut Core, inb: &mut [u8], port: u16, read: bool, bytes: usize) -> usize {
+fn ping_flood(
+    core: &mut Core,
+    inb: &mut [u8],
+    port: u16,
+    read: bool,
+    size: u8,
+    bytes: usize,
+) -> usize {
     std::thread::spawn(move || {
         let ws = ws_client(port, "/wide");
         let mut s = ws.get_ref().try_clone().unwrap();
@@ -516,8 +536,8 @@ fn ping_flood(core: &mut Core, inb: &mut [u8], port: u16, read: bool, bytes: usi
                 while r.read(&mut buf).is_ok_and(|k| k > 0) {}
             });
         }
-        let mut frame = vec![0x89, 0x80 | 125, 0, 0, 0, 0];
-        frame.extend_from_slice(&[b'p'; 125]);
+        let mut frame = vec![0x89, 0x80 | size, 0, 0, 0, 0];
+        frame.extend_from_slice(&vec![b'p'; size.into()]);
         let _ = s.write_all(&frame.repeat(bytes / frame.len()));
         std::thread::sleep(Duration::from_secs(10));
     });
@@ -532,19 +552,57 @@ fn ping_flood(core: &mut Core, inb: &mut [u8], port: u16, read: bool, bytes: usi
 fn websocket_ping_flood_does_not_hold_the_loop() {
     let (mut core, port) = new_core(limits());
     let mut inb = vec![0u8; 1 << 18];
-    let idx = ping_flood(&mut core, &mut inb, port, true, 64 << 20);
-    std::thread::sleep(Duration::from_millis(200));
+    let idx = ping_flood(&mut core, &mut inb, port, true, 20, 64 << 20);
     let mut s = connect(port);
-    s.write_all(b"GET /other HTTP/1.1\r\n\r\n").unwrap();
-    std::thread::sleep(Duration::from_millis(20));
-    let n = core.run(&[], &mut inb, 0).unwrap();
-    assert!(
-        records(&inb[..n]).iter().any(|r| r.target == "/other"),
-        "the other request"
-    );
+    // On a busy machine the accept, the request and the flood bytes can
+    // all come late. So do not trust a sleep: call until a call gets the
+    // request while the flood is "full": more than two shares of it wait
+    // and no pong waits (a pong backlog pauses the flood, see `ws_read`).
+    let mut peek = vec![0u8; 2 * WS_READ + 1];
+    let mut asked = false;
+    // only a limit to give up: the result does not depend on time
+    let end = Instant::now() + Duration::from_secs(10);
+    let pongs = loop {
+        assert!(
+            Instant::now() < end,
+            "no call got the other request while the flood waited"
+        );
+        let c = &core.conns[idx];
+        let full = c.pending() == 0
+            && !c.ws.as_ref().unwrap().paused
+            && c.sock.peek(&mut peek).is_ok_and(|k| k > 2 * WS_READ);
+        let before = c.written;
+        if full && !asked {
+            s.write_all(b"GET /other HTTP/1.1\r\n\r\n").unwrap();
+            asked = true;
+        }
+        if !full {
+            std::thread::sleep(Duration::from_millis(1)); // the client fills
+        }
+        let n = core.run(&[], &mut inb, 0).unwrap();
+        if records(&inb[..n]).iter().any(|r| r.target == "/other") {
+            if full {
+                let c = &core.conns[idx];
+                break c.written + c.pending() as u64 - before;
+            }
+            asked = false; // came in a call that proves nothing: ask again
+        }
+    };
     assert!(
         core.ready.contains(&idx),
         "the flood waits for its next turn"
+    );
+    // A count, not a time. Each ping is 26 bytes and gets one pong of 22
+    // bytes, so the pongs count the bytes read in that call. One share is
+    // WS_READ bytes; tungstenite may also hold less than one READ_ROOM of
+    // frames from the last call, and owe one pong. The pongs of that
+    // (under 235 KiB) stay under the pong cap WS_OUT_MAX, so the cap does
+    // not stop the call. Without the share, the cap stops it only after
+    // more than WS_OUT_MAX / 22 pings (over 300 KiB read).
+    let pings = pongs / 22;
+    assert!(
+        pings * 26 <= (WS_READ + READ_ROOM + 26) as u64,
+        "one call read {pings} pings, more than one share"
     );
 }
 
@@ -554,7 +612,7 @@ fn websocket_ping_flood_does_not_hold_the_loop() {
 fn websocket_pongs_for_a_client_that_does_not_read_are_capped() {
     let (mut core, port) = new_core(limits());
     let mut inb = vec![0u8; 1 << 18];
-    let idx = ping_flood(&mut core, &mut inb, port, false, 8 << 20);
+    let idx = ping_flood(&mut core, &mut inb, port, false, 125, 8 << 20);
     let end = Instant::now() + Duration::from_millis(500);
     while Instant::now() < end {
         core.run(&[], &mut inb, 1000).unwrap();
@@ -805,8 +863,7 @@ fn idle_timeout_comes_from_the_limits() {
     });
     let mut inb = vec![0u8; 1 << 18];
     let _s = connect(port);
-    after(&mut core, &mut inb, Duration::from_millis(100));
-    assert_eq!(core.conns.len(), 1, "accepted");
+    accept(&mut core, &mut inb, 1);
     after(&mut core, &mut inb, Duration::from_secs(60));
     assert_eq!(core.conns.len(), 1, "open after 60 seconds");
     after(&mut core, &mut inb, Duration::from_secs(66));
@@ -893,10 +950,7 @@ fn connection_limit_and_no_buffer_for_idle_connections() {
     });
     let mut inb = vec![0u8; 1 << 18];
     let a = connect(port);
-    for _ in 0..20 {
-        core.run(&[], &mut inb, 1000).unwrap();
-    }
-    assert_eq!(core.conns.len(), 1);
+    accept(&mut core, &mut inb, 1);
     let (_, c) = core.conns.iter().next().unwrap();
     assert_eq!(c.rbuf.capacity(), 0, "an idle connection holds a buffer");
     let mut b = connect(port); // waits in the listen queue
