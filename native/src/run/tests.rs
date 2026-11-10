@@ -805,7 +805,12 @@ fn idle_timeout_comes_from_the_limits() {
     });
     let mut inb = vec![0u8; 1 << 18];
     let _s = connect(port);
-    after(&mut core, &mut inb, Duration::from_millis(100));
+    // connect() can return before the server side can accept. `after` does
+    // not poll, so it would not try the accept again: run the real loop.
+    let end = Instant::now() + Duration::from_secs(5);
+    while core.conns.is_empty() && Instant::now() < end {
+        core.run(&[], &mut inb, 1000).unwrap();
+    }
     assert_eq!(core.conns.len(), 1, "accepted");
     after(&mut core, &mut inb, Duration::from_secs(60));
     assert_eq!(core.conns.len(), 1, "open after 60 seconds");
