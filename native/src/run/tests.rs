@@ -512,10 +512,18 @@ fn upgrade(core: &mut Core, inb: &mut [u8]) -> u64 {
     req.id
 }
 
-/// A client that sends `bytes` of ping frames (125 bytes each) after the
+/// A client that sends `bytes` of ping frames (`size` bytes of data each,
+/// 6 bytes of frame head) after the
 /// upgrade. With `read` it reads and drops the pongs, else it never reads.
 /// Returns the index of its connection.
-fn ping_flood(core: &mut Core, inb: &mut [u8], port: u16, read: bool, bytes: usize) -> usize {
+fn ping_flood(
+    core: &mut Core,
+    inb: &mut [u8],
+    port: u16,
+    read: bool,
+    size: u8,
+    bytes: usize,
+) -> usize {
     std::thread::spawn(move || {
         let ws = ws_client(port, "/wide");
         let mut s = ws.get_ref().try_clone().unwrap();
@@ -528,8 +536,8 @@ fn ping_flood(core: &mut Core, inb: &mut [u8], port: u16, read: bool, bytes: usi
                 while r.read(&mut buf).is_ok_and(|k| k > 0) {}
             });
         }
-        let mut frame = vec![0x89, 0x80 | 125, 0, 0, 0, 0];
-        frame.extend_from_slice(&[b'p'; 125]);
+        let mut frame = vec![0x89, 0x80 | size, 0, 0, 0, 0];
+        frame.extend_from_slice(&vec![b'p'; size.into()]);
         let _ = s.write_all(&frame.repeat(bytes / frame.len()));
         std::thread::sleep(Duration::from_secs(10));
     });
@@ -544,16 +552,17 @@ fn ping_flood(core: &mut Core, inb: &mut [u8], port: u16, read: bool, bytes: usi
 fn websocket_ping_flood_does_not_hold_the_loop() {
     let (mut core, port) = new_core(limits());
     let mut inb = vec![0u8; 1 << 18];
-    let idx = ping_flood(&mut core, &mut inb, port, true, 64 << 20);
+    let idx = ping_flood(&mut core, &mut inb, port, true, 20, 64 << 20);
     let mut s = connect(port);
     // On a busy machine the accept, the request and the flood bytes can
     // all come late. So do not trust a sleep: call until a call gets the
-    // request while the flood is "full": more than one share of it waits
+    // request while the flood is "full": more than two shares of it wait
     // and no pong waits (a pong backlog pauses the flood, see `ws_read`).
-    let mut peek = vec![0u8; WS_READ + 1];
+    let mut peek = vec![0u8; 2 * WS_READ + 1];
     let mut asked = false;
-    let end = Instant::now() + Duration::from_secs(5);
-    loop {
+    // only a limit to give up: the result does not depend on time
+    let end = Instant::now() + Duration::from_secs(10);
+    let pongs = loop {
         assert!(
             Instant::now() < end,
             "no call got the other request while the flood waited"
@@ -561,7 +570,8 @@ fn websocket_ping_flood_does_not_hold_the_loop() {
         let c = &core.conns[idx];
         let full = c.pending() == 0
             && !c.ws.as_ref().unwrap().paused
-            && c.sock.peek(&mut peek).is_ok_and(|k| k > WS_READ);
+            && c.sock.peek(&mut peek).is_ok_and(|k| k > 2 * WS_READ);
+        let before = c.written;
         if full && !asked {
             s.write_all(b"GET /other HTTP/1.1\r\n\r\n").unwrap();
             asked = true;
@@ -572,14 +582,27 @@ fn websocket_ping_flood_does_not_hold_the_loop() {
         let n = core.run(&[], &mut inb, 0).unwrap();
         if records(&inb[..n]).iter().any(|r| r.target == "/other") {
             if full {
-                break;
+                let c = &core.conns[idx];
+                break c.written + c.pending() as u64 - before;
             }
             asked = false; // came in a call that proves nothing: ask again
         }
-    }
+    };
     assert!(
         core.ready.contains(&idx),
         "the flood waits for its next turn"
+    );
+    // A count, not a time. Each ping is 26 bytes and gets one pong of 22
+    // bytes, so the pongs count the bytes read in that call. One share is
+    // WS_READ bytes; tungstenite may also hold less than one READ_ROOM of
+    // frames from the last call, and owe one pong. The pongs of that
+    // (under 235 KiB) stay under the pong cap WS_OUT_MAX, so the cap does
+    // not stop the call. Without the share, the cap stops it only after
+    // more than WS_OUT_MAX / 22 pings (over 300 KiB read).
+    let pings = pongs / 22;
+    assert!(
+        pings * 26 <= (WS_READ + READ_ROOM + 26) as u64,
+        "one call read {pings} pings, more than one share"
     );
 }
 
@@ -589,7 +612,7 @@ fn websocket_ping_flood_does_not_hold_the_loop() {
 fn websocket_pongs_for_a_client_that_does_not_read_are_capped() {
     let (mut core, port) = new_core(limits());
     let mut inb = vec![0u8; 1 << 18];
-    let idx = ping_flood(&mut core, &mut inb, port, false, 8 << 20);
+    let idx = ping_flood(&mut core, &mut inb, port, false, 125, 8 << 20);
     let end = Instant::now() + Duration::from_millis(500);
     while Instant::now() < end {
         core.run(&[], &mut inb, 1000).unwrap();
