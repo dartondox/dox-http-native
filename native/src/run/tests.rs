@@ -189,6 +189,18 @@ fn connect(port: u16) -> StdStream {
     s
 }
 
+/// Runs the loop until `count` connections are open, or 5 seconds.
+/// connect() can return before the server side can accept, and one call
+/// that gets WouldBlock does not try again: a test that calls once (or a
+/// few times) after connect() fails on a busy machine.
+fn accept(core: &mut Core, inb: &mut [u8], count: usize) {
+    let end = Instant::now() + Duration::from_secs(5);
+    while core.conns.len() < count && Instant::now() < end {
+        core.run(&[], inb, 1000).unwrap();
+    }
+    assert_eq!(core.conns.len(), count, "accepted");
+}
+
 /// Sends `req`, reads until the server closes (or 3 seconds).
 fn send(port: u16, req: &[u8]) -> String {
     let mut s = connect(port);
@@ -533,15 +545,38 @@ fn websocket_ping_flood_does_not_hold_the_loop() {
     let (mut core, port) = new_core(limits());
     let mut inb = vec![0u8; 1 << 18];
     let idx = ping_flood(&mut core, &mut inb, port, true, 64 << 20);
-    std::thread::sleep(Duration::from_millis(200));
     let mut s = connect(port);
-    s.write_all(b"GET /other HTTP/1.1\r\n\r\n").unwrap();
-    std::thread::sleep(Duration::from_millis(20));
-    let n = core.run(&[], &mut inb, 0).unwrap();
-    assert!(
-        records(&inb[..n]).iter().any(|r| r.target == "/other"),
-        "the other request"
-    );
+    // On a busy machine the accept, the request and the flood bytes can
+    // all come late. So do not trust a sleep: call until a call gets the
+    // request while the flood is "full": more than one share of it waits
+    // and no pong waits (a pong backlog pauses the flood, see `ws_read`).
+    let mut peek = vec![0u8; WS_READ + 1];
+    let mut asked = false;
+    let end = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(
+            Instant::now() < end,
+            "no call got the other request while the flood waited"
+        );
+        let c = &core.conns[idx];
+        let full = c.pending() == 0
+            && !c.ws.as_ref().unwrap().paused
+            && c.sock.peek(&mut peek).is_ok_and(|k| k > WS_READ);
+        if full && !asked {
+            s.write_all(b"GET /other HTTP/1.1\r\n\r\n").unwrap();
+            asked = true;
+        }
+        if !full {
+            std::thread::sleep(Duration::from_millis(1)); // the client fills
+        }
+        let n = core.run(&[], &mut inb, 0).unwrap();
+        if records(&inb[..n]).iter().any(|r| r.target == "/other") {
+            if full {
+                break;
+            }
+            asked = false; // came in a call that proves nothing: ask again
+        }
+    }
     assert!(
         core.ready.contains(&idx),
         "the flood waits for its next turn"
@@ -805,13 +840,7 @@ fn idle_timeout_comes_from_the_limits() {
     });
     let mut inb = vec![0u8; 1 << 18];
     let _s = connect(port);
-    // connect() can return before the server side can accept. `after` does
-    // not poll, so it would not try the accept again: run the real loop.
-    let end = Instant::now() + Duration::from_secs(5);
-    while core.conns.is_empty() && Instant::now() < end {
-        core.run(&[], &mut inb, 1000).unwrap();
-    }
-    assert_eq!(core.conns.len(), 1, "accepted");
+    accept(&mut core, &mut inb, 1);
     after(&mut core, &mut inb, Duration::from_secs(60));
     assert_eq!(core.conns.len(), 1, "open after 60 seconds");
     after(&mut core, &mut inb, Duration::from_secs(66));
@@ -898,10 +927,7 @@ fn connection_limit_and_no_buffer_for_idle_connections() {
     });
     let mut inb = vec![0u8; 1 << 18];
     let a = connect(port);
-    for _ in 0..20 {
-        core.run(&[], &mut inb, 1000).unwrap();
-    }
-    assert_eq!(core.conns.len(), 1);
+    accept(&mut core, &mut inb, 1);
     let (_, c) = core.conns.iter().next().unwrap();
     assert_eq!(c.rbuf.capacity(), 0, "an idle connection holds a buffer");
     let mut b = connect(port); // waits in the listen queue
