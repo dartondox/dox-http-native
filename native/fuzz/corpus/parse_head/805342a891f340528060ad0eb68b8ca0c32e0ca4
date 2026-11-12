@@ -1,4 +1,0 @@
-PUT /u HTTP/1.0
-expect: 100-gontinue
-con-h: 99
-

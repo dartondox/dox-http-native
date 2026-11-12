@@ -1,7 +1,0 @@
-GET /ws HTTP/1.1
-host: x
-connebsocket-version:
-connection: Upgrrade: websNhbjson
-content-length: 7
-
-{"

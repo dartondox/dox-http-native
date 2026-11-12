@@ -1,4 +1,0 @@
-PUT fu HTTP/1.0
-expect: 100-contJnqe
-content-'ength: 00072626223
-

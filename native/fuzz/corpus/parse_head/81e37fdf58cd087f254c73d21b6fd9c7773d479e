@@ -1,4 +1,0 @@
-ST /p HTTP/1.1
-content-type:-i
-
-{"a":1}

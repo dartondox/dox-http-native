@@ -1,9 +1,0 @@
-POST /p HTTP/1.1
-transfer-encoding: chunked
-length: 6
-transfer-encoding: chunked
-
-
- 7
-
-{"a":1}

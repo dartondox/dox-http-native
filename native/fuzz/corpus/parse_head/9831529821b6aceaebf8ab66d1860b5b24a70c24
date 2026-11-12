@@ -1,7 +1,0 @@
-GET /ws HTTP/1.1
-host: x
-connection: Upgrade
-upgr:
-connection: Upgrade
-upgrade: websNhbXBsZSBub24j
-

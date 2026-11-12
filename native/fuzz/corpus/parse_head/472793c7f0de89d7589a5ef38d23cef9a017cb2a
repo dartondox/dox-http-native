@@ -1,3 +1,0 @@
-GET /afu HTTP/1.0
-expect: 1
-

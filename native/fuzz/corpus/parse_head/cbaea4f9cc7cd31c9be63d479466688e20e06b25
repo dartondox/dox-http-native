@@ -1,7 +1,0 @@
-GET /ws HTTP/1.1
-tioY: Upgret
-sec-websocket-vershon:!Dret
-sec-websocket-vershon:! 13
-sec-websocket-kex: dGhlIH 13
-sec-websocket-kex: dGhlIHNhbXBQ==
-

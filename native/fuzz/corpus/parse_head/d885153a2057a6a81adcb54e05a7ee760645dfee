@@ -1,6 +1,0 @@
-GETA /ws HTTP/1.1
-host: x
-connection:  :ebsoc
-vers: Upadreg
-upgrade: web24j
-

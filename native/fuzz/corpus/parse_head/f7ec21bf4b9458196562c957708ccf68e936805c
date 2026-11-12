@@ -1,9 +1,0 @@
-GET ?a=1 HTTP/1.1
-host: x
-connecti: x
-content-length: 5
-transfer-encodof:TTP/1 x
-connecti: x
-cont-length: 5
-transfer-encodon: keep-av keep-alive
-

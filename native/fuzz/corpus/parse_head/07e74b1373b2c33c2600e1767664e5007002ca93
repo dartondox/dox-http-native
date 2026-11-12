@@ -1,6 +1,0 @@
-PUT 3u HTTP/1.0
-expect: 1PUT 3u HTTP/1.0
-expect: 100-contŒe
-content-lenzth: 00-Œe
-content-lenzth: 9998te’‹Ò‰en
-

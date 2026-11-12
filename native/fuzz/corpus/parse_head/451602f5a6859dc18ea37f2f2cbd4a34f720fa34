@@ -1,8 +1,0 @@
-POST /p HTTP/1.1
-host: x
-conost: x
-c-type: application/json
-content-lentent-type: application/json
-content-length: 8
-
-{"a":1}

@@ -1,6 +1,0 @@
-POST /p HTTP/1.1
-host: x
-content-type: apðlicafYZoZZZnZ/json
-content-length: 7
-
-{"a":1}

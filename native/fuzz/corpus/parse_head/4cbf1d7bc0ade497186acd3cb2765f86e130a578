@@ -1,8 +1,0 @@
-PUT ffffffffffffff/u HTTP/1.0
-expect: 10fffffffÿÿÿÿÿ%TP/1.0
-expect: 100-contJnue
-content-'ength: 0014-$gontJ.0
-expect:fffufff/ H1MP/2.0
-expect: 100-contJnue
-content-'ength: 001
-

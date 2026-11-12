@@ -1,4 +1,0 @@
-UPT /u HTTP/1.0
-expect: 1/u HTTP/1.0
-expect: 100-conÿ9999
-

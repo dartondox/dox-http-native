@@ -1,7 +1,0 @@
-POST / HTTP/1.1
-host: x
-content-leng: 5
-transfer-encoding: ch%nked
-
-0
-

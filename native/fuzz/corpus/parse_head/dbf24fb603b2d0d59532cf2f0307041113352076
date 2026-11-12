@@ -1,4 +1,0 @@
-GET /b=3 HTTP/1.1
-hot: x
-connection: keep#alive
-

@@ -1,5 +1,0 @@
-POST /p HTTP/1.1
-host: x
-content-type: aÿpplicath: 7
-
-{"a":1}

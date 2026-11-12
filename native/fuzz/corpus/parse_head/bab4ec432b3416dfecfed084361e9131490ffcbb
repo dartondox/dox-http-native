@@ -1,6 +1,0 @@
-POST /p HTTP/1.1
-hoost: xpeaÿÿÿÿ
-conten'-type: appli-typc
-conten'-type: appliccon
-
-{"a":1}

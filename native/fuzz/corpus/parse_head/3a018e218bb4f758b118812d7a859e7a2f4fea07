@@ -1,4 +1,0 @@
-GET /a= HTTP/1.1
-h: x
-connection: alive
-
