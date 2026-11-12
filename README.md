@@ -131,6 +131,8 @@ Uint8List? plain = AesGcm.open(key, sealed, aad);  // null when changed
 - A request head with bare LF line ends (no CR) is accepted, like most servers do. A proxy in front should normalize it.
 - `Content-Length` must be ASCII digits. A request with two different lengths, or with both `Content-Length` and `Transfer-Encoding: chunked`, gets `400`.
 - `Transfer-Encoding` must be exactly `chunked`, in one header. Another coding gets `501`. Two headers, or `Transfer-Encoding` in an HTTP/1.0 request, get `400`.
+- A WebSocket upgrade needs one `Sec-WebSocket-Key` that is base64 of 16 bytes (24 characters, RFC 6455). Another key, or two keys, give no upgrade: the request goes to the app as a normal request.
+- Only `multipart/form-data` gets the multipart body limit. Any other content type gets the normal body limit.
 - A streamed answer must keep to its `contentLength`. More bytes throw, and fewer fail `close()`. In both cases the connection is cut, so the client can not mix the rest up with the next answer.
 
 ## Fuzzing

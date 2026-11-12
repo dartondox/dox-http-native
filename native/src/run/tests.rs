@@ -1116,3 +1116,24 @@ fn websocket_key_must_be_16_bytes_of_base64() {
         }
     }
 }
+
+/// Only `multipart/form-data` gets the multipart limit, not any type that
+/// holds the text `form-data`.
+#[test]
+fn only_multipart_form_data_gets_the_multipart_limit() {
+    // body limit 10, multipart limit 20: a 15 byte body
+    for (ty, ok) in [
+        ("multipart/form-data; boundary=x", true),
+        (" Multipart/Form-Data ", true),
+        ("multipart/x-form-data", false),
+        ("text/plain; a=form-data", false),
+        ("application/x-www-form-urlencoded", false),
+    ] {
+        let req = format!(
+            "POST / HTTP/1.1\r\nContent-Type: {ty}\r\nExpect: 100-continue\r\nContent-Length: 15\r\n\r\n"
+        );
+        let step = parse_req(req.as_bytes());
+        assert_eq!(matches!(step, Step::Body(..)), ok, "{ty:?}");
+        assert_eq!(matches!(step, Step::Fail(413)), !ok, "{ty:?}");
+    }
+}

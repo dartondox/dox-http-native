@@ -1114,10 +1114,12 @@ fn parse_one(
                     keep_tok = keep_tok || (!close_tok && has_token(h.value, "keep-alive"));
                     conn_up = conn_up || has_token(h.value, "upgrade");
                 } else if name.eq_ignore_ascii_case(b"content-type") {
+                    // a file upload gets the multipart limit. The last
+                    // `content-type` counts.
                     let mime = h.value.split(|&c| c == b';').next().unwrap_or(b"");
                     form = mime
-                        .windows(9)
-                        .any(|w| w.eq_ignore_ascii_case(b"form-data"));
+                        .trim_ascii()
+                        .eq_ignore_ascii_case(b"multipart/form-data");
                 }
             }
             Some(b't') if name.eq_ignore_ascii_case(b"transfer-encoding") => {
@@ -3290,9 +3292,6 @@ pub mod fuzz {
         Stop,
         /// a bad request: no more records, and a fail answer
         Reject,
-        /// the walk can not tell (see below): only the records up to here
-        /// are checked
-        Unsure,
     }
 
     /// The records Dart must get for `stream`, found request after
@@ -3300,9 +3299,6 @@ pub mod fuzz {
     /// Dart says no to each upgrade, so the walk goes on after one. Also
     /// gives the requests with `Expect: 100-continue` and a body.
     fn expected(stream: &[u8], lim: &Limits) -> (Vec<Rec>, usize, End) {
-        // the server picks the limit by the content type. The walk does
-        // not copy that rule: a body between the two limits is `Unsure`.
-        let (low, high) = (lim.body.min(lim.multipart), lim.body.max(lim.multipart));
         let (mut out, mut asked, mut pos) = (Vec::new(), 0, 0);
         let end = loop {
             let s = &stream[pos..];
@@ -3318,12 +3314,20 @@ pub mod fuzz {
             };
             let want = want(&req);
             let rest = &s[head..];
+            // a file upload (`multipart/form-data`, RFC 7578) has its own
+            // limit. Content-Type comes once (RFC 9110 8.3). When a
+            // client sends more, the last one counts.
+            let form = values(&req, "content-type").last().is_some_and(|v| {
+                let mime = v.split(|&c| c == b';').next().unwrap();
+                ows(mime).eq_ignore_ascii_case(b"multipart/form-data")
+            });
+            let max = if form { lim.multipart } else { lim.body };
             let (body, used) = match want.framing {
                 Framing::Reject => break End::Reject,
                 Framing::Len(n) => {
                     let n = n as usize;
                     asked += usize::from(want.expect && n > 0);
-                    if n > high || rest.len() < n {
+                    if n > max || rest.len() < n {
                         break End::Stop;
                     }
                     (rest[..n].to_vec(), n)
@@ -3331,15 +3335,12 @@ pub mod fuzz {
                 Framing::Chunked => {
                     asked += usize::from(want.expect);
                     match dechunk(rest) {
-                        Some((b, _)) if b.len() > high => break End::Stop,
+                        Some((b, _)) if b.len() > max => break End::Stop,
                         Some(x) => x,
                         None => break End::Stop,
                     }
                 }
             };
-            if body.len() > low {
-                break End::Unsure;
-            }
             out.push(Rec {
                 flags: u32::from(want.http10) | (u32::from(want.key.is_some()) << 1),
                 method: req.method.unwrap().as_bytes().to_vec(),
@@ -3415,21 +3416,19 @@ pub mod fuzz {
             exp[..],
             "a record is not what the client sent"
         );
-        if walk != End::Unsure {
-            assert_eq!(
-                want.recs.len(),
-                exp.len(),
-                "a record after the end of the walk"
-            );
-            // a `100 Continue` only for a request that asked for it and
-            // has a body. How many go out also hangs on how the bytes
-            // came in and on which requests share one `parse` call, so
-            // this is an upper bound, not an exact count.
-            assert!(
-                conts <= asked,
-                "{conts} `100 Continue` for {asked} requests"
-            );
-        }
+        assert_eq!(
+            want.recs.len(),
+            exp.len(),
+            "a record after the end of the walk"
+        );
+        // a `100 Continue` only for a request that asked for it and has a
+        // body. How many go out also hangs on how the bytes came in and on
+        // which requests share one `parse` call, so this is an upper
+        // bound, not an exact count.
+        assert!(
+            conts <= asked,
+            "{conts} `100 Continue` for {asked} requests"
+        );
         if walk == End::Reject {
             assert!(!want.fail.is_empty(), "a bad request got no answer");
         }
@@ -3450,12 +3449,10 @@ pub mod fuzz {
         ] {
             let (seen, conts) = drive(stream, cuts, room, &lim);
             assert_eq!(seen, want, "{what}");
-            if walk != End::Unsure {
-                assert!(
-                    conts <= asked,
-                    "{what}: {conts} `100 Continue` for {asked} requests"
-                );
-            }
+            assert!(
+                conts <= asked,
+                "{what}: {conts} `100 Continue` for {asked} requests"
+            );
         }
     }
 
