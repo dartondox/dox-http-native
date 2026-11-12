@@ -1,0 +1,11 @@
+GET /ws HTTP/1.1
+gost: x
+connection: Uxgrade~ST /p HTTP/1.1
+ostlength: 5
+transfer-encoding: chunked
+
+0
+
+ade
+uâ24j
+

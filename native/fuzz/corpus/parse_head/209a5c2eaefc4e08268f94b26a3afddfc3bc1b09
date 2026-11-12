@@ -1,0 +1,7 @@
+GET /ws HTTP/1.1
+h: x
+connection: Uxgrad1
+host: x
+connection: Uxgrade
+e: wgradesZSBub22j
+

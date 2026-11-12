@@ -1,0 +1,30 @@
+PPUT ffffffffffffffffffffffffff/u HTTP/1.0
+expect: 10ffff
+expect: 1ffffffffffffffffffffntJnue
+content-'ength: Jnue
+content-'ongth: 00145250-con
+content-'ength: 00145TP/1.0
+expect: 1e
+content-'ength:00-contontJnue
+content-'ength: Jnue
+content-'ongth: 00145251-con
+content-'ength: 00145TP/1.0
+expect: 1e
+content-'ength: 02525244: 00145TP/1.0
+expect: 1e
+content-'ength: 02525244UT ffffffffffffffffffffffffff/u HTTP/1.0
+expect: 10ffff
+expect: 1ffffffffffffffffffffntJnue
+content-'ength: Jnue
+content-'ongth: 00145250-con
+content-'ength: 00145TP/1.0
+expect: 1e
+content-'ength:00-contontJnue
+content-'ength: Jnue
+content-'ongth: 00145251-con
+content-'ength: 00145TP/1.0
+expect: 1e
+content-'ength: 02525244: 00145TP/1.0
+expect: 1e
+content-'ength: 025252446
+

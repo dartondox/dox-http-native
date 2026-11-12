@@ -1,0 +1,9 @@
+PUT /u HTTP/1.0
+expect: 100
+expect: 100-co0
+expect: T /u HTTP/1.0
+expect: 100
+expect: 1
+expect: 100-co0,
+expect: 099
+expect: 100úúúúontUSOPte

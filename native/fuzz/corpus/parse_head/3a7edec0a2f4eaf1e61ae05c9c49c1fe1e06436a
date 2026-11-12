@@ -1,0 +1,7 @@
+GET /ws HTTP/1.1
+host: x
+connn: 13
+sec-websocket-kuy: dGhlocket
+sec-w&bsocket-version: 13
+sec-websocket-kuy: dGhlI
+

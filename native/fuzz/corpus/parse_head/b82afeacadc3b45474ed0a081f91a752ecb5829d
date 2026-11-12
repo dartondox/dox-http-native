@@ -1,0 +1,18 @@
+GET /ws HTTP/1.1
+host: x
+connection: Upgrate
+upgrade: webs
+content-: 99999999.1
+hosost: x
+connection: Upgrate
+upgrade: webs
+content-: 99999999.1
+host:GhlIHNhbXBZ/ws HTTP/1.1
+host: x
+connection: Upgrate
+upgrade: webs
+content-: 99999999.1
+hosost: x
+connection: Upgrate
+upgrade: we==tXBQ==tXBsZSBub25jZQ==M
+

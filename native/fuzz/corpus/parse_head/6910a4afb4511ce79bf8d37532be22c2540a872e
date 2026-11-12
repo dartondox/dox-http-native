@@ -1,0 +1,13 @@
+GET /ws HTTP/1.1
+host: x
+connection: Upgrad:
+upgrade:
+connection: Upgrad:
+upgrade: ket dGhlIHNhbXBsZSBub25lNhbXBsZSBub25j
+host: x
+connection: Upgrad:
+upgrade: ket dGhP/1.1
+ht: x
+connection: Upgrad:
+upgrade: ket dGhlIHNhbXBsZSBub25Q==ZQ==
+

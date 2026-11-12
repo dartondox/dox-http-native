@@ -1,0 +1,13 @@
+PUT /u HTTP/1.0
+.xXpect: 1/u HTTP/1.0
+expect: 10u HTTP/1.0
+expect: 1/u HTTP/1.0
+expect:ннннннннннннн: 10u HTTP/1.0
+expect: 1/u HTTP/1.0
+expect:ннннн HTTP/1.0
+expect: 1/u HTTP/1.0
+expect: 100-coP/1.0
+expect: 1/u HTTP/1.0
+exp: 100-contin▄e
+content-length: 99-
+

@@ -1,0 +1,5 @@
+PUT /u HTTP/1.0
+expect: 100-continue
+expect: 100-continue
+
+

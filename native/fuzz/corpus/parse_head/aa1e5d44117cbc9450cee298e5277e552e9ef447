@@ -1,0 +1,18 @@
+PUT /u HTTP/1.0
+expect: tinue/u HTTP/1.0
+expect: tinue
+cnotent-lengtH:expect: tinue
+cnotent-lengtH: 99999
+cnotent-lengtH:expect: tinue
+cnotent-lengtH: 990
+expect: tinue
+cnotent-lengtH:expect:ÿÿÿÿÿÿÿ7 tinue
+cnotent-lengtH: 99999
+cnotent-lengtH:expect: tinue
+cnotenexpect: tinue
+cnotent-lengtH: 99998
+cnotent-lengtH:expect: tinue
+cnotent-lengtH: 990
+expect: tinue
+cnotet-len99199999999999999199999999999
+

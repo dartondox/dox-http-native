@@ -1,0 +1,6 @@
+GET /ws HTTP/1.1
+host: x
+connection: Upgrade
+upgrade: web.or:pUÿÿÿþ
+upgrade: websN1bXBsZSBub24j
+

@@ -1,0 +1,25 @@
+GET /ws HTTP/1.1
+host:ket
+sec-websket-version: 14
+sec-websocket-key: ocket
+sec-websocket-version: 14
+sec-websocket-key: docket-version: 14
+sec-websocket-key: d ocket n: Upgrade
+upgrade: websocket
+sec-websocket-version: 14
+sec-websocket-key:/ws HTTP/1.1
+host: n: Upgrade
+upgrade: websocket
+sec-websocket-version: 14
+sec-websocket-key: ocket
+sec-websket-version: 14
+sec-websocket-key: ocket
+sec-websocket-version: 14
+sec-websocket-key: docket-version: 14
+sec-websocket-key: d ocket
+sec-websket-version: 14
+sec-websocket-key: ocket
+sec-websocket-version: 14
+sec-websocket-key: docket-version: 14
+sec-websocket-key: dGhlIHdGhlIHNhbXBsZSBub25jZQ==
+

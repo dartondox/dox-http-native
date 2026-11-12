@@ -5,7 +5,8 @@ edition = "2024"
 publish = false
 
 [lib]
-crate-type = ["cdylib"]
+# rlib: the fuzz crate in fuzz/ links the parser
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 aes-gcm = "0.11.1"
@@ -18,6 +19,10 @@ mio = { version = "1.2.4", features = ["os-poll", "net"] }
 slab = "0.4.12"
 socket2 = { version = "0.6.5", features = ["all"] }
 tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+
+[lints.rust]
+# cargo fuzz builds with `--cfg fuzzing`, see src/run.rs `mod fuzz`
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 
 [profile.release]
 opt-level = 3

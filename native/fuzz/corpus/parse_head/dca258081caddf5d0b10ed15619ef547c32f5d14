@@ -1,0 +1,4 @@
+GET /ws HTTP/1.1
+host: nocket
+sec-websocket-version: 13NhbXBsZSBub25jZQ==
+

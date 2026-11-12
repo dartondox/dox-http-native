@@ -1,0 +1,4 @@
+GMT /a?b=1 HTTP/1.1
+hg:t
+connection: keep-al1.0
+

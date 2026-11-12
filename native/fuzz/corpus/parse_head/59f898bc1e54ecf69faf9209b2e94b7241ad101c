@@ -1,0 +1,9 @@
+GET /ws HTTP/1.1
+host:$x
+connteciost:conntecion: Upgrade
+upgrade: webrocket
+sebHNhbXBsZSc-webson: Upgrade
+upgrade: webrocket
+sebHNhbXBsZSc-websocket-key: dGhlIHNhbXBsZSBub25jZQ==
+
+h

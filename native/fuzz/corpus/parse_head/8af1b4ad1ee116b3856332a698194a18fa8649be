@@ -1,0 +1,35 @@
+GET /ws HTTP/1.1
+host: x
+connection: Upgrate
+upgrade: webs
+content-: 99999999.1
+hosost: x
+connection: Upgrate
+upgrade: webs
+content-: 999HTTP/1.1
+hosersion:
+connection: Upgrade
+upgrade: websNhbXBs Upgrade
+upgrade: websNhbXBsZSBub24jpgrade
+upgrade: websocket
+sec-websocket-version:
+connection: Upgrade
+upgrade: websNhbXBsZt: xction: U/ws HTTP/1.1
+host: xction: Upgra
+upgrade: websocket
+sec-websocket-version:
+connection: Upgrade
+upgrade: websNhbXBsZSBub24jpgrZSBub24jpgrade
+upgrade: websocket
+sec-websocket-version:
+connection: Upgrade
+upgrade: websNhbXBsZt: xct99999.1
+host:GhlIHNhbXBsZSBub25jZ/ws HTTP/1.1
+host: x
+connection: Upgrate
+upgrade: webs
+content-: 99999999.1
+hosost: x
+connection: Upgrate
+upgrade: we==tXBQ==tXBsZSBub25jZQ==M
+

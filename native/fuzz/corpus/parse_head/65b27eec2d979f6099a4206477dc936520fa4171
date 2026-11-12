@@ -1,0 +1,8 @@
+GET /ws HTTP/1.1
+host:
+connection: Uxgrade
+upgrade: weeskboct
+sec-websocket-version:
+connection: Upgrade
+upgrade: web{NhbXBsZSBub24j
+

@@ -1,0 +1,7 @@
+GET /ws HTTP/1.1
+hnst:$x
+connection: Upgrade
+upgrade: we
+coket-version: 07
+sec-websocket-key: d1
+hoNhbXB sZSBub5/w0

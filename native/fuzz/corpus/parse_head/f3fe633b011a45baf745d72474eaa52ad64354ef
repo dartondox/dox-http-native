@@ -1,0 +1,10 @@
+GET /ws HTTP/1.1
+host:1
+host: x
+connection: Uxgst: x
+connection: Uxgrade
+upgrade: weesconp HTTP/1.1
+hoost: x
+content-type:4
+"a":
+

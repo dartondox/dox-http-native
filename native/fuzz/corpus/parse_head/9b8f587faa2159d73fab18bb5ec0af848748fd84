@@ -1,0 +1,12 @@
+PUT /u HTTP/1.0
+exXpect: 1/u HTTP/1.0
+expect: 10u HTTP/1.0
+expect: 1/u HTTP/1.0
+expect: 100xpect: 10u HTTP/1.0
+expect: 1/u HTTP/1.0
+expect: 100-continåe
+coexpect: 10u HTTP/1.0
+expect: 1/u HTTP/1.0
+exp: 100-continåe
+content-length: 99-
+

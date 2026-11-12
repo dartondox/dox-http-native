@@ -1,0 +1,13 @@
+GET /ws HTTP/1.1
+hosersion:
+connection: Upgrade
+upgrade: websNhbXBsZSBub24jpgrade
+upgrade: websocket
+sec-websocket-version:
+connection: Upgrade
+upgrade: websNhbXBsZt: xn:
+connection: Upgrade
+upgrade: websNhbXBset-version:
+connection: Upgrade
+upgrade: websNhbXBsZSBub24j
+

@@ -1,0 +1,5 @@
+GET /ws HTTP/1.1
+neb: 14
+sec-weeson: 07
+sec-weeskey: dGhlIHNhbXBs~ZSBub25jZQ==	
+

@@ -1,0 +1,20 @@
+GET /ws HTTP/1.1
+host: x
+cnnncotiFFFFinhost: x
+contenu-length: 5
+transferz-encoding: chuFFFFFFFFFFFFFFFFFFFFFHHHHHHHHHHHHHHHHHHHHHHHHH¸¯HHHHHHHHHHHHHHHHHHHHHHH HTTP/1.1
+host: ws HTTP/1.1
+host: x
+cnnncotiFFFFinhost: x
+contenu-length: 5
+transferz-encoding: chuFFFFFFFFFFFFFFFFFFFFFHHHHHHHHHHHHHHHHHHHHHHHHH¸¯HHHHHHHHHHHHHHHHHHHHHHH HTTP/1.1
+host: x
+cnnncotiFFFFinhost: x
+contenu-length: 5
+transferz-encoding: chuFFFFFFFFFFFFFFFFHHHHHHHHHHHx
+cnnncotiFFFFinhost: x
+contenu-length: 5
+transferz-encoding: chuFFFFFFFFF
+content-length: 7
+
+{"

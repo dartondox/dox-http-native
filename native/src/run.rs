@@ -116,6 +116,8 @@ const BIG_BUF: usize = 1 << 20;
 const MAX_TIMEOUT: Duration = Duration::from_secs(365 * 24 * 3600);
 /// Most headers of one request. More gets 431.
 const MAX_HEADERS: usize = 100;
+/// most bytes of a chunk size line, with its extensions
+const CHUNK_LINE: usize = 1024;
 
 /// One request that waits for its answer, in the order of the connection.
 #[derive(Default)]
@@ -171,6 +173,108 @@ struct BodyRead {
     /// when the last body bytes came
     last: Instant,
     slot: Slot,
+}
+
+impl BodyRead {
+    /// Takes the body bytes of `buf[*pos..]` and moves `*pos` past them.
+    /// `buf` is the read buffer, so parts of it may come in many calls.
+    fn feed(&mut self, buf: &[u8], pos: &mut usize) -> Feed {
+        let b = self;
+        if b.whole {
+            return Feed::Whole;
+        }
+        loop {
+            let avail = &buf[*pos..];
+            match b.chunk {
+                None | Some(Chunk::Data(_)) => {
+                    let want = match b.chunk {
+                        Some(Chunk::Data(n)) => n,
+                        _ => b.left,
+                    };
+                    let k = want.min(avail.len());
+                    if k > 0 {
+                        b.seen += k;
+                        if b.seen > b.max {
+                            if b.seen > b.max.saturating_add(DRAIN_MAX) {
+                                return Feed::Fail(413);
+                            }
+                            b.too_big = true;
+                        }
+                        if !b.too_big {
+                            b.data.extend_from_slice(&avail[..k]);
+                        }
+                        *pos += k;
+                    }
+                    match b.chunk {
+                        Some(Chunk::Data(n)) if n == k => b.chunk = Some(Chunk::DataEnd),
+                        Some(Chunk::Data(n)) => {
+                            b.chunk = Some(Chunk::Data(n - k));
+                            return Feed::More;
+                        }
+                        _ => {
+                            b.left -= k;
+                            if b.left > 0 {
+                                return Feed::More;
+                            }
+                            break;
+                        }
+                    }
+                }
+                Some(Chunk::Size) => match httparse::parse_chunk_size(avail) {
+                    // a longer line is refused also when it came whole, so
+                    // the answer does not hang on how the bytes were split
+                    Ok(httparse::Status::Complete((used, _))) if used > CHUNK_LINE => {
+                        return Feed::Fail(400);
+                    }
+                    Ok(httparse::Status::Complete((used, size))) => {
+                        *pos += used;
+                        b.chunk = Some(if size == 0 {
+                            Chunk::Trailer
+                        } else {
+                            match usize::try_from(size) {
+                                Ok(n) => Chunk::Data(n),
+                                Err(_) => return Feed::Fail(413),
+                            }
+                        });
+                    }
+                    Ok(httparse::Status::Partial) if avail.len() < CHUNK_LINE => return Feed::More,
+                    _ => return Feed::Fail(400),
+                },
+                Some(Chunk::DataEnd) => {
+                    if avail.len() < 2 {
+                        return Feed::More;
+                    }
+                    if &avail[..2] != b"\r\n" {
+                        return Feed::Fail(400);
+                    }
+                    *pos += 2;
+                    b.chunk = Some(Chunk::Size);
+                }
+                Some(Chunk::Trailer) => {
+                    // no trailer: an empty line. Else lines up to an empty one.
+                    if avail.len() >= 2 && &avail[..2] == b"\r\n" {
+                        *pos += 2;
+                        break;
+                    }
+                    match avail.windows(4).position(|w| w == b"\r\n\r\n") {
+                        // too long also when it came whole (see above)
+                        Some(at) if at + 4 > MAX_HEAD => return Feed::Fail(431),
+                        Some(at) => {
+                            *pos += at + 4;
+                            break;
+                        }
+                        None if avail.len() > MAX_HEAD => return Feed::Fail(431),
+                        None => return Feed::More,
+                    }
+                }
+            }
+        }
+        if b.too_big {
+            return Feed::Fail(413);
+        }
+        b.whole = true;
+        Feed::Whole
+    }
 }
 
 /// Where a chunked body is.
@@ -271,6 +375,7 @@ enum Step {
 }
 
 /// What happens to a body when new bytes came.
+#[derive(Debug, PartialEq)]
 enum Feed {
     More,
     Fail(u16),
@@ -806,93 +911,7 @@ impl Conn {
         let Some(b) = self.body.as_mut() else {
             return Feed::More;
         };
-        if b.whole {
-            return Feed::Whole;
-        }
-        loop {
-            let avail = &self.rbuf[self.rpos..self.rlen];
-            match b.chunk {
-                None | Some(Chunk::Data(_)) => {
-                    let want = match b.chunk {
-                        Some(Chunk::Data(n)) => n,
-                        _ => b.left,
-                    };
-                    let k = want.min(avail.len());
-                    if k > 0 {
-                        b.seen += k;
-                        if b.seen > b.max {
-                            if b.seen > b.max.saturating_add(DRAIN_MAX) {
-                                return Feed::Fail(413);
-                            }
-                            b.too_big = true;
-                        }
-                        if !b.too_big {
-                            b.data.extend_from_slice(&avail[..k]);
-                        }
-                        self.rpos += k;
-                    }
-                    match b.chunk {
-                        Some(Chunk::Data(n)) if n == k => b.chunk = Some(Chunk::DataEnd),
-                        Some(Chunk::Data(n)) => {
-                            b.chunk = Some(Chunk::Data(n - k));
-                            return Feed::More;
-                        }
-                        _ => {
-                            b.left -= k;
-                            if b.left > 0 {
-                                return Feed::More;
-                            }
-                            break;
-                        }
-                    }
-                }
-                Some(Chunk::Size) => match httparse::parse_chunk_size(avail) {
-                    Ok(httparse::Status::Complete((used, size))) => {
-                        self.rpos += used;
-                        b.chunk = Some(if size == 0 {
-                            Chunk::Trailer
-                        } else {
-                            match usize::try_from(size) {
-                                Ok(n) => Chunk::Data(n),
-                                Err(_) => return Feed::Fail(413),
-                            }
-                        });
-                    }
-                    Ok(httparse::Status::Partial) if avail.len() < 1024 => return Feed::More,
-                    _ => return Feed::Fail(400),
-                },
-                Some(Chunk::DataEnd) => {
-                    if avail.len() < 2 {
-                        return Feed::More;
-                    }
-                    if &avail[..2] != b"\r\n" {
-                        return Feed::Fail(400);
-                    }
-                    self.rpos += 2;
-                    b.chunk = Some(Chunk::Size);
-                }
-                Some(Chunk::Trailer) => {
-                    // no trailer: an empty line. Else lines up to an empty one.
-                    if avail.len() >= 2 && &avail[..2] == b"\r\n" {
-                        self.rpos += 2;
-                        break;
-                    }
-                    match avail.windows(4).position(|w| w == b"\r\n\r\n") {
-                        Some(at) => {
-                            self.rpos += at + 4;
-                            break;
-                        }
-                        None if avail.len() > MAX_HEAD => return Feed::Fail(431),
-                        None => return Feed::More,
-                    }
-                }
-            }
-        }
-        if b.too_big {
-            return Feed::Fail(413);
-        }
-        b.whole = true;
-        Feed::Whole
+        b.feed(&self.rbuf[..self.rlen], &mut self.rpos)
     }
 
     /// Parses the complete requests of the read buffer into `inb` from
@@ -2678,3 +2697,81 @@ pub unsafe extern "C" fn dox_free_body(token: *mut c_void) {
 
 #[cfg(test)]
 mod tests;
+
+/// Entry points for the fuzz targets in `fuzz/`. Only in `cargo fuzz`
+/// builds (`--cfg fuzzing`), not in the library.
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzz {
+    use super::*;
+
+    /// The defaults of Dart's `bind`.
+    fn default_limits() -> Limits {
+        limits_of(100 * 1024 * 1024, 100 * 1024 * 1024, 120_000, 0, 30_000)
+    }
+
+    /// Random bytes as a request head (and maybe a body).
+    pub fn parse_head(data: &[u8]) {
+        let lim = default_limits();
+        // room for any record, and a small room to hit `NoRoom`
+        let mut inb = vec![0u8; REQ_HEAD + 4 * data.len()];
+        for room in [inb.len(), data.len() / 2] {
+            match parse_one(data, 1, &[0; 18], &mut inb[..room], 0, &lim, Instant::now()) {
+                Step::Done(used, _) => {
+                    assert!(used <= data.len());
+                    assert!(record_len(&inb) <= room);
+                }
+                Step::Body(used, _, _) => assert!(used <= data.len()),
+                Step::NoRoom(size) => assert!(size > room),
+                Step::More | Step::Fail(_) => {}
+            }
+        }
+    }
+
+    /// A chunked body: byte 0 picks the size of the read pieces, byte 1 the
+    /// body limit, the rest is the body.
+    pub fn chunked_body(data: &[u8]) {
+        let [seed, max, body @ ..] = data else {
+            return;
+        };
+        let lim = Limits {
+            body: usize::from(*max) * 64,
+            ..default_limits()
+        };
+        let head = b"POST / HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n";
+        let start = || match parse_one(head, 1, &[0; 18], &mut [], 0, &lim, Instant::now()) {
+            Step::Body(_, b, _) => b,
+            _ => unreachable!(),
+        };
+        // all at once
+        let mut whole = start();
+        let mut whole_pos = 0;
+        let want = whole.feed(body, &mut whole_pos);
+        // in pieces, like socket reads
+        let mut b = start();
+        let (mut pos, mut end, mut rng) = (0, 0, u32::from(*seed) | 1);
+        let got = loop {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            end = (end + 1 + rng as usize % 64).min(body.len());
+            let before = pos;
+            let r = b.feed(&body[..end], &mut pos);
+            assert!(before <= pos && pos <= end);
+            if r != Feed::More || end == body.len() {
+                break r;
+            }
+        };
+        assert!(b.data.len() <= pos && b.seen <= pos);
+        if got == Feed::Whole {
+            assert!(b.data.len() == b.seen && b.seen <= lim.body);
+        }
+        // the pieces must not change the result
+        assert_eq!(got, want);
+        assert_eq!(pos, whole_pos);
+        if got == Feed::Whole {
+            // on a fail the bytes kept so far do not matter
+            assert_eq!(b.data, whole.data);
+        }
+    }
+}

@@ -1,0 +1,9 @@
+GET /ws HTTP/1.1
+hoscket-version: 14
+sec-websocket-key: ocket
+sec-websket-version: 14
+sec-websocket-key: ocket
+sec-websocket-version: 14
+sec-websocket-key: docket-version: 14
+sec-websocket-key: dGhlIHdGhlIHNhbXBsZSBub25jZQ==
+

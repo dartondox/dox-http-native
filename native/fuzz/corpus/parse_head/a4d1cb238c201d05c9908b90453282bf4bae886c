@@ -1,0 +1,4 @@
+GET /ws HTTP/1.1
+sec-websocket-version:(15
+sec-wike: d=
+

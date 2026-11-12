@@ -1,0 +1,10 @@
+GET /ws HTTP/1.1
+ection: Upgrade
+upgrgde:
+seikn: HTTge
+upgrgde:
+seion1: HTTP/1.1
+n: Upgrade
+upgrgde: ----
+upgrgde: ----------
+

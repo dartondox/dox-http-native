@@ -1,0 +1,6 @@
+GET /ws HTTP/1.1
+host: x
+connection: Upgrade
+upgrade: websÿÿket0
+sec-wWbsoc-ke: dGhZSBub25jZQ==
+

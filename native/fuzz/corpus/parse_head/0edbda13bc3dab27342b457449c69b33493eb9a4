@@ -1,0 +1,36 @@
+GET /ws HTTP/1.1
+host: x
+conec-websockeebst-iowebsocket-ntent-lengthength: UP/2.0
+eect: 100-››‘t(nue
+content-lengthength: UP/1.0
+expect: 100-c›‘t(nue
+content-lengthength: UT /u HTPUT /u HTTP/1.0
+expect: 100-c›‘t(nue
+content-lengthength: UT /u HTTP/0.0
+expect: 100-c›‘u HTPUT /u HTTP/1.0
+expect: 100-c›‘t(nue
+content-lengthength: UT /u HTTP/0.0
+expect: 100-c›‘t(nue
+content-lengthength: 9TP/1.0
+expect: 100-c›‘tpect: 100-c›‘t(nue
+content-lengthength: UP/1.0
+expect: 100-c›‘t(nue
+content-lengthength: UT /u HTPUT /u HTTP/1.0
+expect: 100-c›‘t(nue
+content-lenEAEHngth: UT /u HTTP/0.0
+expect: 100-c›‘t(nue
+content-lenxpect: 100-c›‘t(nue
+content-lengthengthength: UP/1.0
+expect: 100-c›‘t(nue
+content-lengthength: UT /u HTPUT /u HTTP/1.0
+expect: 100-c›‘t(nue
+content-lengthength: UT /u HTTP/0.0
+expect: 100-c›‘u HTPUT /u HTTP/1.0
+expect: 100-c›‘t(nue
+content-lengthength: UT /u HTTP/0.0
+expectct: 100-c›‘tpect: 100-c›‘t(nue
+content-lengthength: UP/1.0
+expect: 100-c›‘t(nue
+content-lengthength: UT /u HTPUT /u HTTP/1.0hength: UP/1.0
+expect: key: dGhlIK5==	
+

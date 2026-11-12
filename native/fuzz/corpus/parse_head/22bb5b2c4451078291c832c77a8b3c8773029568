@@ -1,0 +1,6 @@
+GET /ws HTTP/1.1
+host: xctipgrade
+upgrade: websock‡t
+sec-websocket-version:
+coctios: Upgrade: webs2j
+

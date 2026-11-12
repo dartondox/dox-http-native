@@ -1,0 +1,6 @@
+3GET /ws HTTP/1.1
+host: x
+connection: Uxgrade
+upn: Upgrade
+upgrade: webs
+

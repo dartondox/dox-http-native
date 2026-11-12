@@ -1,0 +1,8 @@
+GET /ws HTTP/1.1
+host: x
+connection: Upgrade
+upgrade: websocket
+sec-websocket-version:
+connection: Upgrade
+upgrade: websNhbXBsZSBub24j
+

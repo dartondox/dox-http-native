@@ -1,0 +1,7 @@
+GET /ws HTTP/1.1
+hos::T 1.1
+hos:/1.1
+hos::; P
+hos::; P/0.1
+xos:::
+3

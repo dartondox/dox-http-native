@@ -1,0 +1,49 @@
+PUT /u HTTP/1.0
+exXpect: 1/u HTTP/1.0
+expect: 11u HTTP/1.0P/1.0
+exXpect: 1/u HTTP/1.0
+expect: 11u HTTP/1.0
+expect: 1/u HTTP/1.0
+expe00xpect: 10u HTTP/1.0
+expect: 1/: 1/u HTTP/1.0
+expect: 100-conGEADe
+coexpect: 10u]HTTP HTTP/1.0
+expect: 100-conGEADe
+coexpecexpect: 11u HTTP/1.0P/1.0
+exXpect: 1/u HTTP/1.0
+expect: 11u HTTP/1.0
+expect: 1/u HTTP/1.0
+expe00xpect: 10u HTTP/1.0
+expect: 1/: 1/u HTTP/1.0
+expect: 100-conGEADe
+coexpect: 10u]HTTP HTTP/1.0
+expect: 100-conGEADe
+coexpect: 10u] /u HTTP/1.0
+exXpect: 1/u HTTP/1.0
+expect: 11u HTTP/1.0P/1.0
+exXpect: 1/u HTTP/1.0
+expect: 11uŸHTTP/1.0
+expect: 1/u HTTP/1.0
+expe00xpect: 10u HTTP/1.0
+expect: 1/u HTTP/1.0
+expect: 100-conGEADe
+coexpect: 10u]HTT10u HTTP/1.0
+expect: 1/u HTTP/1.0
+expect: 100-conGEADe
+ct: 10u] /u HTTP/1.0
+exXpect: 1/u HTTP/1.0
+expect: 11u HTTP/1.0P/1.0
+exXpect: 1/u HTTP/1.0
+expect: 11uŸHTTP/1.0
+expect: 1/u HTTP/1.0
+expe00xpect: 10u HTTP/1.0
+expect: 1/u HTTP/1.0
+expect: 100-conGEADe
+coexpect: 10u]HTT10u HTTP/1.0
+expect: 1/u HTTP/1.0
+expect: 100-conGEADe
+coexpect: 10u]HTTP/10
+expect: 1/u HTTP/1.0
+exp: 100-continåe
+content-length: 99-
+

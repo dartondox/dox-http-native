@@ -1,0 +1,4 @@
+GET /ws HTTP/1.1
+howc-websocket-keys4: x
+connection: keevlea-Gh,IHNhbXBsZSBub25jZQ==
+

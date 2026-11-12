@@ -1,0 +1,7 @@
+GET /ws HTTP/1.1
+host: x
+connconnection: Upgrradej
+connconnection: Up
+content-length: 7
+
+{"

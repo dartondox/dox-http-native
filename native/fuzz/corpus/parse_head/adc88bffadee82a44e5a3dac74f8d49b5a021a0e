@@ -1,0 +1,31 @@
+GET /ws HTTP/1.1
+host: x
+connection: ]pgrade
+upgrntentkey: GET /
+host: x
+connection: ]pgrade
+upgrntentkey: GET /ws HTTP/2.1
+host: x
+connection: ]pgrade
+upgrntentknnection: ]pgrade
+upgrntentkey: GET /
+host: x
+connection: ]pgrade
+upgrntentkey: GEpgrntentkey: GET /
+host: x
+connection: ]pgrade
+upgrntentkey: GET /ws HTTP/2.1
+host: x
+connection: ]pgrade
+upgrntentknnection: ]pgrade
+upgrntentkey: GET /
+host: x
+connection: ]pgrade
+upgrntentkey: GET /ws HTTP/1.1
+host: x
+coney: dGhlIHNub25jws HTTP/1.1
+hosty: dGhlIHNub25jws HTTP/1.1
+host: x
+connection: ]pgrade
+upgrntentkey: dGhlIHNub25jZQ==@
+

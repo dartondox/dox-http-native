@@ -1,0 +1,48 @@
+name: Fuzz
+
+# Runs each fuzz target in native/fuzz for 60 s: random bytes into the
+# HTTP request parser and the chunked body reader. A crash fails the run
+# and uploads the input that caused it.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [parse_head, chunked_body]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # cargo fuzz needs nightly (sanitizer flags)
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: native/fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      # new inputs go to a temp folder, the seeds in fuzz/corpus stay as they are
+      - name: Fuzz ${{ matrix.target }}
+        working-directory: native
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/corpus"
+          cargo fuzz run "$TARGET" "$RUNNER_TEMP/corpus" "fuzz/corpus/$TARGET" -- -max_total_time=60
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: native/fuzz/artifacts

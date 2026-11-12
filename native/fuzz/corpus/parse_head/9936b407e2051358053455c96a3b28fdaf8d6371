@@ -1,0 +1,5 @@
+GET /ws HTTP/1.1
+host: x
+connecte:sec-rsion: 05
+sec-websocket-key: dGhlIHNhshX
+

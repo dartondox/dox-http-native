@@ -1,0 +1,6 @@
+GET s HTTP/1.1
+host: onnectiradesocket	
+sicrsion: 06
+sec-wkey: dGhNhbXB
+connection: SBub25j
+

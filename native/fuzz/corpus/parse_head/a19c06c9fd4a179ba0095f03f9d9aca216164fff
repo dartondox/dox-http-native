@@ -1,0 +1,4 @@
+GET /ws HTTP/1.1
+st: 2 Ucket
+sec-websocket-vershon:sockIHNhbX
+

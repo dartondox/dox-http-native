@@ -1,0 +1,6 @@
+GE /ws HTTP/1.1
+host: x
+connection: Upgrad,
+upgrth: 999=
+
+ÿÿÿÿÿ

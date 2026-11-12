@@ -349,6 +349,64 @@ fn chunked_body_and_expect_continue() {
     );
 }
 
+/// Feeds a chunked body in pieces of `piece` bytes. Gives the result and
+/// the body bytes.
+fn feed_chunked(body: &[u8], piece: usize) -> (Feed, Vec<u8>) {
+    let head = b"POST / HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n";
+    let lim = Limits {
+        body: 1 << 20,
+        ..limits()
+    };
+    let Step::Body(_, mut b, _) = parse_one(head, 1, &[0; 18], &mut [], 0, &lim, Instant::now())
+    else {
+        panic!("no body");
+    };
+    let (mut pos, mut end) = (0, 0);
+    loop {
+        end = (end + piece).min(body.len());
+        let r = b.feed(&body[..end], &mut pos);
+        if r != Feed::More || end == body.len() {
+            return (r, std::mem::take(&mut b.data));
+        }
+    }
+}
+
+#[test]
+fn long_chunk_lines_fail_the_same_whole_or_in_pieces() {
+    // found by the chunked_body fuzz target: a chunk size line over 1024
+    // bytes failed in small reads, but passed when it came in one read
+    let line = |n: usize| {
+        let mut l = b"5;".to_vec();
+        l.resize(n - 2, b'x');
+        l.extend_from_slice(b"\r\nhello\r\n0\r\n\r\n");
+        l
+    };
+    for piece in [7, 100_000] {
+        assert_eq!(
+            feed_chunked(&line(CHUNK_LINE), piece),
+            (Feed::Whole, b"hello".to_vec())
+        );
+        assert_eq!(
+            feed_chunked(&line(CHUNK_LINE + 1), piece).0,
+            Feed::Fail(400)
+        );
+    }
+    // the same for a trailer over MAX_HEAD bytes
+    let trailer = |n: usize| {
+        let mut t = b"0\r\nx: ".to_vec();
+        t.resize(3 + n - 4, b'y');
+        t.extend_from_slice(b"\r\n\r\n");
+        t
+    };
+    for piece in [7, 100_000] {
+        assert_eq!(feed_chunked(&trailer(MAX_HEAD), piece).0, Feed::Whole);
+        assert_eq!(
+            feed_chunked(&trailer(MAX_HEAD + 1), piece).0,
+            Feed::Fail(431)
+        );
+    }
+}
+
 /// Runs turns (with no app) until `count` requests came, or 2 seconds.
 fn collect(core: &mut Core, inb: &mut [u8], count: usize) -> Vec<Rec> {
     let mut got = Vec::new();

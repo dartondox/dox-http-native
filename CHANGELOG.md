@@ -3,6 +3,9 @@
 - Requires Dart 3.14 or newer.
 - Fix: each download try of the native library now has one time limit of 60 s, from connect to the last byte. Before, there was no limit while waiting for the answer, and the 60 s limit for the body only counted the gap between two chunks. So a slow server could hang the build for a long time. Now 3 tries take about 3 minutes at most.
 
+- Fix: a chunked body with a chunk size line over 1024 bytes (with its extensions) now always gets `400`. Before, it got `400` only when the line came in small reads. When the whole line came in one read, it passed. A trailer over 16 KB now always gets `431` for the same reason. Found by the new fuzz tests.
+- New: fuzz tests (cargo-fuzz) for the request parser and the chunked body reader, in `native/fuzz/`. CI runs them on every push and pull request.
+
 ## 3.0.4
 
 - Fix: the build hook now tries the download of the native library up to 3 times (waits 1 s, then 3 s). Before, one bad answer from GitHub (eg. 503 or 504) meant no native library, and the app stopped at start. It tries again on a 5xx or 429 status, a connection error or timeout, and a wrong sha256. A 404 is not tried again. If all 3 tries fail, nothing changes: the hook falls back to cargo or adds no library.

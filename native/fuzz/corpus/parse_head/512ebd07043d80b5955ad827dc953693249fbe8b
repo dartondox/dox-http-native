@@ -1,0 +1,5 @@
+3GET /ws HTTP/1.1
+hon: U‚grade
+upn: Upgrade
+upgrade: webs
+

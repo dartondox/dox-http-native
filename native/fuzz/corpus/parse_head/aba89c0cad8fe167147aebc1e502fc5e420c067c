@@ -1,0 +1,5 @@
+PUT /u HTTP/1.0
+expect: 10p-ntc
+ent-length:9999 /u HTTP/1.0
+expect:100-cZnåeon99
+

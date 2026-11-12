@@ -1,0 +1,15 @@
+GET /ws HTTP/1.1
+host: x
+connection: Upgbade
+$upgrade:]]]]]P/1.1
+host: x
+connection: Upgbade
+$upgrade:]]]]]] ‰œbGET /ws HTTP/1.1
+connection: Upgbade
+$upgrade:]]]]]P/1.1
+host: x
+connection: Upgbade
+$upgrade:]]]]]] ‰œbsIHœbsIHN25jZ`sIHN25jZ`Q==
+
+] ‰œbsIHN25jZ`Q==
+

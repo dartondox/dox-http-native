@@ -132,6 +132,22 @@ Uint8List? plain = AesGcm.open(key, sealed, aad);  // null when changed
 - `Content-Length` must be ASCII digits. A request with two different lengths, or with both `Content-Length` and `Transfer-Encoding: chunked`, gets `400`.
 - A streamed answer must keep to its `contentLength`. More bytes throw, and fewer fail `close()`. In both cases the connection is cut, so the client can not mix the rest up with the next answer.
 
+## Fuzzing
+
+The request parser and the chunked body reader have fuzz targets in `native/fuzz/`. CI runs each one for 60 seconds on every push and pull request. To run one locally:
+
+```sh
+rustup toolchain install nightly
+cargo install cargo-fuzz --locked
+cd native
+cargo +nightly fuzz run parse_head -- -max_total_time=300
+cargo +nightly fuzz run chunked_body -- -max_total_time=300
+```
+
+- New inputs the fuzzer finds go to `fuzz/corpus/<target>/`. Commit only small, useful seeds.
+- A crash stops the run. The input that caused it is in `fuzz/artifacts/<target>/`.
+- Run it again with `cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<file>`.
+
 ## Documentation
 
 - [Native server](https://dartondox.dev/latest/digging-deeper/native-server/)

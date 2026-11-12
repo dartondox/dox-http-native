@@ -1,0 +1,5 @@
+GET /ws HTTP/1.1
+host: x
+connection: Up1rade
+cket-key:68jZQ==
+

@@ -1,0 +1,6 @@
+PUT /u HTTP/1.0
+expect: 10tg0-oinnue
+con-h: 99TT
+expect: 10tg0-oinnue
+con-h: 
+

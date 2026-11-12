@@ -1,0 +1,8 @@
+GET /ws HTTP/1.1
+host: x
+connection: ]pgrade
+upgrntentkey: GET /ws HTTP/1.1
+host: x
+connection: ]pgrade
+upgrntentkey: dGlIHNub25jZQ==@
+

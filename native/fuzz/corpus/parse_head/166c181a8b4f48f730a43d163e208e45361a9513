@@ -1,0 +1,11 @@
+GET /ws HTTP/1.1
+host: x
+connection: Up2raie
+upgrsecost: x
+connection: Up1raie
+upost: x
+connection: Up2raie
+upgrsecost: x
+connection: Up1raie
+upgret-key:33gret-key:33jZQ==
+

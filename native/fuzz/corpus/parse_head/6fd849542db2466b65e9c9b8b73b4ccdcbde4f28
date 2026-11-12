@@ -1,0 +1,6 @@
+GET /ws HTTP/1.1
+host: x
+connconnection: Upgrradhbjson
+content-length: 7
+
+{"

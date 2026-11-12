@@ -1,0 +1,6 @@
+GET /ws HTTP/1.1
+host: n: Upgrade
+upgrade: websogket
+sec-websoket-version: 14
+sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==
+

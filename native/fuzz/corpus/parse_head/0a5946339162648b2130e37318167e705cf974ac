@@ -1,0 +1,6 @@
+GET /ws HTTP/1.1
+host: x
+connection:x
+connectost: x
+connection:x
+connection: Upgra

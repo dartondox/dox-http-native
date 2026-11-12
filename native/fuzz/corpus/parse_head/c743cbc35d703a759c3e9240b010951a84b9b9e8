@@ -1,0 +1,8 @@
+GET /ws HTTP/1.1
+host:Upgrade
+upgrade: w,
+zciton: Upgrade
+upgrade: w,
+host: x
+co$nzcit: d=
+
