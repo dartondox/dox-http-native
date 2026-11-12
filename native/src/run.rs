@@ -1109,9 +1109,10 @@ fn parse_one(
                         _ => return Step::Fail(400),
                     }
                 } else if name.eq_ignore_ascii_case(b"connection") {
-                    close_tok |= has_token(h.value, "close");
-                    keep_tok |= has_token(h.value, "keep-alive");
-                    conn_up |= has_token(h.value, "upgrade");
+                    // once `close` is seen, `keep-alive` does not matter
+                    close_tok = close_tok || has_token(h.value, "close");
+                    keep_tok = keep_tok || (!close_tok && has_token(h.value, "keep-alive"));
+                    conn_up = conn_up || has_token(h.value, "upgrade");
                 } else if name.eq_ignore_ascii_case(b"content-type") {
                     let mime = h.value.split(|&c| c == b';').next().unwrap_or(b"");
                     form = mime
@@ -1170,7 +1171,8 @@ fn parse_one(
         && up_ws
         && v13
         && n_ver == 1
-        && n_key == 1;
+        && n_key == 1
+        && key.is_some_and(ws_key_ok);
     let flags = u32::from(http10) | (u32::from(upgrade) << 1);
     let slot = Slot {
         close,
@@ -1241,6 +1243,16 @@ fn parse_one(
     };
     let more = data.len() < head + clen || chunked;
     Step::Body(head, Box::new(body), expect && more)
+}
+
+/// A `Sec-WebSocket-Key` is base64 of 16 bytes: 22 base64 characters,
+/// then `==` (RFC 6455 4.2.1). Another key gives no upgrade.
+fn ws_key_ok(k: &[u8]) -> bool {
+    k.len() == 24
+        && k.ends_with(b"==")
+        && k[..22]
+            .iter()
+            .all(|&c| c.is_ascii_alphanumeric() || c == b'+' || c == b'/')
 }
 
 /// A target with raw bytes over 0x7f (eg. UTF-8 from a client that does
@@ -2908,7 +2920,8 @@ pub mod fuzz {
             && tokens(req, "upgrade").iter().any(|t| t == b"websocket")
             && ver.len() == 1
             && ows(ver[0]) == b"13"
-            && keys.len() == 1;
+            && keys.len() == 1
+            && base64(ows(keys[0])).is_some_and(|k| k.len() == 16);
         let expect = values(req, "expect")
             .iter()
             .any(|v| ows(v).eq_ignore_ascii_case(b"100-continue"));
@@ -2921,20 +2934,50 @@ pub mod fuzz {
         }
     }
 
+    /// The target for Dart: raw bytes over 0x7f as %XX, all else as it is.
+    fn escaped(path: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        for &c in path.as_bytes() {
+            if c.is_ascii() {
+                out.push(c);
+            } else {
+                out.extend_from_slice(format!("%{c:02X}").as_bytes());
+            }
+        }
+        out
+    }
+
+    /// The bytes of a base64 value (RFC 4648, with padding), or None.
+    fn base64(v: &[u8]) -> Option<Vec<u8>> {
+        let pad = v.iter().rev().take_while(|&&c| c == b'=').count();
+        if !v.len().is_multiple_of(4) || pad > 2 {
+            return None;
+        }
+        let (mut bits, mut n, mut out) = (0u32, 0, Vec::new());
+        for &c in &v[..v.len() - pad] {
+            let d = match c {
+                b'A'..=b'Z' => c - b'A',
+                b'a'..=b'z' => c - b'a' + 26,
+                b'0'..=b'9' => c - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                _ => return None,
+            };
+            bits = (bits << 6 | u32::from(d)) & 0xffff;
+            n += 6;
+            if n >= 8 {
+                n -= 8;
+                out.push((bits >> n) as u8);
+            }
+        }
+        Some(out)
+    }
+
     /// The record must hold what httparse read from the same bytes.
     fn check_rec(rec: &Rec, req: &httparse::Request, want: &Want) {
         assert_eq!(rec.method, req.method.unwrap().as_bytes());
-        // raw bytes over 0x7f come as %XX, all else as it is
-        let mut target = Vec::new();
-        for &c in req.path.unwrap().as_bytes() {
-            if c.is_ascii() {
-                target.push(c);
-            } else {
-                target.extend_from_slice(format!("%{c:02X}").as_bytes());
-            }
-        }
         assert!(rec.target.is_ascii(), "the target is not ASCII");
-        assert_eq!(rec.target, target);
+        assert_eq!(rec.target, escaped(req.path.unwrap()));
         assert_eq!(rec.headers.len(), req.headers.len());
         for ((name, value), h) in rec.headers.iter().zip(req.headers.iter()) {
             assert!(
@@ -3147,7 +3190,8 @@ pub mod fuzz {
     /// `small` is the room in Dart's buffer: a record that does not fit
     /// gets the room it asks for, in a call of its own. Dart answers
     /// each request at once, and says no to each upgrade.
-    fn drive(stream: &[u8], cuts: &[usize], small: usize, lim: &Limits) -> Seen {
+    /// Also gives the number of `100 Continue` lines.
+    fn drive(stream: &[u8], cuts: &[usize], small: usize, lim: &Limits) -> (Seen, usize) {
         let now = Instant::now();
         let mut c = Conn::new(sock(), PEER, now);
         let mut seq = 0u32;
@@ -3230,23 +3274,122 @@ pub mod fuzz {
             assert!(w.starts_with(b"HTTP/1.1 4") || w.starts_with(b"HTTP/1.1 5"));
             assert!(c.closing);
         }
-        // one `100 Continue` at most per request that asked for it
-        let asked = seen
-            .recs
-            .iter()
-            .filter(|r| {
-                r.headers
-                    .iter()
-                    .any(|(n, v)| n == b"expect" && ows(v).eq_ignore_ascii_case(b"100-continue"))
-            })
-            .count();
-        assert!(conts <= asked + usize::from(c.closing || c.body.is_some()));
         seen.fail = w.to_vec();
         seen.body = c.body.is_some();
         if c.closing {
             assert!(seen.slots.last().is_some_and(|s| s.0) || !seen.fail.is_empty());
         }
-        seen
+        (seen, conts)
+    }
+
+    /// How the walk of [expected] ended.
+    #[derive(Debug, PartialEq)]
+    enum End {
+        /// no more records can come (the end, a close, a body that is
+        /// too big or not whole yet)
+        Stop,
+        /// a bad request: no more records, and a fail answer
+        Reject,
+        /// the walk can not tell (see below): only the records up to here
+        /// are checked
+        Unsure,
+    }
+
+    /// The records Dart must get for `stream`, found request after
+    /// request with httparse, [framing] and [dechunk], apart from `Conn`.
+    /// Dart says no to each upgrade, so the walk goes on after one. Also
+    /// gives the requests with `Expect: 100-continue` and a body.
+    fn expected(stream: &[u8], lim: &Limits) -> (Vec<Rec>, usize, End) {
+        // the server picks the limit by the content type. The walk does
+        // not copy that rule: a body between the two limits is `Unsure`.
+        let (low, high) = (lim.body.min(lim.multipart), lim.body.max(lim.multipart));
+        let (mut out, mut asked, mut pos) = (Vec::new(), 0, 0);
+        let end = loop {
+            let s = &stream[pos..];
+            if s.is_empty() {
+                break End::Stop;
+            }
+            let mut hs = [httparse::EMPTY_HEADER; MAX_HEADERS];
+            let mut req = httparse::Request::new(&mut hs);
+            let head = match req.parse(s) {
+                Ok(httparse::Status::Complete(h)) if h <= MAX_HEAD => h,
+                Ok(httparse::Status::Partial) if s.len() <= MAX_HEAD => break End::Stop,
+                _ => break End::Reject,
+            };
+            let want = want(&req);
+            let rest = &s[head..];
+            let (body, used) = match want.framing {
+                Framing::Reject => break End::Reject,
+                Framing::Len(n) => {
+                    let n = n as usize;
+                    asked += usize::from(want.expect && n > 0);
+                    if n > high || rest.len() < n {
+                        break End::Stop;
+                    }
+                    (rest[..n].to_vec(), n)
+                }
+                Framing::Chunked => {
+                    asked += usize::from(want.expect);
+                    match dechunk(rest) {
+                        Some((b, _)) if b.len() > high => break End::Stop,
+                        Some(x) => x,
+                        None => break End::Stop,
+                    }
+                }
+            };
+            if body.len() > low {
+                break End::Unsure;
+            }
+            out.push(Rec {
+                flags: u32::from(want.http10) | (u32::from(want.key.is_some()) << 1),
+                method: req.method.unwrap().as_bytes().to_vec(),
+                target: escaped(req.path.unwrap()),
+                headers: req
+                    .headers
+                    .iter()
+                    .map(|h| (h.name.to_ascii_lowercase().into_bytes(), h.value.to_vec()))
+                    .collect(),
+                body,
+            });
+            pos += head + used;
+            if want.close {
+                break End::Stop;
+            }
+        };
+        (out, asked, end)
+    }
+
+    /// A chunked body at the start of `s` (RFC 9112 7.1): the body and the
+    /// bytes used. None when it is bad or not whole. Chunk size lines go
+    /// to httparse. Like the server, a size line over [CHUNK_LINE] bytes
+    /// and a trailer over [MAX_HEAD] bytes are bad: stricter on purpose.
+    fn dechunk(s: &[u8]) -> Option<(Vec<u8>, usize)> {
+        let (mut body, mut p) = (Vec::new(), 0);
+        loop {
+            let Ok(httparse::Status::Complete((used, size))) = httparse::parse_chunk_size(&s[p..])
+            else {
+                return None;
+            };
+            if used > CHUNK_LINE {
+                return None;
+            }
+            p += used;
+            if size == 0 {
+                // no trailer: an empty line. Else lines up to an empty one.
+                if s[p..].starts_with(b"\r\n") {
+                    return Some((body, p + 2));
+                }
+                let at = s[p..].windows(4).position(|w| w == b"\r\n\r\n")?;
+                return (at + 4 <= MAX_HEAD).then_some((body, p + at + 4));
+            }
+            let n = usize::try_from(size).ok()?;
+            let data = s.get(p..p.checked_add(n)?.checked_add(2)?)?;
+            if !data.ends_with(b"\r\n") {
+                return None;
+            }
+            body.extend_from_slice(&data[..n]);
+            p += n + 2;
+        }
     }
 
     /// Many requests on one connection (pipelined, with bodies). Byte 0
@@ -3263,7 +3406,33 @@ pub mod fuzz {
             ..default_limits()
         };
         let big = REQ_HEAD + 4 * stream.len() + EXTERNAL_MIN;
-        let want = drive(stream, &[stream.len()], big, &lim);
+        let (want, conts) = drive(stream, &[stream.len()], big, &lim);
+        // the records match a walk of the stream that does not use `Conn`
+        let (exp, asked, walk) = expected(stream, &lim);
+        assert!(want.recs.len() >= exp.len(), "records are missing");
+        assert_eq!(
+            want.recs[..exp.len()],
+            exp[..],
+            "a record is not what the client sent"
+        );
+        if walk != End::Unsure {
+            assert_eq!(
+                want.recs.len(),
+                exp.len(),
+                "a record after the end of the walk"
+            );
+            // a `100 Continue` only for a request that asked for it and
+            // has a body. How many go out also hangs on how the bytes
+            // came in and on which requests share one `parse` call, so
+            // this is an upper bound, not an exact count.
+            assert!(
+                conts <= asked,
+                "{conts} `100 Continue` for {asked} requests"
+            );
+        }
+        if walk == End::Reject {
+            assert!(!want.fail.is_empty(), "a bad request got no answer");
+        }
         let mut cuts = Vec::new();
         let (mut end, mut rng) = (0, u32::from(*seed) | 1);
         while end < stream.len() {
@@ -3274,17 +3443,20 @@ pub mod fuzz {
             return;
         }
         let small = usize::from(*small) * 4;
-        assert_eq!(
-            drive(stream, &[stream.len()], small, &lim),
-            want,
-            "small buffer"
-        );
-        assert_eq!(drive(stream, &cuts, big, &lim), want, "in pieces");
-        assert_eq!(
-            drive(stream, &cuts, small, &lim),
-            want,
-            "in pieces, small buffer"
-        );
+        for (cuts, room, what) in [
+            (&[stream.len()][..], small, "small buffer"),
+            (&cuts[..], big, "in pieces"),
+            (&cuts[..], small, "in pieces, small buffer"),
+        ] {
+            let (seen, conts) = drive(stream, cuts, room, &lim);
+            assert_eq!(seen, want, "{what}");
+            if walk != End::Unsure {
+                assert!(
+                    conts <= asked,
+                    "{what}: {conts} `100 Continue` for {asked} requests"
+                );
+            }
+        }
     }
 
     /// `aead::open` on untrusted cookie bytes. Byte 0 is the aad length,
@@ -3334,6 +3506,31 @@ pub mod fuzz {
         };
         assert_eq!(r, 0);
         assert_eq!(ffi_open(&key, &aad, &out).as_deref(), Some(data));
+        // bad arguments from Dart: a null pointer with a length, or a
+        // negative length. -1, and nothing is read or written.
+        let (k, nul, neg) = (key.as_ptr(), std::ptr::null(), -1 - i64::from(*f0));
+        let (d, n) = (out.as_ptr(), out.len() as i64);
+        let mut o = vec![0u8; out.len()];
+        let o = o.as_mut_ptr();
+        unsafe {
+            assert_eq!(aead::dox_aes_gcm_open(nul, d, 0, d, n, o), -1);
+            assert_eq!(aead::dox_aes_gcm_open(k, nul, 1, d, n, o), -1);
+            assert_eq!(aead::dox_aes_gcm_open(k, d, neg, d, n, o), -1);
+            assert_eq!(aead::dox_aes_gcm_open(k, d, 0, nul, n, o), -1);
+            assert_eq!(aead::dox_aes_gcm_open(k, d, 0, d, neg, o), -1);
+            if n > 28 {
+                let null_out = std::ptr::null_mut();
+                assert_eq!(aead::dox_aes_gcm_open(k, d, 0, d, n, null_out), -1);
+            }
+            assert_eq!(aead::dox_aes_gcm_seal(nul, d, 0, d, 0, o), -1);
+            assert_eq!(aead::dox_aes_gcm_seal(k, d, neg, d, 0, o), -1);
+            assert_eq!(aead::dox_aes_gcm_seal(k, d, 0, d, neg, o), -1);
+            assert_eq!(aead::dox_aes_gcm_seal(k, d, 0, nul, 1, o), -1);
+            assert_eq!(
+                aead::dox_aes_gcm_seal(k, d, 0, d, 0, std::ptr::null_mut()),
+                -1
+            );
+        }
     }
 
     /// `dox_aes_gcm_open` with an out buffer of exactly `data - 28` bytes

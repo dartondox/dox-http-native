@@ -7,7 +7,7 @@
 - Fix: a method like `GOT`, `PUX` or `POOL` came to the app as `GET`, `PUT` or `POST`. Dart checked only the length and the first byte of the method. Now it checks every byte.
 - Fix: `Transfer-Encoding` in an HTTP/1.0 request, or in two headers, now gets `400` (RFC 9112). Before, the body was read as chunked. A proxy in front could read the body another way (request smuggling).
 - Fix: `Connection: close` in one header and `keep-alive` in another now closes the connection. Before, the last header won.
-- Fix: a WebSocket key or version sent twice no longer upgrades (RFC 6455). `websocket` in any `Upgrade` header and `100-continue` in any `Expect` header now count, not only in the last one.
+- Fix: a WebSocket key or version sent twice no longer upgrades (RFC 6455). A key that is not base64 of 16 bytes (24 characters, eg. an empty key) no longer upgrades either. These requests go to the app as normal requests. `websocket` in any `Upgrade` header and `100-continue` in any `Expect` header now count, not only in the last one.
 - New: the fuzz tests now check the request record for Dart and the body framing against a reference, and fuzz a whole connection (`conn`) and the cookie decryption (`aead_open`).
 
 ## 3.0.4

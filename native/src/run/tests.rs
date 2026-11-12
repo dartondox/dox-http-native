@@ -1066,6 +1066,7 @@ fn connection_close_wins_over_keep_alive() {
 #[test]
 fn websocket_upgrade_headers_count_once() {
     let up = |extra: &str| {
+        let extra = extra.replace("{K}", "dGhlIHNhbXBsZSBub25jZQ==");
         let req =
             format!("GET /ws HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n{extra}\r\n");
         match parse_req(req.as_bytes()) {
@@ -1073,17 +1074,45 @@ fn websocket_upgrade_headers_count_once() {
             _ => panic!("{req:?}"),
         }
     };
-    assert!(up("Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: a\r\n"));
     assert!(up(
-        "Upgrade: h2c\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: a\r\n"
+        "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {K}\r\n"
+    ));
+    assert!(up(
+        "Upgrade: h2c\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {K}\r\n"
     ));
     assert!(!up(
-        "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: a\r\nSec-WebSocket-Key: b\r\n"
+        "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {K}\r\nSec-WebSocket-Key: {K}\r\n"
     ));
     assert!(!up(
-        "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: a\r\n"
+        "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {K}\r\n"
     ));
     // `100-continue` in any `Expect` header counts
     let req = b"POST / HTTP/1.1\r\nExpect: 100-continue\r\nExpect: x\r\nContent-Length: 5\r\n\r\n";
     assert!(matches!(parse_req(req), Step::Body(_, _, true)));
+}
+
+/// A `Sec-WebSocket-Key` must be base64 of 16 bytes (RFC 6455 4.2.1).
+/// Another key gives a normal request, with no upgrade.
+#[test]
+fn websocket_key_must_be_16_bytes_of_base64() {
+    for (key, ok) in [
+        ("dGhlIHNhbXBsZSBub25jZQ==", true),
+        ("AAAAAAAAAAAAAAAAAAAAA+/=", false),
+        ("AAAAAAAAAAAAAAAAAAAAA+==", true),
+        ("", false),
+        ("a", false),
+        ("dGhlIHNhbXBsZSBub25jZQ=", false),
+        ("dGhlIHNhbXBsZSBub25jZQ", false),
+        ("dGhlIHNhbXBsZSBub25jZQ!=", false),
+        ("dGhlIHNhbXBsZSBub25jZ===", false),
+        ("dGhlIHNhbXBsZSBub25jZQAA", false),
+    ] {
+        let req = format!(
+            "GET /ws HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {key}\r\n\r\n"
+        );
+        match parse_req(req.as_bytes()) {
+            Step::Done(_, s) => assert_eq!(s.key.is_some(), ok, "{key:?}"),
+            _ => panic!("{key:?}"),
+        }
+    }
 }
