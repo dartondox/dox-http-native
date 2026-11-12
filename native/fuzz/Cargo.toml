@@ -53,3 +53,17 @@ path = "fuzz_targets/chunked_body.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "conn"
+path = "fuzz_targets/conn.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "aead_open"
+path = "fuzz_targets/aead_open.rs"
+test = false
+doc = false
+bench = false

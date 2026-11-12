@@ -236,6 +236,17 @@ void main() {
     });
   });
 
+  test('an unknown method keeps its name', () async {
+    // only exact GET, POST, PUT and DELETE take the short path
+    for (String m in <String>['GOT', 'POOL', 'PUX', 'DELETX']) {
+      String r = await raw(
+        port,
+        '$m /headers HTTP/1.1\r\nConnection: close\r\n\r\n',
+      );
+      expect(r, contains('"method":"$m"'));
+    }
+  });
+
   test('POST body comes back the same', () async {
     List<int> body = List<int>.generate(1000, (int i) => i % 256);
     HttpClientRequest req = await client.post('127.0.0.1', port, '/echo');

@@ -130,20 +130,27 @@ Uint8List? plain = AesGcm.open(key, sealed, aad);  // null when changed
 - `req.uri` is the target as the client sent it. `..` and `%2e%2e` are not removed. Check paths before you use them for files.
 - A request head with bare LF line ends (no CR) is accepted, like most servers do. A proxy in front should normalize it.
 - `Content-Length` must be ASCII digits. A request with two different lengths, or with both `Content-Length` and `Transfer-Encoding: chunked`, gets `400`.
+- `Transfer-Encoding` must be exactly `chunked`, in one header. Another coding gets `501`. Two headers, or `Transfer-Encoding` in an HTTP/1.0 request, get `400`.
 - A streamed answer must keep to its `contentLength`. More bytes throw, and fewer fail `close()`. In both cases the connection is cut, so the client can not mix the rest up with the next answer.
 
 ## Fuzzing
 
-The request parser and the chunked body reader have fuzz targets in `native/fuzz/`. CI runs each one for 60 seconds when `native/` changes. To run one locally:
+Fuzz targets are in `native/fuzz/`. CI runs each one for 60 seconds when `native/` changes.
+
+- `parse_head`: random bytes as one request. It checks the record for Dart against what `httparse` reads from the same bytes: method, target, header names and values, lengths and flags. It also checks the body framing (no body, a length, chunked, or a refusal) against a small reference of RFC 9112 section 6, written apart from the server. A request smuggling bug shows up here.
+- `chunked_body`: a chunked body, all at once and in random pieces. Both must give the same result.
+- `conn`: many requests on one connection (pipelined, bodies, keep-alive, close, upgrade). All at once and in random pieces, with a big and a small Dart buffer: Dart must get the same records each time. Nothing may be parsed after a close or a bad request.
+- `aead_open`: the cookie decryption on random data. It must never panic, a sealed value must open again, and one changed byte must make it fail.
+
+To run one locally:
 
 ```sh
 rustup toolchain install nightly
 cargo install cargo-fuzz --locked
 cd native
 cp Cargo.lock fuzz/Cargo.lock
-mkdir -p /tmp/corpus/parse_head /tmp/corpus/chunked_body
-cargo +nightly fuzz run parse_head /tmp/corpus/parse_head fuzz/corpus/parse_head -- -max_total_time=300 -max_len=32768
-cargo +nightly fuzz run chunked_body /tmp/corpus/chunked_body fuzz/corpus/chunked_body -- -max_total_time=300 -max_len=32768
+mkdir -p /tmp/corpus/conn
+cargo +nightly fuzz run conn /tmp/corpus/conn fuzz/corpus/conn -- -max_total_time=300 -max_len=32768
 ```
 
 - The first folder gets the new inputs the fuzzer finds. Use a temp folder, so `fuzz/corpus/` keeps only the small seed files. Commit a new seed there only when it is useful.

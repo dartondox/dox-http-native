@@ -1020,3 +1020,70 @@ fn connection_limit_and_no_buffer_for_idle_connections() {
     let got = collect(&mut core, &mut inb, 1);
     assert_eq!(got.first().map(|r| r.target.as_str()), Some("/b"));
 }
+
+/// Parses one request with room for its record.
+fn parse_req(req: &[u8]) -> Step {
+    let mut inb = vec![0u8; 4096];
+    parse_one(req, 1, &[0; 18], &mut inb, 0, &limits(), Instant::now())
+}
+
+/// Bad framing that a proxy in front may read another way gets 400
+/// (RFC 9112 6.1 and 6.3). Found by the fuzz oracle.
+#[test]
+fn transfer_encoding_in_http10_or_twice_is_refused() {
+    for req in [
+        &b"POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"[..],
+        b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n",
+    ] {
+        assert!(matches!(parse_req(req), Step::Fail(400)), "{req:?}");
+    }
+    let ok = b"POST / HTTP/1.1\r\nTransfer-Encoding: Chunked\r\n\r\n";
+    assert!(matches!(parse_req(ok), Step::Body(..)));
+}
+
+/// `close` in any `Connection` header closes, also with `keep-alive` in
+/// another one (RFC 9112 9.3). Found by the fuzz oracle.
+#[test]
+fn connection_close_wins_over_keep_alive() {
+    let close = |req: &[u8]| match parse_req(req) {
+        Step::Done(_, s) => s.close,
+        _ => panic!("{req:?}"),
+    };
+    assert!(close(
+        b"GET / HTTP/1.1\r\nConnection: close\r\nConnection: keep-alive\r\n\r\n"
+    ));
+    assert!(close(
+        b"GET / HTTP/1.1\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n"
+    ));
+    assert!(!close(b"GET / HTTP/1.0\r\nConnection: Keep-Alive\r\n\r\n"));
+    assert!(close(b"GET / HTTP/1.0\r\n\r\n"));
+    assert!(!close(b"GET / HTTP/1.1\r\n\r\n"));
+}
+
+/// A WebSocket key or version given twice gives no upgrade (RFC 6455
+/// 11.3). `websocket` in any `Upgrade` header counts. Found by the fuzz
+/// oracle.
+#[test]
+fn websocket_upgrade_headers_count_once() {
+    let up = |extra: &str| {
+        let req =
+            format!("GET /ws HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n{extra}\r\n");
+        match parse_req(req.as_bytes()) {
+            Step::Done(_, s) => s.key.is_some(),
+            _ => panic!("{req:?}"),
+        }
+    };
+    assert!(up("Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: a\r\n"));
+    assert!(up(
+        "Upgrade: h2c\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: a\r\n"
+    ));
+    assert!(!up(
+        "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: a\r\nSec-WebSocket-Key: b\r\n"
+    ));
+    assert!(!up(
+        "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: a\r\n"
+    ));
+    // `100-continue` in any `Expect` header counts
+    let req = b"POST / HTTP/1.1\r\nExpect: 100-continue\r\nExpect: x\r\nContent-Length: 5\r\n\r\n";
+    assert!(matches!(parse_req(req), Step::Body(_, _, true)));
+}

@@ -1,0 +1,11 @@
+GET /a HTTP/1.1
+Host: a
+
+POST /b HTTP/1.1
+Content-Length: 5
+
+helloGET /c HTTP/1.1
+Connection: close
+
+GET /d HTTP/1.1
+

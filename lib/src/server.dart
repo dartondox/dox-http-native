@@ -385,12 +385,21 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   }
 
   static String _method(Uint8List b, int at, int len) {
-    // the common ones without a new String
-    if (len == 3 && b[at] == 71) return 'GET';
-    if (len == 4 && b[at] == 80 && b[at + 1] == 79) return 'POST';
-    if (len == 3 && b[at] == 80) return 'PUT';
-    if (len == 6 && b[at] == 68) return 'DELETE';
+    // the common ones without a new String. Check every byte: a method
+    // like `GOT` must not turn into `GET`.
+    if (_is(b, at, len, 'GET')) return 'GET';
+    if (_is(b, at, len, 'POST')) return 'POST';
+    if (_is(b, at, len, 'PUT')) return 'PUT';
+    if (_is(b, at, len, 'DELETE')) return 'DELETE';
     return String.fromCharCodes(b, at, at + len);
+  }
+
+  static bool _is(Uint8List b, int at, int len, String name) {
+    if (len != name.length) return false;
+    for (int i = 0; i < len; i++) {
+      if (b[at + i] != name.codeUnitAt(i)) return false;
+    }
+    return true;
   }
 
   // ---- responses to Rust ----

@@ -4,6 +4,11 @@
 - Fix: each download try of the native library now has one time limit of 60 s, from connect to the last byte. Before, there was no limit while waiting for the answer, and the 60 s limit for the body only counted the gap between two chunks. So a slow server could hang the build for a long time. Now 3 tries take about 3 minutes at most.
 - Fix: a chunked body with a chunk size line over 1024 bytes (with its extensions) now always gets `400`. Before, it got `400` only when the line came in small reads. When the whole line came in one read, it passed. A trailer over 16 KB now always gets `431` for the same reason. Found by the new fuzz tests.
 - New: fuzz tests (cargo-fuzz) for the request parser and the chunked body reader, in `native/fuzz/`. CI runs them when `native/` changes.
+- Fix: a method like `GOT`, `PUX` or `POOL` came to the app as `GET`, `PUT` or `POST`. Dart checked only the length and the first byte of the method. Now it checks every byte.
+- Fix: `Transfer-Encoding` in an HTTP/1.0 request, or in two headers, now gets `400` (RFC 9112). Before, the body was read as chunked. A proxy in front could read the body another way (request smuggling).
+- Fix: `Connection: close` in one header and `keep-alive` in another now closes the connection. Before, the last header won.
+- Fix: a WebSocket key or version sent twice no longer upgrades (RFC 6455). `websocket` in any `Upgrade` header and `100-continue` in any `Expect` header now count, not only in the last one.
+- New: the fuzz tests now check the request record for Dart and the body framing against a reference, and fuzz a whole connection (`conn`) and the cookie decryption (`aead_open`).
 
 ## 3.0.4
 
