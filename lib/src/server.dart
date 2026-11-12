@@ -385,11 +385,30 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   }
 
   static String _method(Uint8List b, int at, int len) {
-    // the common ones without a new String
-    if (len == 3 && b[at] == 71) return 'GET';
-    if (len == 4 && b[at] == 80 && b[at + 1] == 79) return 'POST';
-    if (len == 3 && b[at] == 80) return 'PUT';
-    if (len == 6 && b[at] == 68) return 'DELETE';
+    // the common ones without a new String. Check every byte: a method
+    // like `GOT` must not turn into `GET`.
+    if (len == 3 && b[at] == 71 && b[at + 1] == 69 && b[at + 2] == 84) {
+      return 'GET';
+    }
+    if (len == 4 &&
+        b[at] == 80 &&
+        b[at + 1] == 79 &&
+        b[at + 2] == 83 &&
+        b[at + 3] == 84) {
+      return 'POST';
+    }
+    if (len == 3 && b[at] == 80 && b[at + 1] == 85 && b[at + 2] == 84) {
+      return 'PUT';
+    }
+    if (len == 6 &&
+        b[at] == 68 &&
+        b[at + 1] == 69 &&
+        b[at + 2] == 76 &&
+        b[at + 3] == 69 &&
+        b[at + 4] == 84 &&
+        b[at + 5] == 69) {
+      return 'DELETE';
+    }
     return String.fromCharCodes(b, at, at + len);
   }
 
