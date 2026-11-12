@@ -1,0 +1,55 @@
+[package]
+name = "dox_http_native-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# The library source of native/ is built here as an rlib. native/ itself
+# stays a cdylib only, so fuzzing does not change the shipped library.
+# Keep these dependencies the same as in native/Cargo.toml.
+[lib]
+name = "dox_http_native"
+path = "../src/lib.rs"
+test = false
+doc = false
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+aes-gcm = "0.11.1"
+bytes = "1.12.1"
+flate2 = "1.1.10"
+getrandom = "0.4.3"
+httparse = "1.10.1"
+httpdate = "1.0.3"
+mio = { version = "1.2.4", features = ["os-poll", "net"] }
+slab = "0.4.12"
+socket2 = { version = "0.6.5", features = ["all"] }
+tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191"
+
+# the source of native/ has `#[cfg(fuzzing)]`, which cargo fuzz sets
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
+# its own workspace, so it is not part of the main build
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "parse_head"
+path = "fuzz_targets/parse_head.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunked_body"
+path = "fuzz_targets/chunked_body.rs"
+test = false
+doc = false
+bench = false

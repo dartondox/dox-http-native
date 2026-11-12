@@ -132,6 +132,25 @@ Uint8List? plain = AesGcm.open(key, sealed, aad);  // null when changed
 - `Content-Length` must be ASCII digits. A request with two different lengths, or with both `Content-Length` and `Transfer-Encoding: chunked`, gets `400`.
 - A streamed answer must keep to its `contentLength`. More bytes throw, and fewer fail `close()`. In both cases the connection is cut, so the client can not mix the rest up with the next answer.
 
+## Fuzzing
+
+The request parser and the chunked body reader have fuzz targets in `native/fuzz/`. CI runs each one for 60 seconds when `native/` changes. To run one locally:
+
+```sh
+rustup toolchain install nightly
+cargo install cargo-fuzz --locked
+cd native
+cp Cargo.lock fuzz/Cargo.lock
+mkdir -p /tmp/corpus/parse_head /tmp/corpus/chunked_body
+cargo +nightly fuzz run parse_head /tmp/corpus/parse_head fuzz/corpus/parse_head -- -max_total_time=300 -max_len=32768
+cargo +nightly fuzz run chunked_body /tmp/corpus/chunked_body fuzz/corpus/chunked_body -- -max_total_time=300 -max_len=32768
+```
+
+- The first folder gets the new inputs the fuzzer finds. Use a temp folder, so `fuzz/corpus/` keeps only the small seed files. Commit a new seed there only when it is useful.
+- `-max_len=32768` lets inputs go over the 16 KB head limit.
+- A crash stops the run. The input that caused it is in `fuzz/artifacts/<target>/`. Run it again with `cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<file>`.
+- The fuzz crate builds the same source as `native/`. Keep the dependencies in `native/fuzz/Cargo.toml` the same as in `native/Cargo.toml`. CI checks this.
+
 ## Documentation
 
 - [Native server](https://dartondox.dev/latest/digging-deeper/native-server/)

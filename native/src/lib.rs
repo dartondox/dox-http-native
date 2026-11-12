@@ -84,6 +84,10 @@
 mod aead;
 mod run;
 
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub use run::fuzz;
+
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdListener};
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
