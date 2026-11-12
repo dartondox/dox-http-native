@@ -149,10 +149,11 @@ rustup toolchain install nightly
 cargo install cargo-fuzz --locked
 cd native
 cp Cargo.lock fuzz/Cargo.lock
-mkdir -p /tmp/corpus/conn
+mkdir -p /tmp/corpus/conn fuzz/corpus/conn
 cargo +nightly fuzz run conn /tmp/corpus/conn fuzz/corpus/conn -- -max_total_time=300 -max_len=32768
 ```
 
+- `mkdir` also makes the seed folder, for a target that has no seeds (`aead_open`: any random bytes are a good input).
 - The first folder gets the new inputs the fuzzer finds. Use a temp folder, so `fuzz/corpus/` keeps only the small seed files. Commit a new seed there only when it is useful.
 - `-max_len=32768` lets inputs go over the 16 KB head limit.
 - A crash stops the run. The input that caused it is in `fuzz/artifacts/<target>/`. Run it again with `cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<file>`.

@@ -70,7 +70,8 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: |
-          mkdir -p "$RUNNER_TEMP/corpus"
+          # a target with no seeds (eg. aead_open) has no seed folder
+          mkdir -p "$RUNNER_TEMP/corpus" "fuzz/corpus/$TARGET"
           # the prebuilt cargo-fuzz is a musl build and picks musl by
           # default. The sanitizer needs the host (glibc) target.
           host=$(rustc -vV | sed -n 's/^host: //p')
