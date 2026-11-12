@@ -36,8 +36,15 @@ jobs:
       - name: Check that the fuzz dependencies match
         working-directory: native
         run: |
+          # the check reads `[dependencies]` style sections only, not
+          # `[dependencies.name]` tables
+          if grep -nE '^\[(target\..*\.)?dependencies\.' Cargo.toml fuzz/Cargo.toml; then
+            echo "::error::use one line per dependency, not a [dependencies.name] table"
+            exit 1
+          fi
+          # the dependency sections, with their header lines
           deps() {
-            awk '/^\[/ { s = ($0 == "[dependencies]" || index($0, ".dependencies]") > 0); next }
+            awk '/^\[/ { s = ($0 == "[dependencies]" || index($0, ".dependencies]") > 0); if (s) print; next }
                  s && NF && !/^#/ && !/^libfuzzer-sys/' "$1"
           }
           diff <(deps Cargo.toml) <(deps fuzz/Cargo.toml)

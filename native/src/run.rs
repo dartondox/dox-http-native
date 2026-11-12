@@ -2705,7 +2705,9 @@ mod tests;
 pub mod fuzz {
     use super::*;
 
-    /// The defaults of Dart's `bind`.
+    /// The defaults of `NativeHttpServer.bind` in lib/src/server.dart
+    /// (`maxBodySize`, `maxMultipartSize`, `bodyTimeout`, `idleTimeout`).
+    /// Keep them the same when those change.
     fn default_limits() -> Limits {
         limits_of(100 * 1024 * 1024, 100 * 1024 * 1024, 120_000, 0, 30_000)
     }
