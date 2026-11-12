@@ -1,5 +1,6 @@
 ## Unreleased
 
+- Requires Dart 3.14 or newer.
 - Fix: each download try of the native library now has one time limit of 60 s, from connect to the last byte. Before, there was no limit while waiting for the answer, and the 60 s limit for the body only counted the gap between two chunks. So a slow server could hang the build for a long time. Now 3 tries take about 3 minutes at most.
 
 ## 3.0.4
