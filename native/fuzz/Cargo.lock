@@ -187,8 +187,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "dox_http_native"
-version = "0.1.0"
+name = "dox_http_native-fuzz"
+version = "0.0.0"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -197,18 +197,11 @@ dependencies = [
  "httparse",
  "httpdate",
  "libc",
+ "libfuzzer-sys",
  "mio",
  "slab",
  "socket2",
  "tungstenite",
-]
-
-[[package]]
-name = "dox_http_native-fuzz"
-version = "0.0.0"
-dependencies = [
- "dox_http_native",
- "libfuzzer-sys",
 ]
 
 [[package]]

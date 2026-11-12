@@ -16,6 +16,7 @@ permissions:
 jobs:
   fuzz:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -31,8 +32,10 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: native/fuzz
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+      # a prebuilt cargo-fuzz, no build from source
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-fuzz
       # new inputs go to a temp folder, the seeds in fuzz/corpus stay as they are
       - name: Fuzz ${{ matrix.target }}
         working-directory: native

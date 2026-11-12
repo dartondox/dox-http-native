@@ -2762,15 +2762,17 @@ pub mod fuzz {
                 break r;
             }
         };
-        assert!(b.data.len() <= pos && b.seen <= pos);
-        if got == Feed::Whole {
-            assert!(b.data.len() == b.seen && b.seen <= lim.body);
-        }
+        assert!(b.data.len() <= pos);
         // the pieces must not change the result
         assert_eq!(got, want);
-        assert_eq!(pos, whole_pos);
+        if !matches!(got, Feed::Fail(_)) {
+            // a fail can count bytes in `seen` before it moves `pos`, so
+            // these only hold for More and Whole
+            assert!(b.seen <= pos);
+            assert_eq!(pos, whole_pos);
+        }
         if got == Feed::Whole {
-            // on a fail the bytes kept so far do not matter
+            assert!(b.data.len() == b.seen && b.seen <= lim.body);
             assert_eq!(b.data, whole.data);
         }
     }
