@@ -32,6 +32,7 @@ tungstenite = { version = "0.30.0", default-features = false, features = ["hands
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.191"
 
+# the source of native/ has `#[cfg(fuzzing)]`, which cargo fuzz sets
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 
