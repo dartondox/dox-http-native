@@ -1,4 +1,4 @@
-## Unreleased
+## 3.2.0
 
 - Fix: each download try of the native library now has one time limit of 60 s, from connect to the last byte. Before, there was no limit while waiting for the answer, and the 60 s limit for the body only counted the gap between two chunks. So a slow server could hang the build for a long time. Now 3 tries take about 3 minutes at most.
 - Fix: a chunked body with a chunk size line over 1024 bytes (with its extensions) now always gets `400`. Before, it got `400` only when the line came in small reads. When the whole line came in one read, it passed. A trailer over 16 KB now always gets `431` for the same reason. Found by the new fuzz tests.
