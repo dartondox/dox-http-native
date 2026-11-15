@@ -41,7 +41,8 @@ class NativeHeaders implements HttpHeaders {
       _http10 = false,
       _map = <String, List<String>>{};
 
-  final Uint8List? _raw;
+  // not final: [detach] swaps the view into the batch for a copy
+  Uint8List? _raw;
   final bool _mutable;
   final bool _http10;
 
@@ -62,6 +63,14 @@ class NativeHeaders implements HttpHeaders {
 
   /// request headers: lookups done by scanning the raw bytes
   int _scans = 0;
+
+  /// For the server. Request headers keep their own copy of the raw bytes,
+  /// not a view into the batch of requests. Parsed headers need none.
+  void detach() {
+    Uint8List? raw = _raw;
+    if (raw == null) return;
+    _raw = _map == null ? Uint8List.fromList(raw) : null;
+  }
 
   /// true while the headers are still the untouched server defaults
   bool get isShared => _shared && _sharedType == null;
@@ -91,10 +100,15 @@ class NativeHeaders implements HttpHeaders {
     return out;
   }
 
+  /// lookups done by scanning the raw bytes before all headers are parsed
+  /// into a map. A scan that finds nothing makes no object, and a few
+  /// scans cost less than the map with a String per name and value.
+  static const int _maxScans = 4;
+
   /// the values of one header. A request reads only that name from the
-  /// raw bytes, so a handler that asks for one or two headers parses no more.
-  /// The second lookup parses all headers into a map, as most handlers
-  /// read a few (host, content type, upgrade).
+  /// raw bytes, so a handler that asks for a few headers parses no more.
+  /// The lookup after [_maxScans] parses all headers into a map, as some
+  /// handlers read many.
   List<String>? _get(String name) {
     String? type = _sharedTypeText;
     if (type != null && name == HttpHeaders.contentTypeHeader) {
@@ -102,7 +116,7 @@ class NativeHeaders implements HttpHeaders {
     }
     Map<String, List<String>>? map = _map;
     if (map != null) return map[name];
-    if (++_scans >= 2) return (_map = _parse(_raw!))[name];
+    if (++_scans > _maxScans) return (_map = _parse(_raw!))[name];
     return _scan(_raw!, name);
   }
 
