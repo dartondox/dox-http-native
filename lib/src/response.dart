@@ -233,6 +233,15 @@ class NativeResponse implements HttpResponse {
 
   @override
   Future<HttpResponse> close() {
+    end();
+    return done;
+  }
+
+  /// Sends the response, like [close], but makes no Future. Use it when the
+  /// result of [close] is not used: a Future per response keeps the request
+  /// alive until the microtasks run, so the heap grows under load. An error
+  /// (fewer bytes than the content length) still goes to [done].
+  void end() {
     if (!_closed) {
       int? stream = _stream;
       // checked before the response is marked closed
@@ -249,13 +258,12 @@ class NativeResponse implements HttpResponse {
           '${_length - _left} bytes written but expected $_length.',
         );
         (_done ??= Completer<HttpResponse>()).completeError(error);
-        return done;
+        return;
       } else {
         _request.server.endStream(stream);
       }
       _done?.complete(this);
     }
-    return done;
   }
 
   @override

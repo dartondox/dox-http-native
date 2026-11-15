@@ -31,9 +31,10 @@ class NativeRequest extends Stream<Uint8List> implements HttpRequest {
   final String method;
 
   final String _target;
-  final Uint8List _rawHeaders;
-  final Uint8List _body;
-  final Uint8List _ip;
+  // not final: [detach] swaps views into the batch for copies
+  Uint8List _rawHeaders;
+  Uint8List _body;
+  Uint8List _ip;
   final int _remotePort;
   final bool _http10;
 
@@ -41,11 +42,11 @@ class NativeRequest extends Stream<Uint8List> implements HttpRequest {
   /// HTTP/1.1, `Upgrade: websocket`, version 13, a key).
   final bool isWebSocketUpgrade;
 
+  NativeHeaders? _headers;
+
   @override
-  late final NativeHeaders headers = NativeHeaders.request(
-    _rawHeaders,
-    http10: _http10,
-  );
+  NativeHeaders get headers =>
+      _headers ??= NativeHeaders.request(_rawHeaders, http10: _http10);
 
   @override
   late final Uri uri = _uri(_target);
@@ -60,8 +61,33 @@ class NativeRequest extends Stream<Uint8List> implements HttpRequest {
     return plain ? Uri(path: target) : Uri.parse(target);
   }
 
+  NativeResponse? _response;
+
   @override
-  late final NativeResponse response = NativeResponse(this);
+  NativeResponse get response => _response ??= NativeResponse(this);
+
+  /// true when the response is sent (or upgraded to a WebSocket)
+  bool get isAnswered => _response?.isClosed ?? false;
+
+  /// For the server. The request still runs after its batch: copy the
+  /// bytes it holds from [batch], so it does not keep the whole batch
+  /// (up to some 100 KB) alive. Bytes from elsewhere (a big body in native
+  /// memory) stay as they are.
+  // ponytail: a body view the handler already took still holds the batch
+  void detach(Uint8List batch) {
+    ByteBuffer buffer = batch.buffer;
+    NativeHeaders? headers = _headers;
+    if (headers != null) {
+      headers.detach();
+      _rawHeaders = _none;
+    } else if (_rawHeaders.buffer == buffer) {
+      _rawHeaders = Uint8List.fromList(_rawHeaders);
+    }
+    if (_body.buffer == buffer) _body = Uint8List.fromList(_body);
+    if (_ip.buffer == buffer) _ip = Uint8List.fromList(_ip);
+  }
+
+  static final Uint8List _none = Uint8List(0);
 
   /// the body bytes. Same bytes the stream gives.
   Uint8List get body => _body;

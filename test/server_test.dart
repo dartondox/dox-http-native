@@ -85,6 +85,17 @@ void handle(HttpRequest req) async {
       res.write('x');
     case String path when path.startsWith('/n/'):
       res.write(path.substring(3));
+    case '/end':
+      // end() sends with no Future. close() after it still gives one.
+      res.write('ended');
+      (res as NativeResponse).end();
+      closedWith = await res.close();
+      return;
+    case '/later':
+      // runs after its batch: the request must keep its own bytes
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      List<int> body = <int>[for (List<int> c in await req.toList()) ...c];
+      res.write('${req.headers.value('x-test')} ${utf8.decode(body)}');
     case '/bad-cookie':
       res.cookies.add(Cookie('a', 'b')..domain = 'x\r\nset-cookie: c=d');
       try {
@@ -110,6 +121,9 @@ Stream<List<int>> parts(int? count) async* {
 }
 
 int sentParts = 0;
+
+/// what `close()` after `end()` gave in `/end`
+HttpResponse? closedWith;
 
 /// errors of streamed bodies that did not keep to their content length
 List<String> lengthErrors = <String>[];
@@ -245,6 +259,84 @@ void main() {
       );
       expect(r, contains('"method":"$m"'));
     }
+  });
+
+  test('end() sends the answer, close() after it still completes', () async {
+    closedWith = null;
+    expect(await get('/end'), (200, 'ended'));
+    expect(closedWith, isA<NativeResponse>());
+  });
+
+  test('close() gives a Future that completes with the response', () async {
+    NativeHttpServer s = await NativeHttpServer.bind(0, address: '127.0.0.1');
+    Completer<Object?> result = Completer<Object?>();
+    s.listen((HttpRequest req) {
+      req.response.write('x');
+      Future<dynamic> f = req.response.close();
+      f.then((dynamic r) => result.complete(identical(r, req.response)));
+    });
+    HttpClientResponse res = await (await client.get(
+      '127.0.0.1',
+      s.port,
+      '/',
+    )).close();
+    expect(await utf8.decodeStream(res), 'x');
+    expect(await result.future, isTrue);
+    await s.close();
+  });
+
+  test(
+    'a request that outlives its batch keeps its headers and body',
+    () async {
+      List<Future<String>> all = <Future<String>>[
+        for (int i = 0; i < 20; i++)
+          () async {
+            HttpClientRequest req = await client.post(
+              '127.0.0.1',
+              port,
+              '/later',
+            );
+            req.headers.set('x-test', 'h$i');
+            req.write('body$i');
+            return utf8.decodeStream(await req.close());
+          }(),
+      ];
+      expect(await Future.wait(all), <String>[
+        for (int i = 0; i < 20; i++) 'h$i body$i',
+      ]);
+    },
+  );
+
+  test('detach copies the views into the batch, not other bytes', () async {
+    NativeHttpServer s = await NativeHttpServer.bind(0, address: '127.0.0.1');
+    Uint8List batch = Uint8List.fromList(<int>[
+      ...<int>[1, 0, 1, 0, 120, 121], // header x: y
+      ...<int>[104, 105], // body hi
+      ...List<int>.filled(16, 0)..[15] = 1, // ip
+    ]);
+    Uint8List own = Uint8List.fromList(<int>[111]);
+    for (bool early in <bool>[false, true]) {
+      NativeRequest req = NativeRequest(
+        s,
+        1,
+        'POST',
+        '/',
+        Uint8List.sublistView(batch, 0, 6),
+        early ? own : Uint8List.sublistView(batch, 6, 8),
+        Uint8List.sublistView(batch, 8, 24),
+        0,
+        http10: false,
+      );
+      if (early) req.headers; // made before the detach
+      req.detach(batch);
+      Uint8List copy = Uint8List.fromList(batch);
+      batch.fillRange(0, batch.length, 0);
+      expect(req.headers.value('x'), 'y');
+      expect(utf8.decode(req.body), early ? 'o' : 'hi');
+      expect(identical(req.body, own), early);
+      batch.setAll(0, copy);
+    }
+    await s.close();
   });
 
   test('POST body comes back the same', () async {

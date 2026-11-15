@@ -1021,6 +1021,55 @@ fn connection_limit_and_no_buffer_for_idle_connections() {
     assert_eq!(got.first().map(|r| r.target.as_str()), Some("/b"));
 }
 
+/// Reads go into the core's one shared buffer. A keep-alive connection
+/// holds no read buffer after a whole request, and only the part of a
+/// request that is not whole yet. A big answer leaves no big write buffer.
+#[test]
+fn keep_alive_connections_share_one_read_buffer() {
+    let (mut core, port) = new_core(limits());
+    let mut inb = vec![0u8; 1 << 18];
+    let mut s = connect(port);
+    s.write_all(b"GET /a HTTP/1.1\r\n\r\n").unwrap();
+    let got = collect(&mut core, &mut inb, 1);
+    assert_eq!(got.len(), 1);
+    let rbuf = |core: &Core| core.conns.iter().next().unwrap().1.rbuf.capacity();
+    assert_eq!(rbuf(&core), 0, "a whole request left a buffer");
+    assert!(core.scratch.capacity() >= READ_ROOM);
+    // a big answer: the write buffer is freed once it is written
+    let mut out = Vec::new();
+    ans(&mut out, got[0].id, 200, 0, b"", &vec![b'x'; 200_000]);
+    core.run(&out, &mut inb, 0).unwrap();
+    let mut seen = 0;
+    let mut buf = [0u8; 65536];
+    while seen < 200_000 {
+        seen += s.read(&mut buf).unwrap();
+        core.run(&[], &mut inb, 0).unwrap();
+    }
+    for _ in 0..10 {
+        core.run(&[], &mut inb, 0).unwrap();
+    }
+    let c = core.conns.iter().next().unwrap().1;
+    assert!(c.wbuf.capacity() <= KEEP_WBUF, "{}", c.wbuf.capacity());
+    // a request in two parts: only the first part is kept, then nothing
+    let part = b"GET /b HTTP/1.1\r\nHo";
+    s.write_all(part).unwrap();
+    let end = Instant::now() + Duration::from_secs(2);
+    while rbuf(&core) == 0 && Instant::now() < end {
+        core.run(&[], &mut inb, 1000).unwrap();
+    }
+    let c = core.conns.iter().next().unwrap().1;
+    assert_eq!(
+        (c.rlen - c.rpos, c.rbuf.capacity()),
+        (part.len(), part.len())
+    );
+    s.write_all(b"st: x\r\n\r\nGET /c HTTP/1.1\r\n\r\n")
+        .unwrap();
+    let got = collect(&mut core, &mut inb, 2);
+    let targets: Vec<&str> = got.iter().map(|r| r.target.as_str()).collect();
+    assert_eq!(targets, ["/b", "/c"]);
+    assert_eq!(rbuf(&core), 0);
+}
+
 /// Parses one request with room for its record.
 fn parse_req(req: &[u8]) -> Step {
     let mut inb = vec![0u8; 4096];

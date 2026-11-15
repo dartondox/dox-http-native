@@ -29,6 +29,31 @@ void main() {
     expect(names, <String>['x-test-long', 'x-test', 'accept', 'content-type']);
   });
 
+  test('many lookups and a detach give the same values', () {
+    Uint8List raw = _raw(<List<String>>[
+      <String>['a', '1'],
+      <String>['b', '2'],
+      <String>['c', '3'],
+      <String>['d', '4'],
+      <String>['e', '5'],
+      <String>['f', '6'],
+    ]);
+    NativeHeaders h = NativeHeaders.request(raw, http10: false);
+    // the first lookups scan the raw bytes, later ones use the map
+    expect(h.value('a'), '1');
+    expect(h.value('x'), isNull);
+    expect(h.value('b'), '2');
+    h.detach();
+    // the headers keep their own copy: the batch bytes may change
+    raw.fillRange(0, raw.length, 0);
+    expect(h.value('c'), '3');
+    for (String name in <String>['d', 'e', 'f', 'a']) {
+      expect(h[name]?.single, isNotNull);
+    }
+    expect(h.value('f'), '6');
+    expect(h.value('y'), isNull);
+  });
+
   test('a line break in a content type is refused', () {
     NativeHeaders h = NativeHeaders.response(NativeHeaders.empty());
     for (ContentType bad in <ContentType>[

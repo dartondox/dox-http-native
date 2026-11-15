@@ -301,6 +301,9 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
 
   bool _inBatch = false;
 
+  /// the requests of the batch being read. Kept, so no list per batch.
+  final List<NativeRequest> _batch = <NativeRequest>[];
+
   /// Frees an external body when Dart is done with it.
   static final Pointer<NativeFinalizerFunction> _freeBody =
       Native.addressOf<NativeFinalizerFunction>(doxFreeBody);
@@ -358,22 +361,30 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
           continue;
         }
         _open++;
-        _requests.add(
-          NativeRequest(
-            this,
-            id,
-            method,
-            target,
-            headers,
-            body,
-            ip,
-            remotePort,
-            http10: flags & 1 == 1,
-            isWebSocketUpgrade: flags & 2 == 2,
-          ),
+        NativeRequest req = NativeRequest(
+          this,
+          id,
+          method,
+          target,
+          headers,
+          body,
+          ip,
+          remotePort,
+          http10: flags & 1 == 1,
+          isWebSocketUpgrade: flags & 2 == 2,
         );
+        _batch.add(req);
+        _requests.add(req);
       }
     } finally {
+      // a request still open after its batch (an async handler, a stream)
+      // gets its own copy of its bytes, so it does not keep the batch alive.
+      // A WebSocket upgrade counts as answered, but the app often keeps
+      // its request for the life of the socket, so it gets a copy too.
+      for (NativeRequest req in _batch) {
+        if (!req.isAnswered || req.isWebSocketUpgrade) req.detach(b);
+      }
+      _batch.clear();
       // Rust stops reading WebSocket frames while Dart is too far behind
       if (wsBytes > 0) {
         sendWebSocket(wsBytes, NativeWebSocket.kindAck, 0, const <int>[]);

@@ -110,8 +110,13 @@ const WS_OUT_MAX: usize = 4 * WS_HOLD;
 /// requests of that connection (pipelining by a client that does not read
 /// the answers). It reads on once they are written.
 const MAX_PENDING: usize = 1 << 20;
-/// A write buffer bigger than this is freed once it is empty.
+/// Over this many bytes written, a write buffer drops what is written.
 const BIG_BUF: usize = 1 << 20;
+/// A write buffer bigger than this is freed once it is empty. Small
+/// answers keep their buffer (no new one per answer), but a big answer
+/// does not leave a big buffer on a keep-alive connection: with many
+/// connections that adds up.
+const KEEP_WBUF: usize = 64 * 1024;
 /// The longest body or idle timeout (a year). Longer is cut to this.
 const MAX_TIMEOUT: Duration = Duration::from_secs(365 * 24 * 3600);
 /// Most headers of one request. More gets 431.
@@ -311,7 +316,8 @@ struct Conn {
     sock: TcpStream,
     peer: [u8; 18],
     /// read bytes: `rpos..rlen` is not parsed yet. All of it is initialized.
-    /// Empty while nothing waits (see `read`).
+    /// Empty while nothing waits: then a read uses the core's shared buffer
+    /// (see `lend`).
     rbuf: Vec<u8>,
     rpos: usize,
     rlen: usize,
@@ -772,16 +778,44 @@ impl Conn {
                         return true;
                     }
                 }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                    if self.rlen == 0 {
-                        // nothing came: an idle connection holds no buffer
-                        self.rbuf = Vec::new();
-                    }
-                    return true;
-                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => return true,
                 Err(e) if e.kind() == ErrorKind::Interrupted => {}
                 Err(_) => return false,
             }
+        }
+    }
+
+    /// Before a read. When no bytes wait, the read goes into `scratch`, the
+    /// one read buffer of the core, not a buffer per connection: an idle
+    /// keep-alive connection then holds no read buffer. True when lent.
+    fn lend(&mut self, scratch: &mut Vec<u8>) -> bool {
+        if self.rpos < self.rlen {
+            return false;
+        }
+        self.rpos = 0;
+        self.rlen = 0;
+        self.rbuf = std::mem::take(scratch);
+        true
+    }
+
+    /// After the parse. Gives `scratch` back to the core. Only bytes not
+    /// parsed yet (a part of a request) are copied to a buffer of the
+    /// connection's own, so a whole request is never copied here. A buffer
+    /// of its own with nothing left in it is freed.
+    fn give_back(&mut self, scratch: &mut Vec<u8>, lent: bool) {
+        if self.rpos == self.rlen {
+            self.rpos = 0;
+            self.rlen = 0;
+            let buf = std::mem::take(&mut self.rbuf);
+            if lent {
+                *scratch = buf;
+            }
+        } else if lent {
+            let buf = std::mem::take(&mut self.rbuf);
+            self.rbuf = buf[self.rpos..self.rlen].to_vec();
+            self.rlen -= self.rpos;
+            self.rpos = 0;
+            *scratch = buf;
         }
     }
 
@@ -801,7 +835,7 @@ impl Conn {
         }
         if self.wpos == self.wbuf.len() {
             self.wpos = 0;
-            if self.wbuf.capacity() > BIG_BUF {
+            if self.wbuf.capacity() > KEEP_WBUF {
                 self.wbuf = Vec::new(); // do not keep a big buffer forever
             } else {
                 self.wbuf.clear();
@@ -1347,6 +1381,9 @@ struct Core {
     waker: Arc<Waker>,
     zip: Option<mpsc::Sender<Job>>,
     zipped: Arc<Mutex<Vec<Zipped>>>,
+    /// the read buffer lent to each connection in turn (see `Conn::lend`).
+    /// The loop runs one connection at a time, so one is enough.
+    scratch: Vec<u8>,
     /// lists reused per call
     dead: Vec<usize>,
     touched: Vec<usize>,
@@ -1384,6 +1421,7 @@ impl Core {
             waker,
             zip: None,
             zipped: Arc::new(Mutex::new(Vec::new())),
+            scratch: Vec::new(),
             dead: Vec::new(),
             touched: Vec::new(),
         })
@@ -2214,17 +2252,22 @@ impl Core {
                     continue;
                 }
                 // a closing connection reads no more requests: drop them
-                if !c.read() {
+                let lent = c.lend(&mut self.scratch);
+                let ok = c.read();
+                c.rpos = c.rlen;
+                c.give_back(&mut self.scratch, lent);
+                if !ok {
                     self.kill(idx);
                     continue;
                 }
-                c.rpos = c.rlen;
                 if c.finished() {
                     self.kill(idx);
                 }
                 continue;
             }
+            let lent = c.lend(&mut self.scratch);
             if !c.read() {
+                c.give_back(&mut self.scratch, lent);
                 self.ready.pop_front();
                 self.kill(idx);
                 continue;
@@ -2238,6 +2281,7 @@ impl Core {
                 &self.date.1,
                 self.now,
             );
+            c.give_back(&mut self.scratch, lent);
             if let Err(size) = res {
                 // stays in the queue for the next call
                 if n == 0 {

@@ -1,3 +1,11 @@
+## Unreleased
+
+- New: `NativeResponse.end()`. It sends the response like `close()`, but makes no Future. `close()` makes a Future and a microtask per response. When the caller does not use that Future, it only keeps the request and its batch of bytes alive a bit longer, so under load the heap grows. Use `end()` when you do not await the response. `close()` works the same as before.
+- Memory: each connection kept a 16 KB read buffer for its whole life. With 512 keep-alive connections that is 8 MB. Now all connections of one core read into one shared buffer. A connection keeps its own buffer only for a part of a request that did not come whole yet.
+- Memory: after a big answer (up to 1 MB), a keep-alive connection kept a write buffer that big. Now a write buffer over 64 KB is freed once it is written.
+- Memory: a request that is still open after its batch (an async handler, a stream, a WebSocket) kept the whole batch copy alive (up to 256 KB or more). Now such a request copies only its own headers and body bytes. Requests answered right away copy nothing.
+- Speed: request headers now scan the raw bytes for the first 4 lookups (was 1) before they parse all headers into a map. A scan that finds nothing makes no object.
+
 ## 3.2.0
 
 - Fix: each download try of the native library now has one time limit of 60 s, from connect to the last byte. Before, there was no limit while waiting for the answer, and the 60 s limit for the body only counted the gap between two chunks. So a slow server could hang the build for a long time. Now 3 tries take about 3 minutes at most.
