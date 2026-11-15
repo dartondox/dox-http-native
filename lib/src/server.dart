@@ -378,9 +378,11 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
       }
     } finally {
       // a request still open after its batch (an async handler, a stream)
-      // gets its own copy of its bytes, so it does not keep the batch alive
+      // gets its own copy of its bytes, so it does not keep the batch alive.
+      // A WebSocket upgrade counts as answered, but the app often keeps
+      // its request for the life of the socket, so it gets a copy too.
       for (NativeRequest req in _batch) {
-        if (!req.isAnswered) req.detach(b);
+        if (!req.isAnswered || req.isWebSocketUpgrade) req.detach(b);
       }
       _batch.clear();
       // Rust stops reading WebSocket frames while Dart is too far behind
