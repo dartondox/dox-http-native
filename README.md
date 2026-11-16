@@ -108,7 +108,7 @@ How it works:
 - WebSocket upgrade with `NativeWebSocket.upgrade`, see above. `detachSocket` is not supported.
 - On a graceful `close()`, every open WebSocket gets close code `1001` (going away).
 - `autoCompress`: Rust gzips the body on a helper thread, not on the isolate.
-- Streaming: a small body is sent in one piece on `close`. When `addStream` passes 64 KB, the answer starts and the rest of the body goes out in parts. A big file never sits in memory.
+- Streaming: a small body is sent in one piece on `close`. When `addStream` passes 64 KB, the answer starts and the rest of the body goes out in parts. A big file never sits in memory. `flush()` also starts the answer: the head and the bytes so far go out, and later writes follow at once (eg. server-sent events written from a timer). Headers and status can not change after it.
 - `response.done` completes (with no error) when the client is gone, also when the handler never closes the response. A handler that writes from its own timer (eg. server-sent events) stops it there: `response.done.then((_) => timer.cancel())`. Writes after that are dropped.
 
 ## AES-GCM

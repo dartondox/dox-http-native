@@ -55,6 +55,16 @@ class NativeHeaders implements HttpHeaders {
   /// counts changes, so a cache of the encoded bytes knows when it is old
   int version = 0;
 
+  /// the head of the response went out (see `NativeResponse.flush`):
+  /// a change throws, like dart:io
+  bool sent = false;
+
+  void _checkMutable() {
+    if (!_mutable || sent) {
+      throw HttpException('HTTP headers are not mutable');
+    }
+  }
+
   /// a content type set while the headers were still the defaults. They
   /// stay shared: a response with only a new content type (eg. JSON)
   /// copies nothing.
@@ -144,7 +154,7 @@ class NativeHeaders implements HttpHeaders {
   }
 
   Map<String, List<String>> _own() {
-    if (!_mutable) throw HttpException('HTTP headers are not mutable');
+    _checkMutable();
     version++;
     if (_shared) _unshare();
     return _entries;
@@ -236,7 +246,7 @@ class NativeHeaders implements HttpHeaders {
   /// content-length is kept as a number, like dart:io.
   bool _special(String name, Object value) {
     if (name == HttpHeaders.contentLengthHeader) {
-      if (!_mutable) throw HttpException('HTTP headers are not mutable');
+      _checkMutable();
       contentLength = value is int ? value : int.parse(_text(value));
       return true;
     }
@@ -297,7 +307,7 @@ class NativeHeaders implements HttpHeaders {
 
   @override
   set contentLength(int length) {
-    if (!_mutable) throw HttpException('HTTP headers are not mutable');
+    _checkMutable();
     _contentLength = length;
   }
 
@@ -317,6 +327,7 @@ class NativeHeaders implements HttpHeaders {
 
   @override
   set contentType(ContentType? type) {
+    _checkMutable();
     if (type == null) {
       removeAll(HttpHeaders.contentTypeHeader);
       return;
@@ -356,7 +367,10 @@ class NativeHeaders implements HttpHeaders {
   }
 
   @override
-  set chunkedTransferEncoding(bool chunked) => _chunked = chunked;
+  set chunkedTransferEncoding(bool chunked) {
+    _checkMutable();
+    _chunked = chunked;
+  }
 
   @override
   bool get persistentConnection {

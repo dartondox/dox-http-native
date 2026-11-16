@@ -111,6 +111,63 @@ void handle(HttpRequest req) async {
       await adding;
       res.add(<int>[3]); // dropped
       raceDone.complete();
+    case '/sse-flush':
+      // server-sent events: add() and flush() from a timer
+      res.headers.contentType = ContentType('text', 'event-stream');
+      int n = 0;
+      Timer timer = Timer.periodic(const Duration(milliseconds: 20), (_) {
+        res.write('data: ${n++}\n\n');
+        unawaited(res.flush());
+      });
+      unawaited(
+        res.done.then((_) {
+          timer.cancel();
+          sseStopped.complete();
+        }),
+      );
+      return;
+    case '/flush-length':
+      // flush keeps to the content length
+      res.contentLength = 10;
+      res.write('hello');
+      await res.flush();
+      res.write('world');
+    case '/flush-then-stream':
+      res.write('a');
+      await res.flush();
+      await res.addStream(Stream<List<int>>.value(utf8.encode('bc')));
+    case '/stream-then-flush':
+      await res.addStream(Stream<List<int>>.value(utf8.encode('ab')));
+      res.write('c');
+      await res.flush();
+      res.write('d');
+    case '/flush-after-close':
+      res.write('closed');
+      await res.close();
+      await res.flush(); // does nothing, no error
+      flushChecks.add('after close ok');
+      return;
+    case '/flush-head':
+      // a HEAD request: the head goes out, the body is dropped
+      res.write('x');
+      await res.flush();
+      res.write('y');
+      flushChecks.add('head done ${(await res.close()) == res}');
+      return;
+    case '/flush-locked':
+      res.write('first ');
+      await res.flush();
+      try {
+        res.headers.set('x-late', '1');
+      } on HttpException {
+        flushChecks.add('headers locked');
+      }
+      try {
+        res.statusCode = 404;
+      } on StateError {
+        flushChecks.add('status locked');
+      }
+      res.write('second');
     case '/headers':
       res.headers.contentType = ContentType.json;
       res.cookies.add(Cookie('a', 'b'));
@@ -179,6 +236,7 @@ Completer<void> quietCancelled = Completer<void>();
 Completer<void> sseStopped = Completer<void>();
 Completer<Object> cancelError = Completer<Object>();
 Completer<void> raceDone = Completer<void>();
+List<String> flushChecks = <String>[];
 
 Future<NativeHttpServer> start(int port, {int maxBodySize = 1024}) async {
   NativeHttpServer server = await NativeHttpServer.bind(
@@ -937,6 +995,72 @@ void main() {
     );
     await raceDone.future.timeout(const Duration(seconds: 5));
     expect(out, startsWith('HTTP/1.1 200'));
+  });
+
+  test('flush: server-sent events from a timer reach the client part by '
+      'part, and stop when it leaves', () async {
+    sseStopped = Completer<void>();
+    HttpClient sse = HttpClient();
+    HttpClientResponse res = await (await sse.get(
+      '127.0.0.1',
+      port,
+      '/sse-flush',
+    )).close();
+    expect(res.headers.contentType?.mimeType, 'text/event-stream');
+    expect(res.headers.chunkedTransferEncoding, isTrue);
+    StringBuffer got = StringBuffer();
+    Completer<void> three = Completer<void>();
+    StreamSubscription<String> sub = res.transform(utf8.decoder).listen((
+      String part,
+    ) {
+      got.write(part);
+      if (got.toString().contains('data: 2\n\n') && !three.isCompleted) {
+        three.complete();
+      }
+    });
+    // the response is never closed: the events come while it is open
+    await three.future.timeout(const Duration(seconds: 5));
+    expect(got.toString(), startsWith('data: 0\n\ndata: 1\n\n'));
+    unawaited(sub.cancel());
+    sse.close(force: true);
+    await sseStopped.future.timeout(const Duration(seconds: 5));
+  });
+
+  test('flush keeps to the content length', () async {
+    HttpClientResponse res = await (await client.get(
+      '127.0.0.1',
+      port,
+      '/flush-length',
+    )).close();
+    expect(res.headers.contentLength, 10);
+    expect(await utf8.decodeStream(res), 'helloworld');
+  });
+
+  test('flush with addStream, both ways', () async {
+    expect(await get('/flush-then-stream'), (200, 'abc'));
+    expect(await get('/stream-then-flush'), (200, 'abcd'));
+  });
+
+  test('flush after close does nothing; HEAD gets no body', () async {
+    flushChecks.clear();
+    expect(await get('/flush-after-close'), (200, 'closed'));
+    HttpClientResponse head = await (await client.head(
+      '127.0.0.1',
+      port,
+      '/flush-head',
+    )).close();
+    expect(head.statusCode, 200);
+    expect(await head.toList(), isEmpty);
+    // the connection still works
+    expect(await get('/'), (200, 'Hello World'));
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    expect(flushChecks, <String>['after close ok', 'head done true']);
+  });
+
+  test('after flush the headers and the status can not change', () async {
+    flushChecks.clear();
+    expect(await get('/flush-locked'), (200, 'first second'));
+    expect(flushChecks, <String>['headers locked', 'status locked']);
   });
 
   test('maxConnections: at the limit new clients wait', () async {

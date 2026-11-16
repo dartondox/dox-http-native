@@ -21,11 +21,31 @@ class NativeResponse implements HttpResponse {
   @override
   final NativeHeaders headers;
 
-  @override
-  int statusCode = HttpStatus.ok;
+  int _statusCode = HttpStatus.ok;
+  String _reasonPhrase = '';
 
   @override
-  String reasonPhrase = '';
+  int get statusCode => _statusCode;
+
+  @override
+  set statusCode(int code) {
+    _checkHead();
+    _statusCode = code;
+  }
+
+  @override
+  String get reasonPhrase => _reasonPhrase;
+
+  @override
+  set reasonPhrase(String phrase) {
+    _checkHead();
+    _reasonPhrase = phrase;
+  }
+
+  /// like dart:io: the status can not change once [flush] sent the head
+  void _checkHead() {
+    if (headers.sent) throw StateError('Header already sent');
+  }
 
   @override
   bool bufferOutput = true;
@@ -244,7 +264,7 @@ class NativeResponse implements HttpResponse {
         add(chunk);
         if (_stream == null && _size >= streamAt) _startStream();
         // wait while Rust holds a full window, so memory stays small
-        if (_unsent > window) await (_room = Completer<void>()).future;
+        if (_unsent > window) await (_room ??= Completer<void>()).future;
         if (_gone) break; // the client left: stop reading the source
       }
     } catch (_) {
@@ -294,8 +314,25 @@ class NativeResponse implements HttpResponse {
     }
   }
 
+  /// Sends what was added so far, like dart:io. The first flush sends the
+  /// head: the body then goes out in parts (chunked, or up to the content
+  /// length when one is set), and later [add] calls go out at once. The
+  /// headers and the status can not change after it.
+  ///
+  /// Completes when Rust has room for more (at most [window] bytes wait
+  /// there), so a fast writer that awaits it keeps memory small. After
+  /// [close], when the client is gone, or while [addStream] runs it does
+  /// nothing. A response that never calls flush is sent as before.
   @override
-  Future<void> flush() => Future<void>.value();
+  Future<void> flush() {
+    if (_closed || _gone || _source != null) return Future<void>.value();
+    if (_stream == null) {
+      _startStream();
+      headers.sent = true;
+    }
+    if (_unsent <= window) return Future<void>.value();
+    return (_room ??= Completer<void>()).future;
+  }
 
   @override
   Future<HttpResponse> close() {
