@@ -661,8 +661,12 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
     _headerLines(res);
     // Rust drops the content-length line of a full body. Here it is the
     // only way the client knows the length up front.
+    // 1xx, 204 and 304 have no body, so no length either (like Rust)
     int length = res.headers.contentLength;
-    if (length >= 0) _lengthLine(length);
+    int status = res.statusCode;
+    bool noBody =
+        (status >= 100 && status < 200) || status == 204 || status == 304;
+    if (length >= 0 && !noBody) _lengthLine(length);
     _endRecord(start, first, id);
     return id;
   }

@@ -1638,6 +1638,10 @@ impl Core {
                     let paused = c.paused || c.ws.as_ref().is_some_and(|w| w.paused);
                     if readable && !paused {
                         self.queue(idx);
+                    } else if c.paused && c.hup && c.ws.is_none() {
+                        // no read while paused (eg. an upgrade waits): the
+                        // close is only seen here, see `Due::Gone`
+                        self.arm_timer(idx);
                     }
                     if writable && self.conns[idx].pending() > 0 {
                         self.service(idx);
@@ -2530,7 +2534,9 @@ impl Conn {
         // read (a half-close), so it gets the idle time to get an answer.
         // `since` moves with each write, so a stream that still writes
         // stays. A client that is really gone makes the write fail.
-        if self.eof {
+        // A paused connection (eg. an upgrade waits, or too many requests)
+        // reads nothing, so only the poll saw the close (`hup`).
+        if self.eof || (self.hup && self.paused) {
             return Some((self.since + limits.idle, Due::Gone));
         }
         None

@@ -1473,3 +1473,33 @@ fn streamed_answer_with_no_body_status_keeps_the_connection() {
         );
     }
 }
+
+/// An upgrade request stops reading until Dart answers. A client that
+/// leaves meanwhile is still found (the poll sees the close): after the
+/// idle time the connection goes and Dart hears it.
+#[test]
+fn client_that_left_a_waiting_upgrade_is_closed() {
+    let (mut core, port) = new_core(limits());
+    let mut inb = vec![0u8; 1 << 18];
+    let mut s = connect(port);
+    s.write_all(
+        b"GET /ws HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+          Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+    )
+    .unwrap();
+    let req = collect(&mut core, &mut inb, 1).pop().unwrap();
+    assert!(core.conns.iter().all(|(_, c)| c.upgrading));
+    drop(s);
+    let end = Instant::now() + Duration::from_secs(5);
+    while !core.conns.iter().any(|(_, c)| c.hup) {
+        assert!(Instant::now() < end, "no hup");
+        core.run(&[], &mut inb, 1000).unwrap();
+    }
+    assert!(after(&mut core, &mut inb, IDLE / 2).is_empty());
+    let got = after(&mut core, &mut inb, IDLE + Duration::from_secs(1));
+    assert!(core.conns.is_empty(), "closed");
+    assert_eq!(
+        got.iter().map(|r| (r.id, r.kind())).collect::<Vec<_>>(),
+        [(req.id, REQUEST_GONE)]
+    );
+}

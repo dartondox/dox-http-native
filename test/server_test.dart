@@ -181,6 +181,12 @@ void handle(HttpRequest req) async {
       res.write('x');
       await res.flush();
       res.write('y');
+    case '/no-body-length':
+      // 204 with a content length: no length line goes out
+      res.statusCode = HttpStatus.noContent;
+      res.contentLength = 1;
+      res.write('x');
+      await res.flush();
     case '/no-body-stream':
       // 304 has no body, also when addStream passes 64 KB
       res.statusCode = HttpStatus.notModified;
@@ -205,6 +211,12 @@ void handle(HttpRequest req) async {
       unawaited(res.close());
       await flushed.timeout(const Duration(seconds: 3));
       flushChecks.add('flush went on');
+      return;
+    case '/late-upgrade':
+      // the client leaves before the WebSocket accept
+      await lateDoneGate.future;
+      await NativeWebSocket.upgrade(req);
+      flushChecks.add('upgraded');
       return;
     case '/late-done':
       // the client leaves before the handler reads done
@@ -1134,7 +1146,11 @@ void main() {
   );
 
   test('a streamed 204 or 304 sends no body, the connection goes on', () async {
-    for (String path in <String>['/no-body-flush', '/no-body-stream']) {
+    for (String path in <String>[
+      '/no-body-flush',
+      '/no-body-length',
+      '/no-body-stream',
+    ]) {
       String out = await raw(
         port,
         'GET $path HTTP/1.1\r\n\r\n'
@@ -1142,11 +1158,26 @@ void main() {
       );
       List<String> answers = out.split('HTTP/1.1 ');
       expect(answers, hasLength(3), reason: out);
-      expect(answers[1], startsWith(path == '/no-body-flush' ? '204' : '304'));
+      expect(answers[1], startsWith(path == '/no-body-stream' ? '304' : '204'));
       expect(answers[1], endsWith('\r\n\r\n'));
       expect(answers[1], isNot(contains('chunked')));
+      expect(answers[1], isNot(contains('content-length')));
       expect(answers[2], endsWith('Hello World'));
     }
+  });
+
+  test('request headers: chunkedTransferEncoding is a no-op, other '
+      'setters throw as before', () async {
+    NativeHeaders h = NativeHeaders.request(Uint8List(0), http10: false);
+    h.chunkedTransferEncoding = true;
+    expect(h.chunkedTransferEncoding, isFalse);
+    expect(() => h.contentLength = 1, throwsA(isA<HttpException>()));
+    expect(() => h.set('x', '1'), throwsA(isA<HttpException>()));
+    expect(
+      () => h.contentType = ContentType.json,
+      throwsA(isA<HttpException>()),
+    );
+    expect(h.clear, throwsA(isA<HttpException>()));
   });
 
   test('a request answered at once keeps no gone id', () async {
@@ -1178,6 +1209,37 @@ void main() {
     expect(flushChecks, <String>['flush went on']);
     await sub.cancel();
     s.destroy();
+  });
+
+  test('a WebSocket accept after the client left keeps no gone id', () async {
+    flushChecks.clear();
+    lateDoneGate = Completer<void>();
+    NativeHttpServer quick = await NativeHttpServer.bind(
+      0,
+      address: '127.0.0.1',
+      idleTimeout: const Duration(milliseconds: 300),
+    );
+    quick.listen(handle);
+    Socket s = await Socket.connect('127.0.0.1', quick.port);
+    s.write(
+      'GET /late-upgrade HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\n'
+      'Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n'
+      'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n',
+    );
+    await s.flush();
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+    s.destroy();
+    for (int i = 0; i < 100 && quick.goneIds.isEmpty; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    }
+    expect(quick.goneIds, hasLength(1));
+    lateDoneGate.complete();
+    for (int i = 0; i < 100 && flushChecks.isEmpty; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    }
+    expect(flushChecks, <String>['upgraded']);
+    expect(quick.goneIds, isEmpty);
+    await quick.close(force: true);
   });
 
   test('done read after the client left completes', () async {

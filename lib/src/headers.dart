@@ -372,7 +372,8 @@ class NativeHeaders implements HttpHeaders {
 
   @override
   set chunkedTransferEncoding(bool chunked) {
-    if (_locked()) return;
+    // request headers: a no-op, as before
+    if (!_mutable || _locked()) return;
     _chunked = chunked;
   }
 

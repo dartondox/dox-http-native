@@ -174,6 +174,8 @@ class NativeResponse implements HttpResponse {
   /// Marks the response as sent: a WebSocket accept answers the request.
   void upgraded() {
     _closed = true;
+    NativeHttpServer server = _request.server;
+    if (server.goneIds.isNotEmpty) server.goneIds.remove(_request.id);
     _complete();
   }
 
