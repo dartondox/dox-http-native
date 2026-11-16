@@ -1186,3 +1186,191 @@ fn only_multipart_form_data_gets_the_multipart_limit() {
         assert_eq!(matches!(step, Step::Fail(413)), !ok, "{ty:?}");
     }
 }
+
+/// Runs turns until the core saw the client close its side.
+fn until_eof(core: &mut Core, inb: &mut [u8]) {
+    let end = Instant::now() + Duration::from_secs(5);
+    while !core.conns.iter().any(|(_, c)| c.eof) {
+        assert!(Instant::now() < end, "no eof");
+        core.run(&[], inb, 1000).unwrap();
+    }
+}
+
+/// The client leaves while Dart never answers: after the idle time the
+/// connection (and its socket) is gone. A late answer is dropped.
+#[test]
+fn client_that_left_a_hanging_request_is_closed() {
+    let (mut core, port) = new_core(limits());
+    let mut inb = vec![0u8; 1 << 18];
+    let mut s = connect(port);
+    s.write_all(b"GET /hang HTTP/1.1\r\n\r\n").unwrap();
+    let req = collect(&mut core, &mut inb, 1).pop().unwrap();
+    drop(s);
+    until_eof(&mut core, &mut inb);
+    after(&mut core, &mut inb, IDLE / 2);
+    assert_eq!(core.conns.len(), 1, "too early");
+    after(&mut core, &mut inb, IDLE + Duration::from_secs(1));
+    assert_eq!(core.conns.len(), 0, "closed");
+    let mut out = Vec::new();
+    ans(&mut out, req.id, 200, 0, b"", b"late");
+    assert_eq!(core.run(&out, &mut inb, 0), Ok(0), "late answer dropped");
+}
+
+/// A streamed body that writes nothing after the client left: Dart hears
+/// STREAM_GONE and the stream entry goes.
+#[test]
+fn quiet_stream_of_a_client_that_left_is_gone() {
+    let (mut core, port) = new_core(limits());
+    let mut inb = vec![0u8; 1 << 18];
+    let mut s = connect(port);
+    s.write_all(b"GET /sse HTTP/1.1\r\n\r\n").unwrap();
+    let req = collect(&mut core, &mut inb, 1).pop().unwrap();
+    let mut out = Vec::new();
+    ans(
+        &mut out,
+        req.id,
+        200,
+        6,
+        b"",
+        &[&77u64.to_le_bytes()[..], b"hi"].concat(),
+    );
+    core.run(&out, &mut inb, 0).unwrap();
+    assert_eq!(core.streams.len(), 1);
+    // read all, so the close is a FIN and not a reset (a reset closes at
+    // once: the read fails)
+    let mut got = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !got.ends_with(b"hi\r\n") {
+        let k = s.read(&mut buf).unwrap();
+        got.extend_from_slice(&buf[..k]);
+    }
+    drop(s);
+    until_eof(&mut core, &mut inb);
+    assert!(
+        after(&mut core, &mut inb, IDLE / 2)
+            .iter()
+            .all(|r| r.kind() != STREAM_GONE)
+    );
+    let got = after(&mut core, &mut inb, IDLE + Duration::from_secs(1));
+    assert!(
+        got.iter().any(|r| r.id == 77 && r.kind() == STREAM_GONE),
+        "{got:?}"
+    );
+    assert!(core.streams.is_empty() && core.conns.is_empty());
+}
+
+/// Half-close: the client sends its request, closes its side and waits.
+/// An answer within the idle time still reaches it.
+#[test]
+fn half_closed_client_gets_its_answer() {
+    let (mut core, port) = new_core(limits());
+    let mut inb = vec![0u8; 1 << 18];
+    let mut s = connect(port);
+    s.write_all(b"GET /half HTTP/1.1\r\n\r\n").unwrap();
+    s.shutdown(Shutdown::Write).unwrap();
+    let req = collect(&mut core, &mut inb, 1).pop().unwrap();
+    until_eof(&mut core, &mut inb);
+    after(&mut core, &mut inb, IDLE / 2);
+    let mut out = Vec::new();
+    ans(&mut out, req.id, 200, 0, b"", b"late but here");
+    core.respond(&out);
+    let mut got = String::new();
+    let _ = s.read_to_string(&mut got);
+    assert!(got.ends_with("late but here"), "{got:?}");
+}
+
+/// A slow handler with a client that stays: no timer closes it.
+#[test]
+fn slow_answer_to_a_connected_client_arrives() {
+    let (mut core, port) = new_core(limits());
+    let mut inb = vec![0u8; 1 << 18];
+    let mut s = connect(port);
+    s.write_all(b"GET /slow HTTP/1.1\r\n\r\n").unwrap();
+    let req = collect(&mut core, &mut inb, 1).pop().unwrap();
+    after(&mut core, &mut inb, IDLE * 3);
+    assert_eq!(core.conns.len(), 1, "still open");
+    let mut out = Vec::new();
+    ans(&mut out, req.id, 200, 0, b"", b"slow");
+    core.respond(&out);
+    let mut buf = [0u8; 1024];
+    let k = s.read(&mut buf).unwrap();
+    assert!(buf[..k].ends_with(b"slow"));
+}
+
+/// `pingInterval`: a ping goes out after a quiet interval. A client that
+/// does not answer is closed one interval later, with 1001 like dart:io.
+#[test]
+fn websocket_ping_closes_a_client_that_does_not_answer() {
+    let (mut core, port) = new_core(limits());
+    let mut inb = vec![0u8; 1 << 18];
+    let (id, _tx) = ws_on(&mut core, &mut inb, port, "/ws");
+    let mut out = Vec::new();
+    ans(&mut out, id, 0, 9, b"", &1000u64.to_le_bytes());
+    core.run(&out, &mut inb, 0).unwrap();
+    assert!(after(&mut core, &mut inb, Duration::from_millis(500)).is_empty());
+    assert!(
+        after(&mut core, &mut inb, Duration::from_millis(1100)).is_empty(),
+        "pinged"
+    );
+    assert!(
+        core.conns
+            .iter()
+            .any(|(_, c)| c.ws.as_ref().unwrap().pinged.is_some())
+    );
+    let got = after(&mut core, &mut inb, Duration::from_millis(2200));
+    assert_eq!(
+        (got[0].id, got[0].kind(), got[0].code),
+        (id, WS_CLOSED, 1001)
+    );
+    assert!(core.conns.is_empty());
+}
+
+/// A client that answers the pings stays open. Interval 0 turns it off.
+#[test]
+fn websocket_ping_keeps_a_client_that_answers() {
+    let (mut core, port) = new_core(limits());
+    let mut inb = vec![0u8; 1 << 18];
+    std::thread::spawn(move || {
+        let mut ws = ws_client(port, "/ws");
+        // tungstenite answers pings while it reads
+        while ws.read().is_ok() {}
+    });
+    let id = upgrade(&mut core, &mut inb);
+    let mut out = Vec::new();
+    ans(&mut out, id, 0, 9, b"", &1000u64.to_le_bytes());
+    core.run(&out, &mut inb, 0).unwrap();
+    after(&mut core, &mut inb, Duration::from_millis(1100));
+    let end = Instant::now() + Duration::from_secs(5);
+    while core
+        .conns
+        .iter()
+        .any(|(_, c)| c.ws.as_ref().unwrap().pinged.is_some())
+    {
+        assert!(Instant::now() < end, "no pong");
+        core.run(&[], &mut inb, 1000).unwrap();
+    }
+    assert!(after(&mut core, &mut inb, Duration::from_millis(1500)).is_empty());
+    assert_eq!(core.conns.len(), 1, "open");
+    out.clear();
+    ans(&mut out, id, 0, 9, b"", &0u64.to_le_bytes());
+    core.run(&out, &mut inb, 0).unwrap();
+    assert!(after(&mut core, &mut inb, Duration::from_secs(60)).is_empty());
+    assert!(
+        core.conns
+            .iter()
+            .all(|(_, c)| c.ws.as_ref().unwrap().pinged.is_none())
+    );
+}
+
+/// Accepted sockets get TCP keep-alive.
+#[test]
+fn accepted_sockets_have_keepalive() {
+    let (mut core, port) = new_core(limits());
+    let mut inb = vec![0u8; 1 << 18];
+    let _s = connect(port);
+    accept(&mut core, &mut inb, 1);
+    let (_, c) = core.conns.iter().next().unwrap();
+    let sock = socket2::SockRef::from(&c.sock);
+    assert!(sock.keepalive().unwrap());
+    assert_eq!(sock.tcp_keepalive_time().unwrap(), KEEPALIVE);
+}

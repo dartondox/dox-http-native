@@ -65,6 +65,17 @@ void handle(HttpRequest req) async {
       // never ends on its own: only a client that leaves stops it
       await res.addStream(parts(null));
       foreverDone.complete(sentParts);
+    case '/hang':
+      // answers only when the test says so
+      await hang.future;
+      res.write('late');
+    case '/quiet':
+      // one part, then nothing (like server-sent events with no news)
+      StreamController<List<int>> source = StreamController<List<int>>(
+        onCancel: () => quietCancelled.complete(),
+      );
+      source.add(Uint8List(70000));
+      await res.addStream(source.stream);
     case '/headers':
       res.headers.contentType = ContentType.json;
       res.cookies.add(Cookie('a', 'b'));
@@ -128,6 +139,8 @@ HttpResponse? closedWith;
 /// errors of streamed bodies that did not keep to their content length
 List<String> lengthErrors = <String>[];
 Completer<int> foreverDone = Completer<int>();
+Completer<void> hang = Completer<void>();
+Completer<void> quietCancelled = Completer<void>();
 
 Future<NativeHttpServer> start(int port, {int maxBodySize = 1024}) async {
   NativeHttpServer server = await NativeHttpServer.bind(
@@ -779,6 +792,59 @@ void main() {
     await s.drain<void>().timeout(const Duration(seconds: 5));
     expect(clock.elapsed, greaterThan(const Duration(milliseconds: 250)));
     s.destroy();
+    await quick.close(force: true);
+  });
+
+  test('a client that left a request with no answer frees its connection, '
+      'a late answer is dropped', () async {
+    hang = Completer<void>();
+    NativeHttpServer one = await NativeHttpServer.bind(
+      0,
+      address: '127.0.0.1',
+      maxConnections: 1,
+      idleTimeout: const Duration(milliseconds: 300),
+    );
+    one.listen(handle);
+    Socket s = await Socket.connect('127.0.0.1', one.port);
+    s.write('GET /hang HTTP/1.1\r\n\r\n');
+    await s.flush();
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+    s.destroy(); // a FIN: the client is gone
+    // the only connection slot is free again after the idle time
+    String out = await raw(
+      one.port,
+      'GET / HTTP/1.1\r\nConnection: close\r\n\r\n',
+    ).timeout(const Duration(seconds: 5));
+    expect(out, endsWith('Hello World'));
+    hang.complete(); // the late answer goes nowhere
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    out = await raw(one.port, 'GET / HTTP/1.1\r\nConnection: close\r\n\r\n');
+    expect(out, endsWith('Hello World'));
+    await one.close(force: true);
+  });
+
+  test('a quiet stream stops when the client leaves', () async {
+    quietCancelled = Completer<void>();
+    NativeHttpServer quick = await NativeHttpServer.bind(
+      0,
+      address: '127.0.0.1',
+      idleTimeout: const Duration(milliseconds: 300),
+    );
+    quick.listen(handle);
+    Socket s = await Socket.connect('127.0.0.1', quick.port);
+    s.write('GET /quiet HTTP/1.1\r\n\r\n');
+    int got = 0;
+    Completer<void> all = Completer<void>();
+    s.listen((List<int> data) {
+      got += data.length;
+      if (got >= 70000 && !all.isCompleted) all.complete();
+    });
+    await all.future.timeout(const Duration(seconds: 5));
+    expect(quick.streams, hasLength(1));
+    s.destroy();
+    // the source is cancelled, with no new part
+    await quietCancelled.future.timeout(const Duration(seconds: 5));
+    expect(quick.streams, isEmpty);
     await quick.close(force: true);
   });
 

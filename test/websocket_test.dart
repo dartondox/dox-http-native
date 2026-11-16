@@ -24,6 +24,11 @@ void main() {
         WebSocket ws = await NativeWebSocket.upgrade(req);
         accepted.add(ws);
         await ws.close(4000, 'bye');
+      case '/ping':
+        WebSocket ws = await NativeWebSocket.upgrade(req);
+        ws.pingInterval = const Duration(milliseconds: 200);
+        accepted.add(ws);
+        ws.listen(null);
       case '/flood':
         WebSocket ws = await NativeWebSocket.upgrade(req, maxMessageSize: 10);
         accepted.add(ws);
@@ -154,5 +159,39 @@ void main() {
     await accepted.single.done.timeout(const Duration(seconds: 10));
     expect(accepted.single.closeCode, WebSocketStatus.policyViolation);
     client.destroy();
+  });
+
+  test(
+    'pingInterval closes a client that does not answer, with 1001',
+    () async {
+      // a raw client: it upgrades and then never answers a ping
+      Socket client = await Socket.connect('127.0.0.1', server.port);
+      client.listen(null);
+      client.write(
+        'GET /ping HTTP/1.1\r\n'
+        'Host: 127.0.0.1\r\n'
+        'Connection: Upgrade\r\n'
+        'Upgrade: websocket\r\n'
+        'Sec-WebSocket-Version: 13\r\n'
+        'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n',
+      );
+      await client.flush();
+      while (accepted.isEmpty) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      await accepted.single.done.timeout(const Duration(seconds: 5));
+      expect(accepted.single.closeCode, WebSocketStatus.goingAway);
+      client.destroy();
+    },
+  );
+
+  test('pingInterval keeps a client that answers', () async {
+    // dart:io answers pings
+    WebSocket ws = await WebSocket.connect(url('/ping'));
+    ws.listen(null);
+    await Future<void>.delayed(const Duration(seconds: 1));
+    expect(accepted.single.readyState, WebSocket.open);
+    expect(accepted.single.pingInterval, const Duration(milliseconds: 200));
+    await ws.close();
   });
 }

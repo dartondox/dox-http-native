@@ -62,6 +62,10 @@ class NativeResponse implements HttpResponse {
   Completer<void>? _room;
   bool _gone = false;
 
+  /// the source of [addStream] while it runs. Cancelled when the client
+  /// leaves, so a quiet source (eg. server-sent events) does not stay.
+  StreamIterator<List<int>>? _source;
+
   /// true after [close]
   bool get isClosed => _closed;
 
@@ -80,6 +84,8 @@ class NativeResponse implements HttpResponse {
   void streamed(int bytes) {
     if (bytes < 0) {
       _gone = true;
+      // ends a pending wait for the next chunk in [addStream]
+      unawaited(_source?.cancel());
     } else {
       _unsent -= bytes;
     }
@@ -182,8 +188,12 @@ class NativeResponse implements HttpResponse {
 
   @override
   Future<void> addStream(Stream<List<int>> stream) async {
+    StreamIterator<List<int>> source = _source = StreamIterator<List<int>>(
+      stream,
+    );
     try {
-      await for (List<int> chunk in stream) {
+      while (!_gone && await source.moveNext()) {
+        List<int> chunk = source.current;
         add(chunk);
         if (_stream == null && _size >= streamAt) _startStream();
         // wait while Rust holds a full window, so memory stays small
@@ -199,6 +209,9 @@ class NativeResponse implements HttpResponse {
         _done?.complete(this);
       }
       rethrow;
+    } finally {
+      _source = null;
+      await source.cancel();
     }
   }
 

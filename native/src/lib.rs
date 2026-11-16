@@ -34,7 +34,7 @@
 //! headers_len, u32 body_len. Then header lines, body. Kind 0 is an HTTP
 //! answer. Kind bit 8 (0x100) on it: Rust gzips the body, on a helper
 //! thread (Dart sets `content-encoding`). Kind bit 9 (0x200): the header
-//! lines hold `connection: close`. Kinds 1 to 5 are for WebSockets, see
+//! lines hold `connection: close`. Kinds 1 to 5 and 9 are for WebSockets, see
 //! below.
 //!
 //! Streamed body: kind 6 is an HTTP answer whose body comes in parts. Its
@@ -65,7 +65,10 @@
 //! ws, when it ended. Messages from Dart are response records: kind 2
 //! text, 3 binary, 4 close (status: the close code, 0 for none. body: the
 //! reason). Kind 5: Dart handled this many bytes (the id field) of client
-//! messages.
+//! messages. Kind 9: `pingInterval` of the WebSocket (id: the ws id, body:
+//! u64 milliseconds, 0 for off). Rust then pings a client that sent
+//! nothing for that long, and closes it (1001) when it stays quiet one
+//! more interval.
 //!
 //! Limits, so a slow side can not make memory grow forever:
 //! - Dart to client: each socket has a queue of messages that Rust did not
