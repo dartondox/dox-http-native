@@ -92,6 +92,9 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   /// balancer, set it longer than the idle timeout of the balancer (eg.
   /// 65 seconds for the 60 seconds of AWS ALB). Else the server may close
   /// a connection the balancer still sends on, and clients get 502.
+  /// A client that closed its sending side (a half-close) waits at most
+  /// [idleTimeout] for its answer: with no write in that time the
+  /// connection closes. Raise it when such clients call slow handlers.
   static Future<NativeHttpServer> bind(
     int port, {
     Object? address,
@@ -195,6 +198,23 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   /// responses that send their body in parts, by stream id
   final Map<int, NativeResponse> streams = <int, NativeResponse>{};
   int _nextStreamId = 1;
+
+  /// open responses that are not streamed and whose `done` is awaited, by
+  /// request id. Rust tells when their client is gone, then `done`
+  /// completes. Other responses cost nothing here.
+  final Map<int, NativeResponse> watched = <int, NativeResponse>{};
+
+  /// ids of open requests whose client left before their `done` was read.
+  /// `done` then completes at once. An id goes when its response ends. At
+  /// most [maxGoneIds] are kept (the oldest go first), for handlers that
+  /// never end their response.
+  final Set<int> goneIds = <int>{};
+
+  /// most entries of [goneIds]
+  static const int maxGoneIds = 1024;
+
+  /// false once the server is closed
+  bool get isOpen => _handle != 0;
   final StreamController<HttpRequest> _requests = StreamController<HttpRequest>(
     sync: true,
   );
@@ -288,6 +308,11 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
         res.streamed(-1);
       }
       streams.clear();
+      for (NativeResponse res in List<NativeResponse>.of(watched.values)) {
+        res.gone();
+      }
+      watched.clear();
+      goneIds.clear();
       _done();
     }
   }
@@ -307,6 +332,27 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   /// Frees an external body when Dart is done with it.
   static final Pointer<NativeFinalizerFunction> _freeBody =
       Native.addressOf<NativeFinalizerFunction>(doxFreeBody);
+
+  /// Rust closed the connection of request [id] before it got an answer.
+  void _requestGone(int id) {
+    NativeResponse? res = watched[id];
+    if (res != null) return res.gone();
+    // a request of this batch: its handler already ran. When it answered
+    // (or started a stream) nothing waits, so no id is kept.
+    for (NativeRequest req in _batch) {
+      if (req.id != id) continue;
+      NativeResponse res = req.response;
+      if (!res.isClosed && !res.headSent) res.gone();
+      return;
+    }
+    // An open request of an earlier batch whose `done` is not read yet:
+    // Rust handled every answer Dart gave before this batch, so it is
+    // still live. ponytail: at most [maxGoneIds] ids, the oldest go first.
+    // Only a burst of more than that many open requests whose clients
+    // left, before their handlers read `done`, loses ids.
+    if (goneIds.length >= maxGoneIds) goneIds.remove(goneIds.first);
+    goneIds.add(id);
+  }
 
   /// The requests and messages from one `dox_run` call.
   void _onBatch(Uint8List b) {
@@ -352,6 +398,11 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
           NativeResponse? res = streams[id];
           if (kind == 5) streams.remove(id);
           res?.streamed(kind == 4 ? d.getUint64(q, Endian.little) : -1);
+          continue;
+        }
+        if (kind == 6) {
+          // the connection of a request with no answer yet is gone
+          _requestGone(id);
           continue;
         }
         if (kind != 0) {
@@ -610,8 +661,12 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
     _headerLines(res);
     // Rust drops the content-length line of a full body. Here it is the
     // only way the client knows the length up front.
+    // 1xx, 204 and 304 have no body, so no length either (like Rust)
     int length = res.headers.contentLength;
-    if (length >= 0) _lengthLine(length);
+    int status = res.statusCode;
+    bool noBody =
+        (status >= 100 && status < 200) || status == 204 || status == 304;
+    if (length >= 0 && !noBody) _lengthLine(length);
     _endRecord(start, first, id);
     return id;
   }

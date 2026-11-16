@@ -78,8 +78,8 @@ use tungstenite::{Error as WsError, Message, Utf8Bytes};
 
 use crate::{
     CLOSE_WAIT, DRAIN_MAX, EXTERNAL_MIN, Key, MAX_HEAD, MAX_RESERVE, MIN_QUEUE, POST, REQ_HEAD,
-    RES_HEAD, SEND_WAIT, STREAM_GONE, STREAM_SENT, WS_BINARY, WS_CLOSED, WS_TEXT, WS_UNACKED, bind,
-    gzip, peer_bytes, post, rd16, rd32, unbind,
+    REQUEST_GONE, RES_HEAD, SEND_WAIT, STREAM_GONE, STREAM_SENT, WS_BINARY, WS_CLOSED, WS_TEXT,
+    WS_UNACKED, bind, gzip, peer_bytes, post, rd16, rd32, unbind,
 };
 
 const LISTENER: Token = Token(0);
@@ -94,6 +94,9 @@ const MAX_INFLIGHT: usize = 64;
 /// Lingering close: how long, and how many bytes, Rust drops.
 const LINGER: Duration = Duration::from_secs(1);
 const LINGER_MAX: usize = 1 << 20;
+/// No traffic for this long and the OS checks that the client is still
+/// there (TCP keep-alive, see `keepalive`).
+const KEEPALIVE: Duration = Duration::from_secs(60);
 /// Wait before the next accept after an error (eg. too many open files).
 const ACCEPT_RETRY: Duration = Duration::from_millis(10);
 /// Bytes not written yet before Rust gives tungstenite the next message.
@@ -310,6 +313,13 @@ struct Ws {
     closing: Option<Instant>,
     /// Dart is behind: no frames are read
     paused: bool,
+    /// `pingInterval` of Dart: send a ping when the client was quiet this
+    /// long, close when it stays quiet one more interval. None: off.
+    ping: Option<Duration>,
+    /// when the client last sent bytes (or the ping timer started)
+    heard: Instant,
+    /// a ping went out at this time and the client was quiet since
+    pinged: Option<Instant>,
 }
 
 struct Conn {
@@ -396,6 +406,13 @@ enum Due {
     Head,
     Ws,
     Send,
+    /// the client closed its side, answers wait and nothing was written
+    /// for the idle time: it is gone
+    Gone,
+    /// a WebSocket ping is due
+    Ping,
+    /// the client did not answer the ping in time
+    Pong,
 }
 
 /// Body limits of one server.
@@ -493,6 +510,12 @@ fn render_head(
         buf.extend_from_slice(b"connection: keep-alive\r\n");
     }
     buf.extend_from_slice(b"\r\n");
+}
+
+/// A status whose answer never has a body: 1xx, 204 and 304. A status
+/// out of range is sent as 500, which has one.
+fn no_body(status: u16) -> bool {
+    (100..200).contains(&status) || status == 204 || status == 304
 }
 
 /// Writes a whole answer with this body.
@@ -670,7 +693,7 @@ fn close_frame(code: CloseCode) -> Option<CloseFrame> {
 }
 
 impl Ws {
-    fn new(id: u64, max: usize) -> Self {
+    fn new(id: u64, max: usize, now: Instant) -> Self {
         Ws {
             ctx: WebSocketContext::new(Role::Server, None),
             id,
@@ -683,6 +706,9 @@ impl Ws {
             told: false,
             closing: None,
             paused: false,
+            ping: None,
+            heard: now,
+            pinged: None,
         }
     }
 
@@ -1393,6 +1419,12 @@ impl Core {
     fn new(listener: std::net::TcpListener, key: Key, limits: Limits) -> std::io::Result<Self> {
         let poll = Poll::new()?;
         let waker = Arc::new(Waker::new(poll.registry(), WAKER)?);
+        // finds a client whose host is gone (no FIN, eg. a phone that lost
+        // its network): the OS probes an idle connection, and an answer
+        // that never comes ends it with an error. A live client's OS always
+        // answers. Set once here: accepted sockets inherit it (see
+        // `accept_all`). An error only means no keep-alive.
+        let _ = socket2::SockRef::from(&listener).set_tcp_keepalive(&keepalive());
         let mut listener = TcpListener::from_std(listener);
         poll.registry()
             .register(&mut listener, LISTENER, Interest::READABLE)?;
@@ -1481,6 +1513,9 @@ impl Core {
                 && self.streams.remove(&sid).is_some()
             {
                 self.msgs.push(sid, STREAM_GONE, 0, b"");
+            } else if !s.answered {
+                let id = ((idx as u64) << 32) | u64::from(s.seq);
+                self.msgs.push(id, REQUEST_GONE, 0, b"");
             }
         }
         if let Some(ws) = c.ws {
@@ -1537,6 +1572,27 @@ impl Core {
                         c.fail(408, &self.date.1);
                         self.service(idx);
                     }
+                    Due::Ping => {
+                        let ws = c.ws.as_mut().unwrap();
+                        ws.pinged = Some(now);
+                        ws.queue.push_front(Message::Ping(Bytes::new()));
+                        self.service(idx);
+                    }
+                    Due::Pong => {
+                        // The pong may wait in the socket, not read yet:
+                        // timers run before reads, and Dart may have been
+                        // busy for longer than the interval. Read first.
+                        self.ws_read(idx);
+                        if let Some(c) = self.conns.get_mut(idx)
+                            && let Some((at, Due::Pong)) = c.due(&limits)
+                            && at <= now
+                        {
+                            // like dart:io: the close code is 1001 (going away)
+                            let ws = c.ws.as_mut().unwrap();
+                            ws.code.get_or_insert((1001, Vec::new()));
+                            self.kill(idx);
+                        }
+                    }
                     _ => self.kill(idx),
                 },
                 _ => {}
@@ -1582,6 +1638,10 @@ impl Core {
                     let paused = c.paused || c.ws.as_ref().is_some_and(|w| w.paused);
                     if readable && !paused {
                         self.queue(idx);
+                    } else if c.paused && c.hup && c.ws.is_none() {
+                        // no read while paused (eg. an upgrade waits): the
+                        // close is only seen here, see `Due::Gone`
+                        self.arm_timer(idx);
                     }
                     if writable && self.conns[idx].pending() > 0 {
                         self.service(idx);
@@ -1608,6 +1668,19 @@ impl Core {
             match listener.accept() {
                 Ok((mut sock, addr)) => {
                     let _ = sock.set_nodelay(true);
+                    // Linux copies the keep-alive of the listener (see
+                    // `Core::new`) to the accepted socket. macOS copies
+                    // all but the idle time. Others (eg. Windows) get all
+                    // of it here. Tested in `accepted_sockets_have_keepalive`.
+                    #[cfg(target_os = "macos")]
+                    let _ = socket2::SockRef::from(&sock)
+                        .set_tcp_keepalive(&socket2::TcpKeepalive::new().with_time(KEEPALIVE));
+                    #[cfg(not(any(
+                        target_os = "linux",
+                        target_os = "android",
+                        target_os = "macos"
+                    )))]
+                    let _ = socket2::SockRef::from(&sock).set_tcp_keepalive(&keepalive());
                     let entry = self.conns.vacant_entry();
                     let idx = entry.key();
                     let interest = Interest::READABLE | Interest::WRITABLE;
@@ -1659,12 +1732,16 @@ impl Core {
                 .write_buffer_size(0);
             ws.ctx = WebSocketContext::from_partially_read(part, Role::Server, Some(config));
             ws.live = true;
+            ws.heard = now;
             if draining {
                 ws.close(CloseCode::Away);
             }
             c.paused = false;
             c.queued = true;
             self.ready.push_back(idx);
+            if ws.ping.is_some() {
+                self.arm_timer(idx);
+            }
         }
         let c = &mut self.conns[idx];
         let mut close_started = false;
@@ -1712,12 +1789,13 @@ impl Core {
             c.marks.pop_front();
             self.msgs.push(sid, STREAM_SENT, 0, &n.to_le_bytes());
         }
+        if c.written > before {
+            // the idle time (and the grace of a client that closed its
+            // side, see `due`) counts from the last write
+            c.since = now;
+        }
         if c.pending() == 0 {
             c.stuck = None;
-            if c.written > before && c.slots.is_empty() {
-                // the last answer is out: the idle time starts now
-                c.since = now;
-            }
         } else if c.written > before || c.stuck.is_none() {
             c.stuck = Some(now);
         }
@@ -1845,6 +1923,12 @@ impl Core {
                 Err(_) => return self.kill(idx),
             }
         };
+        // any bytes from the client show it is there (see `Ws::ping`)
+        let ping = ws.ping.is_some();
+        if io.left < WS_READ {
+            ws.heard = self.now;
+            ws.pinged = None;
+        }
         match fail {
             None => {}
             // over: close the TCP connection once the last frame is out
@@ -1866,6 +1950,10 @@ impl Core {
         if again {
             // read the rest in a later turn (see `fill`)
             self.queue(idx);
+        }
+        if ping {
+            // after a pause the ping may be due earlier than the timer
+            self.arm_timer(idx);
         }
     }
 
@@ -1903,6 +1991,7 @@ impl Core {
                 }
                 7 => self.part(id, body, false, true),
                 8 => self.part(id, b"", true, status == 0),
+                9 => self.ws_ping(id, body),
                 _ => {}
             }
         }
@@ -2004,7 +2093,7 @@ impl Core {
                 let mut out = Vec::new();
                 render_head(&mut out, 101, lines, extra.as_bytes(), date, way, Len::None);
                 c.put(i, &out, 0);
-                c.ws = Some(Box::new(Ws::new(ws_id, max)));
+                c.ws = Some(Box::new(Ws::new(ws_id, max, self.now)));
                 self.wss.insert(ws_id, idx);
             }
             _ => {
@@ -2017,8 +2106,11 @@ impl Core {
                 // Dart sends `content-length` itself when it knows it. Rust
                 // counts the bytes: a wrong count closes the connection, so
                 // the rest can not look like the next answer.
+                // HEAD, 1xx, 204 and 304 have no body: only the head goes
+                // out, the connection stays usable
+                let silent = way.head || no_body(status);
                 let (len, tail) = match length_line(lines) {
-                    _ if way.head => (Len::Open, Tail::Close),
+                    _ if silent => (Len::Open, Tail::Close),
                     Some(Some(n)) => (Len::Open, Tail::Left(n)),
                     sized => {
                         if sized.is_some() || way.http10 {
@@ -2034,7 +2126,7 @@ impl Core {
                 };
                 let mut out = Vec::new();
                 render_head(&mut out, status, lines, b"", date, way, len);
-                if way.head {
+                if silent {
                     // no body: tell Dart to stop
                     s.done = true;
                     c.put(i, &out, 0);
@@ -2147,6 +2239,24 @@ impl Core {
             ws.queue.push_back(m);
         }
         self.touch(idx);
+    }
+
+    /// Dart set `pingInterval` of the WebSocket `id`: u64 milliseconds in
+    /// `body`, 0 for off. The interval starts now.
+    fn ws_ping(&mut self, id: u64, body: &[u8]) {
+        let Some(&idx) = self.wss.get(&id) else {
+            return;
+        };
+        let Some(ws) = self.conns.get_mut(idx).and_then(|c| c.ws.as_mut()) else {
+            return;
+        };
+        let ms = body
+            .get(..8)
+            .map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+        ws.ping = (ms > 0).then(|| Duration::from_millis(ms).min(MAX_TIMEOUT));
+        ws.heard = self.now;
+        ws.pinged = None;
+        self.arm_timer(idx);
     }
 
     /// Gives a gzip job to the helper thread of this server. Starts it on
@@ -2262,6 +2372,8 @@ impl Core {
                 }
                 if c.finished() {
                     self.kill(idx);
+                } else if c.eof {
+                    self.arm_timer(idx); // see `Due::Gone`
                 }
                 continue;
             }
@@ -2292,8 +2404,8 @@ impl Core {
             let c = &mut self.conns[idx];
             c.queued = false;
             self.ready.pop_front();
-            if c.body.as_ref().is_some_and(|b| b.last == self.now) {
-                self.arm_timer(idx);
+            if c.eof || c.body.as_ref().is_some_and(|b| b.last == self.now) {
+                self.arm_timer(idx); // `Due::Gone` or `Due::Body`
             }
             self.service(idx);
         }
@@ -2402,14 +2514,45 @@ impl Conn {
         if let Some(t) = self.stuck {
             return Some((t + SEND_WAIT, Due::Send));
         }
-        if self.ws.is_some() || self.body.is_some() {
+        if let Some(w) = &self.ws
+            && w.live
+            && !w.paused
+            && let Some(every) = w.ping
+        {
+            return Some(match w.pinged {
+                Some(t) => (t + every, Due::Pong),
+                None => (w.heard + every, Due::Ping),
+            });
+        }
+        if self.ws.is_some() || self.body.is_some() || self.pending() > 0 {
             return None;
         }
-        if self.slots.is_empty() && self.pending() == 0 {
+        if self.slots.is_empty() {
             return Some((self.since + limits.idle, Due::Head));
+        }
+        // The client closed its side while answers wait. It may still
+        // read (a half-close), so it gets the idle time to get an answer.
+        // `since` moves with each write, so a stream that still writes
+        // stays. A client that is really gone makes the write fail.
+        // A paused connection (eg. an upgrade waits, or too many requests)
+        // reads nothing, so only the poll saw the close (`hup`).
+        if self.eof || (self.hup && self.paused) {
+            return Some((self.since + limits.idle, Due::Gone));
         }
         None
     }
+}
+
+/// TCP keep-alive of accepted sockets: the first probe after [KEEPALIVE]
+/// with no traffic, then one every 10 seconds. After 6 probes with no
+/// answer (Windows: its fixed count) the connection is dead.
+fn keepalive() -> socket2::TcpKeepalive {
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(KEEPALIVE)
+        .with_interval(Duration::from_secs(10));
+    #[cfg(not(windows))]
+    let ka = ka.with_retries(6);
+    ka
 }
 
 /// The limits from Dart's values. A timeout is at most [MAX_TIMEOUT], so

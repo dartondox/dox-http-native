@@ -96,6 +96,7 @@ How it works:
 - One thread per isolate: the socket work (accept, read, parse, write) runs on the isolate's own thread. A small helper thread only watches the sockets while the isolate is idle, and wakes it when a request comes.
 - Keep-alive and pipelining. At most 64 requests of one connection wait for an answer, and at most 1 MB of answers waits to be written. Then the server stops reading that connection until answers go out.
 - A request head must arrive within `idleTimeout` (default 30 seconds). A connection with no request for `idleTimeout` after its last answer is closed. Behind a load balancer, set it longer than the balancer's idle timeout (eg. `bind(port, idleTimeout: Duration(seconds: 65))` for AWS ALB).
+- A client that closed its sending side (a half-close) waits at most `idleTimeout` for its answer. With no write in that time the connection closes, because most such clients are gone. Raise `idleTimeout` when such clients call slow handlers.
 - A client that reads nothing of its answer for 30 seconds is closed.
 - `bind(port, maxConnections: 1000)` holds at most that many connections open. At the limit new clients wait in the listen queue of the OS. Default: no limit.
 - When the isolate dies without `close()` (eg. an uncaught error), the server closes within about 100 ms. New clients get "connection refused".
@@ -107,7 +108,8 @@ How it works:
 - WebSocket upgrade with `NativeWebSocket.upgrade`, see above. `detachSocket` is not supported.
 - On a graceful `close()`, every open WebSocket gets close code `1001` (going away).
 - `autoCompress`: Rust gzips the body on a helper thread, not on the isolate.
-- Streaming: a small body is sent in one piece on `close`. When `addStream` passes 64 KB, the answer starts and the rest of the body goes out in parts. A big file never sits in memory.
+- Streaming: a small body is sent in one piece on `close`. When `addStream` passes 64 KB, the answer starts and the rest of the body goes out in parts. A big file never sits in memory. `flush()` also starts the answer: the head and the bytes so far go out, and later writes follow at once (eg. server-sent events written from a timer). Once the head is out (a flush, or `addStream` past 64 KB), a header or status change is ignored and a warning is logged once.
+- `response.done` completes (with no error) when the client is gone, also when the handler never closes the response. A handler that writes from its own timer (eg. server-sent events) stops it there: `response.done.then((_) => timer.cancel())`. Writes after that are dropped.
 
 ## AES-GCM
 

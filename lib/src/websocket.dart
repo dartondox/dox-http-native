@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:dox_http_native/src/headers.dart';
@@ -104,6 +105,9 @@ class NativeWebSocket extends Stream<dynamic> implements WebSocket {
   /// Dart handled this many bytes (the id field) of client messages.
   static const int kindAck = 5;
 
+  /// [pingInterval] changed: the body is u64 milliseconds, 0 for off.
+  static const int kindPing = 9;
+
   final NativeHttpServer _server;
   final int _id;
   final StreamController<dynamic> _messages = StreamController<dynamic>();
@@ -128,10 +132,29 @@ class NativeWebSocket extends Stream<dynamic> implements WebSocket {
   @override
   String? get closeReason => _closeReason;
 
-  // ponytail: Rust answers the pings of the client, but sends none itself.
-  // Add a ping record when a server side keep-alive is needed.
+  Duration? _pingInterval;
+
+  /// How often Rust checks that the client is still there. Off (null) by
+  /// default, like `dart:io`.
+  ///
+  /// When the client sent nothing for this long, Rust sends a ping. When
+  /// the client still sends nothing (no pong, no message) for one more
+  /// interval, the socket is closed with 1001 (going away), like
+  /// `dart:io`. Use it to find clients that vanished with no close (eg. a
+  /// phone that lost its network). The interval starts when it is set.
   @override
-  Duration? pingInterval;
+  Duration? get pingInterval => _pingInterval;
+
+  @override
+  set pingInterval(Duration? interval) {
+    _pingInterval = interval;
+    if (_state == WebSocket.closed) return;
+    int ms = interval == null || interval <= Duration.zero
+        ? 0
+        : max(1, interval.inMilliseconds);
+    ByteData body = ByteData(8)..setUint64(0, ms, Endian.little);
+    _server.sendWebSocket(_id, kindPing, 0, body.buffer.asUint8List());
+  }
 
   @override
   StreamSubscription<dynamic> listen(
