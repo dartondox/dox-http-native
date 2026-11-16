@@ -1207,10 +1207,15 @@ fn client_that_left_a_hanging_request_is_closed() {
     let req = collect(&mut core, &mut inb, 1).pop().unwrap();
     drop(s);
     until_eof(&mut core, &mut inb);
-    after(&mut core, &mut inb, IDLE / 2);
+    assert!(after(&mut core, &mut inb, IDLE / 2).is_empty());
     assert_eq!(core.conns.len(), 1, "too early");
-    after(&mut core, &mut inb, IDLE + Duration::from_secs(1));
+    let got = after(&mut core, &mut inb, IDLE + Duration::from_secs(1));
     assert_eq!(core.conns.len(), 0, "closed");
+    // Dart hears it, so `response.done` completes
+    assert_eq!(
+        got.iter().map(|r| (r.id, r.kind())).collect::<Vec<_>>(),
+        [(req.id, REQUEST_GONE)]
+    );
     let mut out = Vec::new();
     ans(&mut out, req.id, 200, 0, b"", b"late");
     assert_eq!(core.run(&out, &mut inb, 0), Ok(0), "late answer dropped");
@@ -1362,7 +1367,8 @@ fn websocket_ping_keeps_a_client_that_answers() {
     );
 }
 
-/// Accepted sockets get TCP keep-alive.
+/// Accepted sockets get TCP keep-alive. On Linux and macOS it is set
+/// once on the listener: this checks that they inherit all of it.
 #[test]
 fn accepted_sockets_have_keepalive() {
     let (mut core, port) = new_core(limits());
@@ -1372,5 +1378,47 @@ fn accepted_sockets_have_keepalive() {
     let (_, c) = core.conns.iter().next().unwrap();
     let sock = socket2::SockRef::from(&c.sock);
     assert!(sock.keepalive().unwrap());
-    assert_eq!(sock.tcp_keepalive_time().unwrap(), KEEPALIVE);
+    #[cfg(not(windows))]
+    {
+        assert_eq!(sock.tcp_keepalive_time().unwrap(), KEEPALIVE);
+        assert_eq!(
+            sock.tcp_keepalive_interval().unwrap(),
+            Duration::from_secs(10)
+        );
+        assert_eq!(sock.tcp_keepalive_retries().unwrap(), 6);
+    }
+}
+
+/// The pong is in the socket, but Dart was busy longer than the interval:
+/// the timer runs before the read. The client must not be closed.
+#[test]
+fn websocket_pong_waiting_in_the_socket_keeps_the_client() {
+    let (mut core, port) = new_core(limits());
+    let mut inb = vec![0u8; 1 << 18];
+    std::thread::spawn(move || {
+        let mut ws = ws_client(port, "/ws");
+        // tungstenite answers pings while it reads
+        while ws.read().is_ok() {}
+    });
+    let id = upgrade(&mut core, &mut inb);
+    let mut out = Vec::new();
+    ans(&mut out, id, 0, 9, b"", &1000u64.to_le_bytes());
+    core.run(&out, &mut inb, 0).unwrap();
+    // the ping goes out
+    after(&mut core, &mut inb, Duration::from_millis(1100));
+    assert!(
+        core.conns
+            .iter()
+            .all(|(_, c)| c.ws.as_ref().unwrap().pinged.is_some())
+    );
+    // the pong arrives, but the loop does not read it now
+    std::thread::sleep(Duration::from_millis(300));
+    // the pong time is over: the timer runs first and reads the pong
+    assert!(after(&mut core, &mut inb, Duration::from_millis(2200)).is_empty());
+    assert_eq!(core.conns.len(), 1, "open");
+    assert!(
+        core.conns
+            .iter()
+            .all(|(_, c)| c.ws.as_ref().unwrap().pinged.is_none())
+    );
 }

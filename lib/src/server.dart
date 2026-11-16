@@ -92,6 +92,9 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   /// balancer, set it longer than the idle timeout of the balancer (eg.
   /// 65 seconds for the 60 seconds of AWS ALB). Else the server may close
   /// a connection the balancer still sends on, and clients get 502.
+  /// A client that closed its sending side (a half-close) waits at most
+  /// [idleTimeout] for its answer: with no write in that time the
+  /// connection closes. Raise it when such clients call slow handlers.
   static Future<NativeHttpServer> bind(
     int port, {
     Object? address,
@@ -195,6 +198,11 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   /// responses that send their body in parts, by stream id
   final Map<int, NativeResponse> streams = <int, NativeResponse>{};
   int _nextStreamId = 1;
+
+  /// open responses that are not streamed and whose `done` is awaited, by
+  /// request id. Rust tells when their client is gone, then `done`
+  /// completes. Other responses cost nothing here.
+  final Map<int, NativeResponse> watched = <int, NativeResponse>{};
   final StreamController<HttpRequest> _requests = StreamController<HttpRequest>(
     sync: true,
   );
@@ -288,6 +296,10 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
         res.streamed(-1);
       }
       streams.clear();
+      for (NativeResponse res in List<NativeResponse>.of(watched.values)) {
+        res.gone();
+      }
+      watched.clear();
       _done();
     }
   }
@@ -352,6 +364,11 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
           NativeResponse? res = streams[id];
           if (kind == 5) streams.remove(id);
           res?.streamed(kind == 4 ? d.getUint64(q, Endian.little) : -1);
+          continue;
+        }
+        if (kind == 6) {
+          // the connection of a request with no answer yet is gone
+          watched[id]?.gone();
           continue;
         }
         if (kind != 0) {

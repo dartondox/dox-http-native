@@ -78,8 +78,8 @@ use tungstenite::{Error as WsError, Message, Utf8Bytes};
 
 use crate::{
     CLOSE_WAIT, DRAIN_MAX, EXTERNAL_MIN, Key, MAX_HEAD, MAX_RESERVE, MIN_QUEUE, POST, REQ_HEAD,
-    RES_HEAD, SEND_WAIT, STREAM_GONE, STREAM_SENT, WS_BINARY, WS_CLOSED, WS_TEXT, WS_UNACKED, bind,
-    gzip, peer_bytes, post, rd16, rd32, unbind,
+    REQUEST_GONE, RES_HEAD, SEND_WAIT, STREAM_GONE, STREAM_SENT, WS_BINARY, WS_CLOSED, WS_TEXT,
+    WS_UNACKED, bind, gzip, peer_bytes, post, rd16, rd32, unbind,
 };
 
 const LISTENER: Token = Token(0);
@@ -1413,6 +1413,12 @@ impl Core {
     fn new(listener: std::net::TcpListener, key: Key, limits: Limits) -> std::io::Result<Self> {
         let poll = Poll::new()?;
         let waker = Arc::new(Waker::new(poll.registry(), WAKER)?);
+        // finds a client whose host is gone (no FIN, eg. a phone that lost
+        // its network): the OS probes an idle connection, and an answer
+        // that never comes ends it with an error. A live client's OS always
+        // answers. Set once here: accepted sockets inherit it (see
+        // `accept_all`). An error only means no keep-alive.
+        let _ = socket2::SockRef::from(&listener).set_tcp_keepalive(&keepalive());
         let mut listener = TcpListener::from_std(listener);
         poll.registry()
             .register(&mut listener, LISTENER, Interest::READABLE)?;
@@ -1501,6 +1507,9 @@ impl Core {
                 && self.streams.remove(&sid).is_some()
             {
                 self.msgs.push(sid, STREAM_GONE, 0, b"");
+            } else if !s.answered {
+                let id = ((idx as u64) << 32) | u64::from(s.seq);
+                self.msgs.push(id, REQUEST_GONE, 0, b"");
             }
         }
         if let Some(ws) = c.ws {
@@ -1564,10 +1573,19 @@ impl Core {
                         self.service(idx);
                     }
                     Due::Pong => {
-                        // like dart:io: the close code is 1001 (going away)
-                        let ws = c.ws.as_mut().unwrap();
-                        ws.code.get_or_insert((1001, Vec::new()));
-                        self.kill(idx);
+                        // The pong may wait in the socket, not read yet:
+                        // timers run before reads, and Dart may have been
+                        // busy for longer than the interval. Read first.
+                        self.ws_read(idx);
+                        if let Some(c) = self.conns.get_mut(idx)
+                            && let Some((at, Due::Pong)) = c.due(&limits)
+                            && at <= now
+                        {
+                            // like dart:io: the close code is 1001 (going away)
+                            let ws = c.ws.as_mut().unwrap();
+                            ws.code.get_or_insert((1001, Vec::new()));
+                            self.kill(idx);
+                        }
                     }
                     _ => self.kill(idx),
                 },
@@ -1640,10 +1658,18 @@ impl Core {
             match listener.accept() {
                 Ok((mut sock, addr)) => {
                     let _ = sock.set_nodelay(true);
-                    // finds a client whose host is gone (no FIN, eg. a
-                    // phone that lost its network): the OS probes an idle
-                    // connection, and an answer that never comes ends it
-                    // with an error. A live client's OS always answers.
+                    // Linux copies the keep-alive of the listener (see
+                    // `Core::new`) to the accepted socket. macOS copies
+                    // all but the idle time. Others (eg. Windows) get all
+                    // of it here. Tested in `accepted_sockets_have_keepalive`.
+                    #[cfg(target_os = "macos")]
+                    let _ = socket2::SockRef::from(&sock)
+                        .set_tcp_keepalive(&socket2::TcpKeepalive::new().with_time(KEEPALIVE));
+                    #[cfg(not(any(
+                        target_os = "linux",
+                        target_os = "android",
+                        target_os = "macos"
+                    )))]
                     let _ = socket2::SockRef::from(&sock).set_tcp_keepalive(&keepalive());
                     let entry = self.conns.vacant_entry();
                     let idx = entry.key();

@@ -76,6 +76,41 @@ void handle(HttpRequest req) async {
       );
       source.add(Uint8List(70000));
       await res.addStream(source.stream);
+    case '/sse-timer':
+      // server-sent events written from a timer, not with addStream
+      res.headers.contentType = ContentType('text', 'event-stream');
+      Timer timer = Timer.periodic(const Duration(milliseconds: 20), (_) {
+        res.write('data: tick\n\n');
+      });
+      unawaited(
+        res.done.then((_) {
+          timer.cancel();
+          sseStopped.complete();
+        }),
+      );
+      return;
+    case '/cancel-error':
+      // the source fails when it is cancelled (the client left)
+      StreamController<List<int>> source = StreamController<List<int>>(
+        onCancel: () => throw StateError('cancel failed'),
+      );
+      source.add(Uint8List(70000));
+      try {
+        await res.addStream(source.stream);
+      } catch (e) {
+        cancelError.complete(e);
+      }
+      return;
+    case '/gone-race':
+      // the client leaves while a chunk is on its way: no error
+      StreamController<List<int>> source = StreamController<List<int>>();
+      Future<void> adding = res.addStream(source.stream);
+      source.add(<int>[1]);
+      scheduleMicrotask((res as NativeResponse).gone);
+      source.add(<int>[2]);
+      await adding;
+      res.add(<int>[3]); // dropped
+      raceDone.complete();
     case '/headers':
       res.headers.contentType = ContentType.json;
       res.cookies.add(Cookie('a', 'b'));
@@ -141,6 +176,9 @@ List<String> lengthErrors = <String>[];
 Completer<int> foreverDone = Completer<int>();
 Completer<void> hang = Completer<void>();
 Completer<void> quietCancelled = Completer<void>();
+Completer<void> sseStopped = Completer<void>();
+Completer<Object> cancelError = Completer<Object>();
+Completer<void> raceDone = Completer<void>();
 
 Future<NativeHttpServer> start(int port, {int maxBodySize = 1024}) async {
   NativeHttpServer server = await NativeHttpServer.bind(
@@ -846,6 +884,59 @@ void main() {
     await quietCancelled.future.timeout(const Duration(seconds: 5));
     expect(quick.streams, isEmpty);
     await quick.close(force: true);
+  });
+
+  test('done completes when the client of an open response leaves, '
+      'so a timer can stop', () async {
+    sseStopped = Completer<void>();
+    NativeHttpServer quick = await NativeHttpServer.bind(
+      0,
+      address: '127.0.0.1',
+      idleTimeout: const Duration(milliseconds: 300),
+    );
+    quick.listen(handle);
+    Socket s = await Socket.connect('127.0.0.1', quick.port);
+    s.write('GET /sse-timer HTTP/1.1\r\n\r\n');
+    await s.flush();
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+    expect(quick.watched, hasLength(1));
+    s.destroy();
+    await sseStopped.future.timeout(const Duration(seconds: 5));
+    expect(quick.watched, isEmpty);
+    await quick.close(force: true);
+  });
+
+  test('an error of the source on cancel goes to addStream', () async {
+    cancelError = Completer<Object>();
+    NativeHttpServer quick = await NativeHttpServer.bind(
+      0,
+      address: '127.0.0.1',
+      idleTimeout: const Duration(milliseconds: 300),
+    );
+    quick.listen(handle);
+    Socket s = await Socket.connect('127.0.0.1', quick.port);
+    s.write('GET /cancel-error HTTP/1.1\r\n\r\n');
+    int got = 0;
+    Completer<void> all = Completer<void>();
+    s.listen((List<int> data) {
+      got += data.length;
+      if (got >= 70000 && !all.isCompleted) all.complete();
+    });
+    await all.future.timeout(const Duration(seconds: 5));
+    s.destroy();
+    Object error = await cancelError.future.timeout(const Duration(seconds: 5));
+    expect(error, isA<StateError>());
+    await quick.close(force: true);
+  });
+
+  test('a client that leaves while a chunk comes gives no error', () async {
+    raceDone = Completer<void>();
+    String out = await raw(
+      server.port,
+      'GET /gone-race HTTP/1.1\r\nConnection: close\r\n\r\n',
+    );
+    await raceDone.future.timeout(const Duration(seconds: 5));
+    expect(out, startsWith('HTTP/1.1 200'));
   });
 
   test('maxConnections: at the limit new clients wait', () async {

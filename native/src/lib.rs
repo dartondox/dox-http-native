@@ -44,7 +44,9 @@
 //! bytes reached the socket: a record with kind 4 ([STREAM_SENT]), the
 //! stream id and a u64 body. Dart keeps at most a window of bytes not sent
 //! yet, so memory stays small and the client gets the first bytes early.
-//! Kind 5 ([STREAM_GONE]): the client is gone, stop sending.
+//! Kind 5 ([STREAM_GONE]): the client is gone, stop sending. Kind 6
+//! ([REQUEST_GONE]): the connection closed while this request (the id) had
+//! no answer yet. Dart then completes `done` of its response.
 //!
 //! WebSocket: a request that can upgrade (GET, HTTP/1.1, `Connection:
 //! upgrade`, `Upgrade: websocket`, version 13, a key) gets flag bit 1. Dart
@@ -119,6 +121,9 @@ const WS_CLOSED: u32 = 3;
 /// Stream messages to Dart (flags bits 8 to 15): bytes sent, client gone
 const STREAM_SENT: u32 = 4;
 const STREAM_GONE: u32 = 5;
+/// The connection of a request that has no answer yet is gone (id: the
+/// request id). Dart completes `response.done`.
+const REQUEST_GONE: u32 = 6;
 /// A body this big or bigger goes to Dart without a copy (external typed
 /// data). A smaller one is copied: for a few bytes a copy is cheaper than
 /// a finalizer.

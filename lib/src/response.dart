@@ -66,6 +66,13 @@ class NativeResponse implements HttpResponse {
   /// leaves, so a quiet source (eg. server-sent events) does not stay.
   StreamIterator<List<int>>? _source;
 
+  /// that cancel, so [addStream] gets an error of the source's `onCancel`
+  Future<void>? _cancel;
+
+  /// the zone of [addStream]. The cancel runs there: a future error can
+  /// not go to another error zone (it would be an uncaught error).
+  Zone? _zone;
+
   /// true after [close]
   bool get isClosed => _closed;
 
@@ -82,13 +89,39 @@ class NativeResponse implements HttpResponse {
   /// Rust sent [bytes] of the streamed body to the client. -1: the client
   /// is gone, stop sending.
   void streamed(int bytes) {
-    if (bytes < 0) {
-      _gone = true;
-      // ends a pending wait for the next chunk in [addStream]
-      unawaited(_source?.cancel());
-    } else {
-      _unsent -= bytes;
+    if (bytes < 0) return gone();
+    _unsent -= bytes;
+    _wake();
+  }
+
+  /// The client is gone. Writes are dropped from now on, [addStream] stops
+  /// and [done] completes (with no error).
+  void gone() {
+    _gone = true;
+    StreamIterator<List<int>>? source = _source;
+    // ends a pending wait for the next chunk in [addStream]. An error of
+    // the source's `onCancel` goes to [addStream], not to the zone.
+    if (source != null && _cancel == null) {
+      _cancel = (_zone ?? Zone.current).run(() => _cancelSource(source));
     }
+    _wake();
+    _complete();
+  }
+
+  static Future<void> _cancelSource(StreamIterator<List<int>> source) {
+    Future<void> cancel;
+    try {
+      cancel = source.cancel();
+    } catch (e, s) {
+      // an `onCancel` that throws at once
+      cancel = Future<void>.error(e, s);
+    }
+    // [addStream] awaits it. Until then the error is not uncaught.
+    return cancel..ignore();
+  }
+
+  /// Lets a waiting [addStream] go on.
+  void _wake() {
     Completer<void>? room = _room;
     if (room != null && (_gone || _unsent <= window)) {
       _room = null;
@@ -96,10 +129,18 @@ class NativeResponse implements HttpResponse {
     }
   }
 
+  /// Completes [done], once.
+  void _complete() {
+    Completer<HttpResponse>? done = _done;
+    if (done == null || done.isCompleted) return;
+    _request.server.watched.remove(_request.id);
+    done.complete(this);
+  }
+
   /// Marks the response as sent: a WebSocket accept answers the request.
   void upgraded() {
     _closed = true;
-    _done?.complete(this);
+    _complete();
   }
 
   /// true when a cookie was added
@@ -136,10 +177,10 @@ class NativeResponse implements HttpResponse {
   @override
   void add(List<int> data) {
     if (_closed) throw StateError('StreamSink is closed');
-    if (data.isEmpty) return;
+    // the client is gone: drop it, like the bytes of a closed socket
+    if (data.isEmpty || _gone) return;
     int? stream = _stream;
     if (stream != null) {
-      if (_gone) return;
       if (_length >= 0) {
         // like dart:io: more bytes than the content length is an error
         if (data.length > _left) {
@@ -183,7 +224,10 @@ class NativeResponse implements HttpResponse {
 
   @override
   void addError(Object error, [StackTrace? stackTrace]) {
-    _done?.completeError(error, stackTrace);
+    Completer<HttpResponse>? done = _done;
+    if (done == null || done.isCompleted) return;
+    _request.server.watched.remove(_request.id);
+    done.completeError(error, stackTrace);
   }
 
   @override
@@ -191,8 +235,11 @@ class NativeResponse implements HttpResponse {
     StreamIterator<List<int>> source = _source = StreamIterator<List<int>>(
       stream,
     );
+    _zone = Zone.current;
     try {
       while (!_gone && await source.moveNext()) {
+        // the client left while the next chunk came: it was cancelled
+        if (_gone) break;
         List<int> chunk = source.current;
         add(chunk);
         if (_stream == null && _size >= streamAt) _startStream();
@@ -201,17 +248,21 @@ class NativeResponse implements HttpResponse {
         if (_gone) break; // the client left: stop reading the source
       }
     } catch (_) {
+      // the client left: nobody gets this answer any more
+      if (_gone) return;
       int? id = _stream;
       if (id != null && !_closed) {
         // the head is sent: cut the connection, the body is not whole
         _closed = true;
         _request.server.endStream(id, ok: false);
-        _done?.complete(this);
+        _complete();
       }
       rethrow;
     } finally {
       _source = null;
-      await source.cancel();
+      Future<void>? cancel = _cancel;
+      _cancel = null;
+      await (cancel ?? source.cancel());
     }
   }
 
@@ -228,6 +279,8 @@ class NativeResponse implements HttpResponse {
     _length = length;
     _left = length - _size;
     List<int> first = takeBody();
+    // from now on Rust tells [streamed] when the client is gone
+    if (_done != null) _request.server.watched.remove(_request.id);
     _stream = _request.server.startStream(_request, this, first);
     _unsent += first.length;
   }
@@ -270,19 +323,31 @@ class NativeResponse implements HttpResponse {
           'Content size below specified contentLength. '
           '${_length - _left} bytes written but expected $_length.',
         );
-        (_done ??= Completer<HttpResponse>()).completeError(error);
+        _done ??= Completer<HttpResponse>();
+        addError(error);
         return;
       } else {
         _request.server.endStream(stream);
       }
-      _done?.complete(this);
+      _complete();
     }
   }
 
+  /// Completes when the response is sent, or when the client is gone
+  /// (with no error, also when the handler never closes the response).
+  /// So a handler that writes from its own timer (eg. server-sent events)
+  /// can stop it: `response.done.then((_) => timer.cancel())`.
   @override
   Future<HttpResponse> get done {
-    if (_closed && _done == null) return Future<HttpResponse>.value(this);
-    return (_done ??= Completer<HttpResponse>()).future;
+    Completer<HttpResponse>? done = _done;
+    if (done == null) {
+      if (_closed || _gone) return Future<HttpResponse>.value(this);
+      done = _done = Completer<HttpResponse>();
+      // only an open response that someone waits on hears that its
+      // client left (see `NativeHttpServer.watched`)
+      if (_stream == null) _request.server.watched[_request.id] = this;
+    }
+    return done.future;
   }
 
   @override
