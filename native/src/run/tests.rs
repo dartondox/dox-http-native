@@ -1422,3 +1422,54 @@ fn websocket_pong_waiting_in_the_socket_keeps_the_client() {
             .all(|(_, c)| c.ws.as_ref().unwrap().pinged.is_none())
     );
 }
+
+/// A streamed 204 or 304 sends only its head: no chunk end, no body. The
+/// keep-alive connection then serves the next request.
+#[test]
+fn streamed_answer_with_no_body_status_keeps_the_connection() {
+    for status in [204u16, 304] {
+        let (mut core, port) = new_core(limits());
+        let mut inb = vec![0u8; 1 << 18];
+        let mut s = connect(port);
+        s.write_all(b"GET /a HTTP/1.1\r\n\r\n").unwrap();
+        let req = collect(&mut core, &mut inb, 1).pop().unwrap();
+        let mut out = Vec::new();
+        ans(
+            &mut out,
+            req.id,
+            status,
+            6,
+            b"",
+            &[&9u64.to_le_bytes()[..], b"body"].concat(),
+        );
+        ans(&mut out, 9, 0, 7, b"", b"more");
+        ans(&mut out, 9, 0, 8, b"", b"");
+        let n = core.run(&out, &mut inb, 0).unwrap();
+        // Dart is told to stop sending
+        assert!(
+            records(&inb[..n])
+                .iter()
+                .any(|r| r.id == 9 && r.kind() == STREAM_GONE)
+        );
+        s.write_all(b"GET /b HTTP/1.1\r\n\r\n").unwrap();
+        let req = collect(&mut core, &mut inb, 1).pop().unwrap();
+        out.clear();
+        ans(&mut out, req.id, 200, 0, b"", b"second");
+        core.run(&out, &mut inb, 0).unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !got.ends_with(b"second") {
+            let k = s.read(&mut buf).unwrap();
+            assert!(k > 0, "closed: {:?}", String::from_utf8_lossy(&got));
+            got.extend_from_slice(&buf[..k]);
+        }
+        let text = String::from_utf8_lossy(&got);
+        let first = text.split("HTTP/1.1 200").next().unwrap();
+        assert!(first.starts_with(&format!("HTTP/1.1 {status}")), "{text:?}");
+        assert!(first.ends_with("\r\n\r\n"), "{text:?}");
+        assert!(
+            !first.contains("body") && !first.contains("\r\n0\r\n") && !first.contains("chunked"),
+            "{text:?}"
+        );
+    }
+}

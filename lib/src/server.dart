@@ -333,6 +333,27 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   static final Pointer<NativeFinalizerFunction> _freeBody =
       Native.addressOf<NativeFinalizerFunction>(doxFreeBody);
 
+  /// Rust closed the connection of request [id] before it got an answer.
+  void _requestGone(int id) {
+    NativeResponse? res = watched[id];
+    if (res != null) return res.gone();
+    // a request of this batch: its handler already ran. When it answered
+    // (or started a stream) nothing waits, so no id is kept.
+    for (NativeRequest req in _batch) {
+      if (req.id != id) continue;
+      NativeResponse res = req.response;
+      if (!res.isClosed && !res.headSent) res.gone();
+      return;
+    }
+    // An open request of an earlier batch whose `done` is not read yet:
+    // Rust handled every answer Dart gave before this batch, so it is
+    // still live. ponytail: at most [maxGoneIds] ids, the oldest go first.
+    // Only a burst of more than that many open requests whose clients
+    // left, before their handlers read `done`, loses ids.
+    if (goneIds.length >= maxGoneIds) goneIds.remove(goneIds.first);
+    goneIds.add(id);
+  }
+
   /// The requests and messages from one `dox_run` call.
   void _onBatch(Uint8List b) {
     ByteData d = ByteData.sublistView(b);
@@ -381,13 +402,7 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
         }
         if (kind == 6) {
           // the connection of a request with no answer yet is gone
-          NativeResponse? res = watched[id];
-          if (res != null) {
-            res.gone();
-          } else {
-            if (goneIds.length >= maxGoneIds) goneIds.remove(goneIds.first);
-            goneIds.add(id);
-          }
+          _requestGone(id);
           continue;
         }
         if (kind != 0) {

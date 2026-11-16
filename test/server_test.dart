@@ -156,7 +156,9 @@ void handle(HttpRequest req) async {
       return;
     case '/flush-locked':
       res.write('first ');
+      bool before = (res as NativeResponse).headSent;
       await res.flush();
+      flushChecks.add('headSent $before ${res.headSent}');
       // the head is out: these are ignored, with no error
       res.headers.set('x-late', '1');
       res.headers.contentType = ContentType.json;
@@ -173,6 +175,16 @@ void handle(HttpRequest req) async {
       flushChecks.add(
         'ignored ${res.headers.value('x-late') == null} ${res.statusCode}',
       );
+    case '/no-body-flush':
+      // 204 has no body: flush sends the head only
+      res.statusCode = HttpStatus.noContent;
+      res.write('x');
+      await res.flush();
+      res.write('y');
+    case '/no-body-stream':
+      // 304 has no body, also when addStream passes 64 KB
+      res.statusCode = HttpStatus.notModified;
+      await res.addStream(Stream<List<int>>.value(Uint8List(70000)));
     case '/flush-error':
       // too many bytes for the content length: the Future fails
       res.contentLength = 2;
@@ -1113,9 +1125,40 @@ void main() {
         (await res.toList()).fold(0, (int n, List<int> c) => n + c.length),
         70000,
       );
-      expect(flushChecks, <String>['ignored true 200', 'ignored true 200']);
+      expect(flushChecks, <String>[
+        'headSent false true',
+        'ignored true 200',
+        'ignored true 200',
+      ]);
     },
   );
+
+  test('a streamed 204 or 304 sends no body, the connection goes on', () async {
+    for (String path in <String>['/no-body-flush', '/no-body-stream']) {
+      String out = await raw(
+        port,
+        'GET $path HTTP/1.1\r\n\r\n'
+        'GET / HTTP/1.1\r\nConnection: close\r\n\r\n',
+      );
+      List<String> answers = out.split('HTTP/1.1 ');
+      expect(answers, hasLength(3), reason: out);
+      expect(answers[1], startsWith(path == '/no-body-flush' ? '204' : '304'));
+      expect(answers[1], endsWith('\r\n\r\n'));
+      expect(answers[1], isNot(contains('chunked')));
+      expect(answers[2], endsWith('Hello World'));
+    }
+  });
+
+  test('a request answered at once keeps no gone id', () async {
+    for (int i = 0; i < 20; i++) {
+      Socket s = await Socket.connect('127.0.0.1', port);
+      s.write('GET / HTTP/1.1\r\n\r\n');
+      await s.flush();
+      s.destroy();
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+    expect(server.goneIds, isEmpty);
+  });
 
   test('flush fails its Future, it does not throw', () async {
     flushChecks.clear();

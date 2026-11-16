@@ -100,6 +100,12 @@ class NativeResponse implements HttpResponse {
   /// true after [close]
   bool get isClosed => _closed;
 
+  /// true once the status and the headers went out (a [flush], or
+  /// [addStream] past [streamAt] bytes). Then an error can not change the
+  /// status any more, and later header or status changes are ignored. A
+  /// body that is not streamed sends its head on [close].
+  bool get headSent => headers.sent;
+
   /// the body, all chunks together
   List<int> takeBody() {
     BytesBuilder? more = _more;
@@ -126,7 +132,11 @@ class NativeResponse implements HttpResponse {
     // ends a pending wait for the next chunk in [addStream]. An error of
     // the source's `onCancel` goes to [addStream], not to the zone.
     if (source != null && _cancel == null) {
-      _cancel = (_zone ?? Zone.current).run(() => _cancelSource(source));
+      // in a microtask: the source's `onCancel` (app code) does not run
+      // inside the message loop of the server
+      _cancel = (_zone ?? Zone.current).run(
+        () => Future<void>.microtask(() => _cancelSource(source))..ignore(),
+      );
     }
     _wake();
     _complete();

@@ -512,6 +512,12 @@ fn render_head(
     buf.extend_from_slice(b"\r\n");
 }
 
+/// A status whose answer never has a body: 1xx, 204 and 304. A status
+/// out of range is sent as 500, which has one.
+fn no_body(status: u16) -> bool {
+    (100..200).contains(&status) || status == 204 || status == 304
+}
+
 /// Writes a whole answer with this body.
 fn render(buf: &mut Vec<u8>, status: u16, lines: &[u8], body: &[u8], date: &[u8], w: Way) {
     render_head(buf, status, lines, b"", date, w, Len::Exact(body.len()));
@@ -2096,8 +2102,11 @@ impl Core {
                 // Dart sends `content-length` itself when it knows it. Rust
                 // counts the bytes: a wrong count closes the connection, so
                 // the rest can not look like the next answer.
+                // HEAD, 1xx, 204 and 304 have no body: only the head goes
+                // out, the connection stays usable
+                let silent = way.head || no_body(status);
                 let (len, tail) = match length_line(lines) {
-                    _ if way.head => (Len::Open, Tail::Close),
+                    _ if silent => (Len::Open, Tail::Close),
                     Some(Some(n)) => (Len::Open, Tail::Left(n)),
                     sized => {
                         if sized.is_some() || way.http10 {
@@ -2113,7 +2122,7 @@ impl Core {
                 };
                 let mut out = Vec::new();
                 render_head(&mut out, status, lines, b"", date, way, len);
-                if way.head {
+                if silent {
                     // no body: tell Dart to stop
                     s.done = true;
                     c.put(i, &out, 0);
