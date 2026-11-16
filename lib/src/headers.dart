@@ -55,14 +55,16 @@ class NativeHeaders implements HttpHeaders {
   /// counts changes, so a cache of the encoded bytes knows when it is old
   int version = 0;
 
-  /// the head of the response went out (see `NativeResponse.flush`):
-  /// a change throws, like dart:io
+  /// the head of the response went out (a flush or a streamed body): a
+  /// change is ignored, with a warning (see [warnHeadSent])
   bool sent = false;
 
-  void _checkMutable() {
-    if (!_mutable || sent) {
-      throw HttpException('HTTP headers are not mutable');
-    }
+  /// true when the change must be dropped: the head went out
+  bool _locked() {
+    if (!_mutable) throw HttpException('HTTP headers are not mutable');
+    if (!sent) return false;
+    warnHeadSent();
+    return true;
   }
 
   /// a content type set while the headers were still the defaults. They
@@ -154,7 +156,8 @@ class NativeHeaders implements HttpHeaders {
   }
 
   Map<String, List<String>> _own() {
-    _checkMutable();
+    // the head went out: the change goes nowhere
+    if (_locked()) return <String, List<String>>{};
     version++;
     if (_shared) _unshare();
     return _entries;
@@ -246,7 +249,7 @@ class NativeHeaders implements HttpHeaders {
   /// content-length is kept as a number, like dart:io.
   bool _special(String name, Object value) {
     if (name == HttpHeaders.contentLengthHeader) {
-      _checkMutable();
+      if (_locked()) return true;
       contentLength = value is int ? value : int.parse(_text(value));
       return true;
     }
@@ -283,6 +286,7 @@ class NativeHeaders implements HttpHeaders {
 
   @override
   void clear() {
+    if (_locked()) return;
     _own().clear();
     _contentLength = -1;
   }
@@ -307,7 +311,7 @@ class NativeHeaders implements HttpHeaders {
 
   @override
   set contentLength(int length) {
-    _checkMutable();
+    if (_locked()) return;
     _contentLength = length;
   }
 
@@ -327,7 +331,7 @@ class NativeHeaders implements HttpHeaders {
 
   @override
   set contentType(ContentType? type) {
-    _checkMutable();
+    if (_locked()) return;
     if (type == null) {
       removeAll(HttpHeaders.contentTypeHeader);
       return;
@@ -368,7 +372,7 @@ class NativeHeaders implements HttpHeaders {
 
   @override
   set chunkedTransferEncoding(bool chunked) {
-    _checkMutable();
+    if (_locked()) return;
     _chunked = chunked;
   }
 
@@ -474,4 +478,17 @@ class NativeHeaders implements HttpHeaders {
     });
     return sb.toString();
   }
+}
+
+bool _warnedHeadSent = false;
+
+/// Logs once per isolate that a change of the headers or the status came
+/// after the head went out, so it is ignored.
+void warnHeadSent() {
+  if (_warnedHeadSent) return;
+  _warnedHeadSent = true;
+  stderr.writeln(
+    'dox_http_native: a header or status change after the response head '
+    'was sent (flush or a streamed body) is ignored.',
+  );
 }

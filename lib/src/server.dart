@@ -203,6 +203,18 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   /// request id. Rust tells when their client is gone, then `done`
   /// completes. Other responses cost nothing here.
   final Map<int, NativeResponse> watched = <int, NativeResponse>{};
+
+  /// ids of open requests whose client left before their `done` was read.
+  /// `done` then completes at once. An id goes when its response ends. At
+  /// most [maxGoneIds] are kept (the oldest go first), for handlers that
+  /// never end their response.
+  final Set<int> goneIds = <int>{};
+
+  /// most entries of [goneIds]
+  static const int maxGoneIds = 1024;
+
+  /// false once the server is closed
+  bool get isOpen => _handle != 0;
   final StreamController<HttpRequest> _requests = StreamController<HttpRequest>(
     sync: true,
   );
@@ -300,6 +312,7 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
         res.gone();
       }
       watched.clear();
+      goneIds.clear();
       _done();
     }
   }
@@ -368,7 +381,13 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
         }
         if (kind == 6) {
           // the connection of a request with no answer yet is gone
-          watched[id]?.gone();
+          NativeResponse? res = watched[id];
+          if (res != null) {
+            res.gone();
+          } else {
+            if (goneIds.length >= maxGoneIds) goneIds.remove(goneIds.first);
+            goneIds.add(id);
+          }
           continue;
         }
         if (kind != 0) {

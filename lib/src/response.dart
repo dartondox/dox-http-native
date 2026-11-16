@@ -5,6 +5,7 @@ import 'dart:typed_data';
 
 import 'package:dox_http_native/src/headers.dart';
 import 'package:dox_http_native/src/request.dart';
+import 'package:dox_http_native/src/server.dart';
 
 /// [HttpResponse] for the native server.
 ///
@@ -29,7 +30,7 @@ class NativeResponse implements HttpResponse {
 
   @override
   set statusCode(int code) {
-    _checkHead();
+    if (_headSent()) return;
     _statusCode = code;
   }
 
@@ -38,13 +39,16 @@ class NativeResponse implements HttpResponse {
 
   @override
   set reasonPhrase(String phrase) {
-    _checkHead();
+    if (_headSent()) return;
     _reasonPhrase = phrase;
   }
 
-  /// like dart:io: the status can not change once [flush] sent the head
-  void _checkHead() {
-    if (headers.sent) throw StateError('Header already sent');
+  /// true when the head went out (a flush or a streamed body): a status
+  /// change is then ignored, with a warning once
+  bool _headSent() {
+    if (!headers.sent) return false;
+    warnHeadSent();
+    return true;
   }
 
   @override
@@ -303,6 +307,10 @@ class NativeResponse implements HttpResponse {
     if (_done != null) _request.server.watched.remove(_request.id);
     _stream = _request.server.startStream(_request, this, first);
     _unsent += first.length;
+    // the head is out: later header and status changes are ignored
+    headers.sent = true;
+    // the server is closed: nothing goes out, so no wait for room
+    if (!_request.server.isOpen) gone();
   }
 
   /// Cookie does not check its domain, so a line break there would add a
@@ -316,8 +324,10 @@ class NativeResponse implements HttpResponse {
 
   /// Sends what was added so far, like dart:io. The first flush sends the
   /// head: the body then goes out in parts (chunked, or up to the content
-  /// length when one is set), and later [add] calls go out at once. The
-  /// headers and the status can not change after it.
+  /// length when one is set), and later [add] calls go out at once. A
+  /// header or status change after it is ignored (a warning is logged
+  /// once). An error (eg. more bytes than the content length) fails the
+  /// Future.
   ///
   /// Completes when Rust has room for more (at most [window] bytes wait
   /// there), so a fast writer that awaits it keeps memory small. After
@@ -327,10 +337,13 @@ class NativeResponse implements HttpResponse {
   Future<void> flush() {
     if (_closed || _gone || _source != null) return Future<void>.value();
     if (_stream == null) {
-      _startStream();
-      headers.sent = true;
+      try {
+        _startStream();
+      } catch (e, s) {
+        return Future<void>.error(e, s);
+      }
     }
-    if (_unsent <= window) return Future<void>.value();
+    if (_gone || _unsent <= window) return Future<void>.value();
     return (_room ??= Completer<void>()).future;
   }
 
@@ -350,6 +363,12 @@ class NativeResponse implements HttpResponse {
       // checked before the response is marked closed
       if (stream == null) _checkCookies();
       _closed = true;
+      NativeHttpServer server = _request.server;
+      if (server.goneIds.isNotEmpty) server.goneIds.remove(_request.id);
+      // nothing more is sent: a waiting flush or addStream goes on (Rust
+      // tells no more sent bytes once the stream ended)
+      _unsent = 0;
+      _wake();
       if (stream == null) {
         _request.server.send(_request, this);
       } else if (_length >= 0 && _left > 0 && !_gone) {
@@ -378,6 +397,11 @@ class NativeResponse implements HttpResponse {
   Future<HttpResponse> get done {
     Completer<HttpResponse>? done = _done;
     if (done == null) {
+      // the client left before anyone read done (see `goneIds`)
+      NativeHttpServer server = _request.server;
+      if (server.goneIds.isNotEmpty && server.goneIds.remove(_request.id)) {
+        gone();
+      }
       if (_closed || _gone) return Future<HttpResponse>.value(this);
       done = _done = Completer<HttpResponse>();
       // only an open response that someone waits on hears that its

@@ -157,17 +157,49 @@ void handle(HttpRequest req) async {
     case '/flush-locked':
       res.write('first ');
       await res.flush();
-      try {
-        res.headers.set('x-late', '1');
-      } on HttpException {
-        flushChecks.add('headers locked');
-      }
-      try {
-        res.statusCode = 404;
-      } on StateError {
-        flushChecks.add('status locked');
-      }
+      // the head is out: these are ignored, with no error
+      res.headers.set('x-late', '1');
+      res.headers.contentType = ContentType.json;
+      res.statusCode = 404;
+      flushChecks.add(
+        'ignored ${res.headers.value('x-late') == null} ${res.statusCode}',
+      );
       res.write('second');
+    case '/stream-locked':
+      // addStream over 64 KB sends the head: later changes are ignored
+      await res.addStream(Stream<List<int>>.value(Uint8List(70000)));
+      res.headers.set('x-late', '1');
+      res.statusCode = 500;
+      flushChecks.add(
+        'ignored ${res.headers.value('x-late') == null} ${res.statusCode}',
+      );
+    case '/flush-error':
+      // too many bytes for the content length: the Future fails
+      res.contentLength = 2;
+      res.write('abc');
+      Future<void> flushed = res.flush(); // no throw here
+      try {
+        await flushed;
+      } on HttpException {
+        flushChecks.add('flush failed');
+      }
+      res.headers.contentLength = -1;
+    case '/flush-stranded':
+      // the client does not read: the flush waits for room. A close
+      // from another task ends the wait.
+      res.add(Uint8List(16 << 20));
+      Future<void> flushed = res.flush();
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      unawaited(res.close());
+      await flushed.timeout(const Duration(seconds: 3));
+      flushChecks.add('flush went on');
+      return;
+    case '/late-done':
+      // the client leaves before the handler reads done
+      await lateDoneGate.future;
+      await res.done.timeout(const Duration(seconds: 3));
+      flushChecks.add('late done');
+      return;
     case '/headers':
       res.headers.contentType = ContentType.json;
       res.cookies.add(Cookie('a', 'b'));
@@ -237,6 +269,7 @@ Completer<void> sseStopped = Completer<void>();
 Completer<Object> cancelError = Completer<Object>();
 Completer<void> raceDone = Completer<void>();
 List<String> flushChecks = <String>[];
+Completer<void> lateDoneGate = Completer<void>();
 
 Future<NativeHttpServer> start(int port, {int maxBodySize = 1024}) async {
   NativeHttpServer server = await NativeHttpServer.bind(
@@ -1057,10 +1090,78 @@ void main() {
     expect(flushChecks, <String>['after close ok', 'head done true']);
   });
 
-  test('after flush the headers and the status can not change', () async {
+  test(
+    'after the head went out header and status changes are ignored',
+    () async {
+      flushChecks.clear();
+      HttpClientResponse res = await (await client.get(
+        '127.0.0.1',
+        port,
+        '/flush-locked',
+      )).close();
+      expect(res.statusCode, 200);
+      expect(res.headers.value('x-late'), isNull);
+      expect(await utf8.decodeStream(res), 'first second');
+      res = await (await client.get(
+        '127.0.0.1',
+        port,
+        '/stream-locked',
+      )).close();
+      expect(res.statusCode, 200);
+      expect(res.headers.value('x-late'), isNull);
+      expect(
+        (await res.toList()).fold(0, (int n, List<int> c) => n + c.length),
+        70000,
+      );
+      expect(flushChecks, <String>['ignored true 200', 'ignored true 200']);
+    },
+  );
+
+  test('flush fails its Future, it does not throw', () async {
     flushChecks.clear();
-    expect(await get('/flush-locked'), (200, 'first second'));
-    expect(flushChecks, <String>['headers locked', 'status locked']);
+    expect(await get('/flush-error'), (200, 'abc'));
+    expect(flushChecks, <String>['flush failed']);
+  });
+
+  test('a flush that waits for room goes on after close', () async {
+    flushChecks.clear();
+    Socket s = await Socket.connect('127.0.0.1', port);
+    s.write('GET /flush-stranded HTTP/1.1\r\n\r\n');
+    await s.flush();
+    StreamSubscription<List<int>> sub = s.listen(null)..pause();
+    for (int i = 0; i < 100 && flushChecks.isEmpty; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+    expect(flushChecks, <String>['flush went on']);
+    await sub.cancel();
+    s.destroy();
+  });
+
+  test('done read after the client left completes', () async {
+    flushChecks.clear();
+    lateDoneGate = Completer<void>();
+    NativeHttpServer quick = await NativeHttpServer.bind(
+      0,
+      address: '127.0.0.1',
+      idleTimeout: const Duration(milliseconds: 300),
+    );
+    quick.listen(handle);
+    Socket s = await Socket.connect('127.0.0.1', quick.port);
+    s.write('GET /late-done HTTP/1.1\r\n\r\n');
+    await s.flush();
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+    s.destroy();
+    for (int i = 0; i < 100 && quick.goneIds.isEmpty; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    }
+    expect(quick.goneIds, hasLength(1));
+    lateDoneGate.complete();
+    for (int i = 0; i < 100 && flushChecks.isEmpty; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    }
+    expect(flushChecks, <String>['late done']);
+    expect(quick.goneIds, isEmpty);
+    await quick.close(force: true);
   });
 
   test('maxConnections: at the limit new clients wait', () async {
