@@ -124,7 +124,7 @@ const UNSENT_CAP: usize = 32 << 20;
 /// client may send `content-type: application/grpc` to any route, and a
 /// streamed body has no timeout: without this cap `max_streams` unread
 /// bodies would pin `max_streams` MiB per connection. The DATA that would
-/// pass it resets its own stream (ENHANCE_YOUR_CALM, see `data`); the
+/// pass it resets the streams that hold the most (see `evict`); the
 /// other streams go on. A gRPC handler that reads acks at once and never
 /// comes close. Same as the old cap: CONN_WINDOW.
 const UNACKED_CAP: u64 = CONN_WINDOW as u64;
@@ -349,6 +349,8 @@ pub(crate) struct H2 {
     calm: bool,
     settings_rate: Rate,
     pings_rate: Rate,
+    /// RST_STREAMs on closed streams this second (see `dispatch`)
+    closed_rsts: Rate,
     unacked_settings: u32,
     unacked_pings: u32,
     empty: u32,
@@ -429,6 +431,7 @@ impl H2 {
             calm: false,
             settings_rate: Rate::new(now),
             pings_rate: Rate::new(now),
+            closed_rsts: Rate::new(now),
             unacked_settings: 0,
             unacked_pings: 0,
             empty: 0,
@@ -749,20 +752,23 @@ impl H2 {
                 if self.state(h.id) == State::Idle {
                     return Err(conn_err(frame::PROTOCOL_ERROR));
                 }
-                // After our GOAWAY, the client's RST may cross our
-                // refusal of a stream (a proxy cancels calls it sent
-                // before it saw the GOAWAY): free, the refusal took a
-                // whole token. Only once: the id leaves our reset memory.
-                if self.away && !self.streams.contains_key(&h.id) && self.resets_set.remove(&h.id) {
-                    self.resets.retain(|&r| r != h.id);
+                // A closed stream: the RST cancels no work (eg. a proxy's
+                // cancel crossed our answer, or our refusal after GOAWAY).
+                // Up to one burst of them a second take no reset token,
+                // so a burst of them can not cut the other users of the
+                // connection. Past that each one takes a token like any
+                // reset: a flood drains, then is cut (see `spend_n`).
+                if !self.streams.contains_key(&h.id) {
+                    if self.closed_rsts.over(self.now, self.reset_burst as u32) {
+                        self.spend()?;
+                    }
                     return Ok(());
                 }
-                // also on a closed stream: it costs us the same
+                // it cancels open work: a reset token
                 self.spend()?;
                 // an open stream is remembered: a later frame on it is
-                // STREAM_CLOSED (RFC 9113 5.1). A closed id is not, so
-                // RSTs on closed ids fill nothing.
-                if self.streams.contains_key(&h.id) && !self.client_resets_set.contains(&h.id) {
+                // STREAM_CLOSED (RFC 9113 5.1)
+                if !self.client_resets_set.contains(&h.id) {
                     if self.client_resets.len() >= self.max_streams.max(RESETS)
                         && let Some(old) = self.client_resets.pop_front()
                     {
@@ -888,6 +894,12 @@ impl H2 {
             }
             return Err(conn_err(frame::STREAM_CLOSED));
         }
+        if self.unacked + data.len() as u64 > UNACKED_CAP
+            && self.streams[&id].streaming()
+            && !self.evict(id, data.len() as u64, out)
+        {
+            return Ok(()); // this stream was the biggest: it is reset
+        }
         let s = self.streams.get_mut(&id).expect("an open stream");
         let Some(r) = s.recv.as_mut() else {
             // the request is whole: no more DATA (RFC 9113 5.1)
@@ -904,14 +916,6 @@ impl H2 {
             return Err(stream_err(frame::PROTOCOL_ERROR));
         }
         if r.streamed {
-            // Too much waits for Dart on this connection: this stream
-            // goes. ENHANCE_YOUR_CALM, not FLOW_CONTROL_ERROR: the client
-            // kept to its windows, it only sends more than the server
-            // takes (gRPC maps it to RESOURCE_EXHAUSTED). The reset frees
-            // its bytes (`drop_stream`) and counts as a reset (`step`).
-            if self.unacked + data.len() as u64 > UNACKED_CAP {
-                return Err(stream_err(frame::ENHANCE_YOUR_CALM));
-            }
             // to Dart at once. The stream window comes back on Dart's
             // ack, the padding now (Dart never sees it). The connection
             // window comes back now (`settle`).
@@ -978,6 +982,33 @@ impl H2 {
             r.window = STREAM_WINDOW;
         }
         Ok(())
+    }
+
+    /// `n` more streamed bytes for stream `id` would pass UNACKED_CAP:
+    /// resets the streams that hold the most unacked bytes (ties: the
+    /// oldest) until they fit. So one user of a proxy connection that
+    /// pins the cap with slow handlers loses its own streams, not the
+    /// next user's. ENHANCE_YOUR_CALM, not FLOW_CONTROL_ERROR: the client
+    /// kept to its windows, it only sends more than the server takes
+    /// (gRPC maps it to RESOURCE_EXHAUSTED). No reset token: the client
+    /// broke no rule, and each such stream cost it a full window. False
+    /// when stream `id` itself was reset.
+    fn evict(&mut self, id: u32, n: u64, out: &mut Vec<u8>) -> bool {
+        while self.unacked + n > UNACKED_CAP {
+            let Some((&victim, _)) = self
+                .streams
+                .iter()
+                .filter(|(_, s)| s.owed > 0)
+                .max_by_key(|(sid, s)| (s.owed, std::cmp::Reverse(**sid)))
+            else {
+                break; // nothing to free (can not happen: n <= MAX_FRAME)
+            };
+            self.reset(out, victim, frame::ENHANCE_YOUR_CALM);
+            if victim == id {
+                return false;
+            }
+        }
+        true
     }
 
     fn window_update(&mut self, id: u32, inc: u32) -> Result<(), Error> {

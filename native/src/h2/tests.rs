@@ -2912,40 +2912,109 @@ mod conn {
         goaway(&fs, frame::ENHANCE_YOUR_CALM);
     }
 
-    /// RST_STREAM on closed ids counts toward the limit, and does not push
-    /// the ids we reset out of the reset memory.
+    /// RST_STREAM on closed ids cancels no work: up to one burst a second
+    /// takes no reset token, so many at once (a proxy's cancels that
+    /// crossed our answers) do not cut the connection. More take a token
+    /// each. They do not push the ids we reset out of the reset memory.
     #[test]
     fn attack_rst_stream_on_closed_ids() {
         let mut c = Client::with_max(250, 1);
         // stream 1 gets 413 and our reset: its late DATA must be ignored
         c.send(frame::HEADERS, frame::END_HEADERS, 1, &post(5));
         c.get(3, GET);
+        c.get(5, GET); // another user's open request
         c.answer(0, 200, b"", b"");
         assert_eq!(c.h2.resets.len(), 1);
-        // the 413 took one token: 999 are left (an empty answer gives
-        // nothing back)
-        for _ in 0..999 {
+        let tokens = c.h2.reset_bucket.tokens;
+        // 2 x the burst in one second would have cut before: now the
+        // first burst is free
+        for _ in 0..1000 {
             assert!(
                 c.send(frame::RST_STREAM, 0, 3, &8u32.to_be_bytes())
                     .is_empty()
             );
         }
+        assert_eq!(c.h2.reset_bucket.tokens, tokens, "no token taken");
         assert_eq!(c.h2.resets.len(), 1, "client resets are not remembered");
         assert!(c.h2.client_resets.is_empty());
         assert!(c.send(frame::DATA, 0, 1, b"late").is_empty());
-        let fs = c.send(frame::RST_STREAM, 0, 3, &8u32.to_be_bytes());
-        calm(&c, &fs);
-        // RSTs that go on after the GOAWAY: cut after one more burst
-        for _ in 0..999 {
+        // the next second: another burst is fine
+        next_second(&mut c);
+        for _ in 0..1000 {
             assert!(
                 c.send(frame::RST_STREAM, 0, 3, &8u32.to_be_bytes())
                     .is_empty()
             );
         }
-        goaway(
-            &c.send(frame::RST_STREAM, 0, 3, &8u32.to_be_bytes()),
-            frame::ENHANCE_YOUR_CALM,
+        assert!(!c.h2.away);
+        // over one burst in one second: each takes a token, so a flood
+        // drains the connection (the open request 5 still finishes)
+        let mut n = 0;
+        let fs = loop {
+            let fs = c.send(frame::RST_STREAM, 0, 3, &8u32.to_be_bytes());
+            n += 1;
+            if !fs.is_empty() {
+                break fs;
+            }
+            assert!(n < 5000);
+        };
+        calm(&c, &fs);
+        assert!(n > 900, "{n}");
+        assert!(!c.h2.over(), "stream 5 is open");
+    }
+
+    /// After our GOAWAY a proxy cancels the calls it sent before it saw
+    /// it: their RSTs cross our REFUSED_STREAM and take no token.
+    #[test]
+    fn rst_after_our_refusal_is_free() {
+        let mut c = Client::new(250);
+        c.get(1, GET);
+        let mut out = Vec::new();
+        c.h2.drain(&mut out);
+        let before = c.h2.reset_bucket.tokens;
+        for i in 0..300u32 {
+            let id = 3 + 2 * i;
+            assert_eq!(code(&c.get(id, GET)), frame::REFUSED_STREAM);
+            assert!(
+                c.send(frame::RST_STREAM, 0, id, &8u32.to_be_bytes())
+                    .is_empty()
+            );
+        }
+        // each refusal took a token, the RSTs took none
+        assert_eq!(c.h2.reset_bucket.tokens, before - 300.0);
+        assert!(!c.h2.dead);
+        assert!(!c.answer(0, 200, b"", b"a").is_empty());
+        assert!(c.h2.over());
+    }
+
+    /// A `:path` that is not origin form is malformed (RFC 9113 8.3.1):
+    /// RST_STREAM PROTOCOL_ERROR, Dart never sees it, the connection goes
+    /// on. `*` is only for OPTIONS.
+    #[test]
+    fn a_path_without_a_slash_is_rejected() {
+        let mut c = Client::new(250);
+        let mut id = 1;
+        for (m, path) in [
+            ("GET", "admin"),
+            ("GET", "*"),
+            ("POST", "a/b"),
+            ("GET", "http://x/"),
+        ] {
+            let fs = c.get(id, &[(":method", m), (":scheme", "http"), (":path", path)]);
+            assert_eq!(kinds(&fs), rst(id, frame::PROTOCOL_ERROR), "{path}");
+            assert_eq!(code(&fs), frame::PROTOCOL_ERROR);
+            id += 2;
+        }
+        assert!(c.recs.is_empty());
+        assert!(!c.h2.over());
+        let fs = c.get(
+            id,
+            &[(":method", "OPTIONS"), (":scheme", "http"), (":path", "*")],
         );
+        assert!(fs.is_empty());
+        assert_eq!(record(&c.recs[0]).2, "*");
+        assert!(c.get(id + 2, GET).is_empty());
+        assert_eq!(c.recs.len(), 2);
     }
 
     /// SETTINGS flood: at most 10 whose ACK is not written yet, and at
@@ -3197,11 +3266,13 @@ mod conn {
             assert_eq!(c.recs.len(), 250, "Dart work stays bounded");
         }
         // The bucket holds 1000. The 250 resets take 250. Each later round
-        // takes 1 for the reset of the refused id and 0.25 for the refusal
-        // itself (the zombies fill the slots, see ZOMBIE_REFUSAL_COST):
-        // 1.25 per round, so the cut comes after about 600 rounds.
+        // takes 0.25 for the refusal (the zombies fill the slots, see
+        // ZOMBIE_REFUSAL_COST). Its RST is on a closed id: free for the
+        // first 1000 in a second, then 1 token each. So 1000 rounds take
+        // 250, then 1.25 a round: the drain comes about 400 rounds later.
+        // Dart never gets more than 250 requests either way.
         assert!(
-            cut.is_some_and(|i| (800..900).contains(&i)),
+            cut.is_some_and(|i| (1600..1700).contains(&i)),
             "cut at {cut:?}"
         );
         assert_eq!(c.recs.len(), 250);
@@ -3957,8 +4028,8 @@ mod conn {
     /// the stream window waits for Dart's ack. 16 unread 1 MiB gRPC bodies
     /// (eg. to a slow route that never reads) used to hold the whole
     /// connection window, and every other upload on the connection froze.
-    /// The unacked bytes stay capped (UNACKED_CAP): the DATA that would
-    /// pass it resets only its own stream.
+    /// The unacked bytes stay capped (UNACKED_CAP): the stream that holds
+    /// the most (ties: the oldest) is reset to make room.
     #[test]
     fn unread_streamed_bodies_do_not_hold_the_connection_window() {
         let mut c = Client::new(250);
@@ -3979,17 +4050,16 @@ mod conn {
                 // no stream window comes back: Dart did not ack
                 assert!(updates(&fs).iter().all(|u| u.0 == 0));
                 conn_back += updates(&fs).iter().map(|u| u64::from(u.1)).sum::<u64>();
-                if let Some(f) = fs.iter().find(|f| f.0.kind == frame::RST_STREAM) {
-                    assert_eq!(f.0.id, id);
+                for f in fs.iter().filter(|f| f.0.kind == frame::RST_STREAM) {
                     assert_eq!(code(std::slice::from_ref(f)), frame::ENHANCE_YOUR_CALM);
-                    cut.push(id);
+                    cut.push(f.0.id);
                 }
             }
             assert!(c.h2.unacked <= UNACKED_CAP);
         }
-        // the first 16 fill the cap exactly, each later one is reset at
-        // its first DATA; the 16 stay open
-        assert_eq!(cut, [33, 35, 37, 39]);
+        // the first 16 fill the cap exactly; each later stream makes
+        // room by resetting the oldest full one. The newest 16 stay open.
+        assert_eq!(cut, [1, 3, 5, 7]);
         assert_eq!(c.h2.unacked, UNACKED_CAP);
         assert_eq!(c.h2.open(), 16);
         assert!(conn_back >= 15 << 20, "{conn_back}");
@@ -4000,7 +4070,7 @@ mod conn {
             .filter(|p| p.1 == crate::BODY_END)
             .map(|p| (p.0, p.2))
             .collect();
-        assert_eq!(ends, [(16, 1), (17, 1), (18, 1), (19, 1)]);
+        assert_eq!(ends, [(0, 1), (1, 1), (2, 1), (3, 1)]);
         // a JSON POST on the same connection still comes through
         let body = vec![b'{'; 300_000];
         c.send(frame::HEADERS, frame::END_HEADERS, 101, &post(body.len()));
@@ -4016,15 +4086,74 @@ mod conn {
         assert_eq!(c.bodies.last().map(|b| b.len()), Some(body.len()));
         // an ack gives the stream window back (gRPC backpressure) and
         // frees room under the cap
-        let fs = ack(&mut c, 0, 1 << 20);
-        assert_eq!(updates(&fs), [(1, 1 << 20)]);
+        let fs = ack(&mut c, 4, 1 << 20);
+        assert_eq!(updates(&fs), [(9, 1 << 20)]);
         assert_eq!(c.h2.unacked, UNACKED_CAP - (1 << 20));
         // an over-ack frees at most what is owed
-        ack(&mut c, 0, u64::MAX);
+        ack(&mut c, 4, u64::MAX);
         assert_eq!(c.h2.unacked, UNACKED_CAP - (1 << 20));
         // a dropped stream frees what was never acked
-        c.send(frame::RST_STREAM, 0, 3, &8u32.to_be_bytes());
+        c.send(frame::RST_STREAM, 0, 11, &8u32.to_be_bytes());
         assert_eq!(c.h2.unacked, UNACKED_CAP - (2 << 20));
+    }
+
+    /// One user of a proxy connection pins the cap with 16 slow gRPC
+    /// calls. Another user's call that sends data then resets the
+    /// biggest pinned stream, not its own: it goes on.
+    #[test]
+    fn the_cap_resets_the_biggest_stream_not_the_newcomer() {
+        let mut c = Client::new(250);
+        let big = vec![3u8; 16_384];
+        for k in 0..16u32 {
+            let id = 2 * k + 1;
+            c.send(
+                frame::HEADERS,
+                frame::END_HEADERS,
+                id,
+                &grpc("application/grpc"),
+            );
+            // stream 1 holds a bit less: the oldest is not the biggest
+            let frames = if k == 0 { 63 } else { 64 };
+            for _ in 0..frames {
+                c.send(frame::DATA, 0, id, &big);
+            }
+        }
+        // a small one fills the cap exactly
+        c.send(
+            frame::HEADERS,
+            frame::END_HEADERS,
+            33,
+            &grpc("application/grpc"),
+        );
+        c.send(frame::DATA, 0, 33, &big);
+        assert_eq!(c.h2.unacked, UNACKED_CAP);
+        // the legit call: its handler reads
+        c.send(
+            frame::HEADERS,
+            frame::END_HEADERS,
+            101,
+            &grpc("application/grpc"),
+        );
+        let mut cut = Vec::new();
+        for _ in 0..200 {
+            let fs = c.send(frame::DATA, 0, 101, &big);
+            cut.extend(
+                fs.iter()
+                    .filter(|f| f.0.kind == frame::RST_STREAM)
+                    .map(|f| f.0.id),
+            );
+            for (seq, kind, _, data) in to_dart(&mut c) {
+                if seq == 17 && kind == crate::BODY_PART {
+                    ack(&mut c, seq, data.len() as u64);
+                }
+            }
+            assert!(c.h2.unacked <= UNACKED_CAP);
+        }
+        // one full attacker stream went (the oldest of the full ones);
+        // the legit call never did
+        assert_eq!(cut, [3]);
+        assert!(c.h2.streams.contains_key(&101));
+        assert!(c.h2.streams.contains_key(&1) && c.h2.streams.contains_key(&33));
     }
 
     /// A gRPC client whose handlers read (ack) at once never comes near
