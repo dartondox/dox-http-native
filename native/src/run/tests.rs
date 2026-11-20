@@ -1626,3 +1626,64 @@ fn http2_pings_do_not_keep_a_blocked_window_alive() {
     }
     assert_eq!(core.conns.len(), 0, "closed");
 }
+
+/// A connection with an open body and a GOAWAY error that can not be
+/// written (the client does not read): the body timer must not run again
+/// and again. The send stall closes the connection in the end.
+#[test]
+fn http2_dead_connection_with_an_open_body_does_not_spin() {
+    use crate::h2::frame;
+    use crate::h2::hpack::encode_field;
+    let (mut core, port) = new_core(Limits {
+        timeout: Duration::from_secs(5),
+        ..limits()
+    });
+    let mut inb = vec![0u8; 1 << 18];
+    let mut req = PREFACE.to_vec();
+    frame::write(&mut req, frame::SETTINGS, 0, 0, b"");
+    let mut block = Vec::new();
+    for (n, v) in [
+        (":method", "POST"),
+        (":scheme", "http"),
+        (":path", "/"),
+        ("content-length", "10"),
+    ] {
+        encode_field(n.as_bytes(), v.as_bytes(), &mut block);
+    }
+    frame::write_headers(&mut req, 1, &block, false, 16 * 1024);
+    frame::write(&mut req, frame::DATA, 0, 1, b"abc");
+    let mut s = connect(port);
+    s.write_all(&req).unwrap();
+    for _ in 0..20 {
+        core.run(&[], &mut inb, 0).unwrap();
+        if core
+            .conns
+            .iter()
+            .any(|(_, c)| c.h2.as_ref().is_some_and(|h| h.open() == 1))
+        {
+            break;
+        }
+    }
+    // a bad frame (WINDOW_UPDATE on a stream that never was) makes the
+    // connection dead, and GOAWAY waits in a write buffer that is full
+    let (idx, _) = core.conns.iter().next().unwrap();
+    let c = core.conns.get_mut(idx).unwrap();
+    let mut bad = Vec::new();
+    frame::write(&mut bad, frame::WINDOW_UPDATE, 0, 99, &1u32.to_be_bytes());
+    let (mut pos, mut seq) = (0, 7);
+    let now = Instant::now();
+    let h2 = c.h2.as_mut().unwrap();
+    h2.step(&bad, &mut pos, &mut c.wbuf, &mut seq, b"", now);
+    c.wbuf.extend(vec![0u8; 64 << 20]);
+    c.stuck = Some(now);
+    core.arm_timer(idx);
+    let (_, c) = core.conns.iter().next().unwrap();
+    assert!(c.h2.as_ref().unwrap().over(), "the connection is dead");
+    assert!(c.pending() > 0, "GOAWAY waits");
+    // after the body timeout: the timers return (no loop)
+    after(&mut core, &mut inb, Duration::from_secs(6));
+    assert_eq!(core.conns.len(), 1, "too early");
+    // the send stall closes it
+    after(&mut core, &mut inb, SEND_WAIT + Duration::from_secs(6));
+    assert_eq!(core.conns.len(), 0, "closed");
+}

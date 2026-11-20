@@ -31,6 +31,7 @@ pub(crate) const FLOW_CONTROL_ERROR: u32 = 0x3;
 pub(crate) const STREAM_CLOSED: u32 = 0x5;
 pub(crate) const FRAME_SIZE_ERROR: u32 = 0x6;
 pub(crate) const REFUSED_STREAM: u32 = 0x7;
+pub(crate) const CANCEL: u32 = 0x8;
 pub(crate) const COMPRESSION_ERROR: u32 = 0x9;
 pub(crate) const ENHANCE_YOUR_CALM: u32 = 0xb;
 

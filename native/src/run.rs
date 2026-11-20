@@ -409,6 +409,8 @@ enum Feed {
 enum Due {
     Linger,
     Body,
+    /// HTTP/2: a request body got no bytes for the body timeout
+    H2Body,
     Head,
     Ws,
     Send,
@@ -563,6 +565,30 @@ fn external(data: Vec<u8>) -> [u8; 24] {
     out[8..16].copy_from_slice(&token.to_le_bytes());
     out[16..].copy_from_slice(&len.to_le_bytes());
     out
+}
+
+/// The size of a record whose body was read apart from its head (see
+/// [put_body]).
+fn body_size(rec: usize, body: usize) -> usize {
+    rec + if body >= EXTERNAL_MIN { 24 } else { body }
+}
+
+/// Writes a record whose body was read apart: `rec` (head, method,
+/// target, headers) with the id and the body. A big body goes to Dart
+/// without a copy (see [external]). `out` is [body_size] bytes.
+fn put_body(out: &mut [u8], rec: &[u8], body: Vec<u8>, id: u64) {
+    let rl = rec.len();
+    out[..rl].copy_from_slice(rec);
+    out[0..8].copy_from_slice(&id.to_le_bytes());
+    if body.len() >= EXTERNAL_MIN {
+        let flags = rd32(out, 8) as u32 | 4;
+        out[8..12].copy_from_slice(&flags.to_le_bytes());
+        out[20..24].copy_from_slice(&24u32.to_le_bytes());
+        out[rl..].copy_from_slice(&external(body));
+    } else {
+        out[20..24].copy_from_slice(&(body.len() as u32).to_le_bytes());
+        out[rl..].copy_from_slice(&body);
+    }
 }
 
 /// Frees the external body of a record Dart never got.
@@ -980,7 +1006,14 @@ impl Conn {
         }
         self.sniff = false;
         self.rpos += PREFACE.len();
-        self.h2 = Some(H2::new(idx, self.peer, lim.max_streams, &mut self.wbuf));
+        let max = (lim.body, lim.multipart);
+        self.h2 = Some(H2::new(
+            idx,
+            self.peer,
+            lim.max_streams,
+            max,
+            &mut self.wbuf,
+        ));
         false
     }
 
@@ -1033,14 +1066,15 @@ impl Conn {
         }
         if let Some(h2) = self.h2.as_mut() {
             loop {
-                if let Some(rec) = h2.held.take() {
-                    if inb.len() - *n < rec.len() {
-                        let size = rec.len();
-                        h2.held = Some(rec);
+                if let Some((rec, body)) = h2.held.take() {
+                    let size = body_size(rec.len(), body.len());
+                    if inb.len() - *n < size {
+                        h2.held = Some((rec, body));
                         return Err(size);
                     }
-                    inb[*n..*n + rec.len()].copy_from_slice(&rec);
-                    *n += rec.len();
+                    let id = u64::from_le_bytes(rec[..8].try_into().unwrap());
+                    put_body(&mut inb[*n..*n + size], &rec, body, id);
+                    *n += size;
                     self.since = now;
                 }
                 if self.wbuf.len() - self.wpos >= MAX_PENDING {
@@ -1053,6 +1087,7 @@ impl Conn {
                     &mut self.wbuf,
                     seq,
                     date,
+                    now,
                 ) {
                     break;
                 }
@@ -1075,26 +1110,14 @@ impl Conn {
                     }
                     Feed::Whole => {
                         let b = self.body.as_mut().unwrap();
-                        let ext = b.data.len() >= EXTERNAL_MIN;
-                        let size = b.rec.len() + if ext { 24 } else { b.data.len() };
+                        let size = body_size(b.rec.len(), b.data.len());
                         if inb.len() - *n < size {
                             return Err(size);
                         }
                         let mut b = self.body.take().unwrap();
                         let id = ((idx as u64) << 32) | u64::from(*seq);
-                        let out = &mut inb[*n..*n + size];
-                        let rl = b.rec.len();
-                        out[..rl].copy_from_slice(&b.rec);
-                        out[0..8].copy_from_slice(&id.to_le_bytes());
-                        if ext {
-                            let flags = rd32(out, 8) as u32 | 4;
-                            out[8..12].copy_from_slice(&flags.to_le_bytes());
-                            out[20..24].copy_from_slice(&24u32.to_le_bytes());
-                            out[rl..].copy_from_slice(&external(std::mem::take(&mut b.data)));
-                        } else {
-                            out[20..24].copy_from_slice(&(b.data.len() as u32).to_le_bytes());
-                            out[rl..].copy_from_slice(&b.data);
-                        }
+                        let data = std::mem::take(&mut b.data);
+                        put_body(&mut inb[*n..*n + size], &b.rec, data, id);
                         *n += size;
                         let mut slot = std::mem::take(&mut b.slot);
                         slot.seq = *seq;
@@ -1165,7 +1188,7 @@ impl Conn {
 
 /// A length: ASCII digits only, with spaces or tabs around. Not `+5`, not
 /// `5, 5`, not other white space.
-fn parse_len(v: &[u8]) -> Option<u64> {
+pub(crate) fn parse_len(v: &[u8]) -> Option<u64> {
     let v = v.trim_ascii();
     if v.is_empty() || !v.iter().all(u8::is_ascii_digit) {
         return None;
@@ -1177,7 +1200,7 @@ fn parse_len(v: &[u8]) -> Option<u64> {
 
 /// The `content-length` of Dart's header lines: None when there is none,
 /// Some(None) when it is not a number.
-fn length_line(lines: &[u8]) -> Option<Option<u64>> {
+pub(crate) fn length_line(lines: &[u8]) -> Option<Option<u64>> {
     lines.split(|&c| c == b'\n').find_map(|line| {
         let at = line.iter().position(|&c| c == b':')?;
         line[..at]
@@ -1616,6 +1639,11 @@ impl Core {
                 let id = ((idx as u64) << 32) | u64::from(seq);
                 self.msgs.push(id, REQUEST_GONE, 0, b"");
             }
+            for sid in h2.streamed() {
+                if self.streams.remove(&sid).is_some() {
+                    self.msgs.push(sid, STREAM_GONE, 0, b"");
+                }
+            }
         }
         if let Some(ws) = c.ws {
             self.wss.remove(&ws.id);
@@ -1669,6 +1697,11 @@ impl Core {
                 Some((at, what)) if at <= now => match what {
                     Due::Body => {
                         c.fail(408, &self.date.1);
+                        self.service(idx);
+                    }
+                    Due::H2Body => {
+                        let h2 = c.h2.as_mut().unwrap();
+                        h2.expire(now, limits.timeout, SEND_WAIT, &self.date.1, &mut c.wbuf);
                         self.service(idx);
                     }
                     Due::Ping => {
@@ -1879,7 +1912,7 @@ impl Core {
         let data = c.h2.as_ref().map_or(0, |h| h.data_sent);
         loop {
             if let Some(h2) = c.h2.as_mut() {
-                h2.send(&mut c.wbuf, c.wpos);
+                h2.send(&mut c.wbuf, c.wpos, c.written, &mut c.marks);
             }
             if c.pending() > 0 && !c.flush() {
                 self.kill(idx);
@@ -1891,9 +1924,15 @@ impl Core {
             }
         }
         if let Some(h2) = c.h2.as_mut() {
+            h2.stall_mark(now);
             for seq in h2.gone.drain(..) {
                 let id = ((idx as u64) << 32) | u64::from(seq);
                 self.msgs.push(id, REQUEST_GONE, 0, b"");
+            }
+            for sid in h2.gone_streams.drain(..) {
+                if self.streams.remove(&sid).is_some() {
+                    self.msgs.push(sid, STREAM_GONE, 0, b"");
+                }
             }
             c.shut |= h2.over();
         }
@@ -2148,8 +2187,15 @@ impl Core {
             match kind & 0xff {
                 0 if zip => {}
                 0 => h2.answer(seq, status, lines, body, date, &mut c.wbuf),
-                // 2b: streamed answers on HTTP/2 (and a WebSocket can not
-                // come: the request never has flag bit 1)
+                6 if body.len() >= 8 => {
+                    let sid = u64::from_le_bytes(body[..8].try_into().unwrap());
+                    if h2.start(seq, status, lines, sid, &body[8..], date, &mut c.wbuf) {
+                        self.streams.insert(sid, (idx, seq));
+                    } else {
+                        self.msgs.push(sid, STREAM_GONE, 0, b""); // Dart stops
+                    }
+                }
+                // a WebSocket can not come: the request never has flag bit 1
                 _ => h2.refuse(seq, &mut c.wbuf),
             }
             self.touch(idx);
@@ -2170,7 +2216,7 @@ impl Core {
                     h2: true,
                 };
                 self.zip(job);
-            } else if kind & 0xff != 0 {
+            } else if kind & 0xff == 1 {
                 self.answer_gone(kind, body);
             }
             return;
@@ -2322,6 +2368,14 @@ impl Core {
         let Some(c) = self.conns.get_mut(idx) else {
             return;
         };
+        if let Some(h2) = c.h2.as_mut() {
+            if end {
+                self.streams.remove(&sid);
+            }
+            h2.part(seq, data, end, ok, &mut c.wbuf);
+            self.touch(idx);
+            return;
+        }
         let Some(i) = c.slots.iter().position(|s| s.seq == seq) else {
             return;
         };
@@ -2568,8 +2622,8 @@ impl Core {
             let c = &mut self.conns[idx];
             c.queued = false;
             self.ready.pop_front();
-            if c.eof || c.body.as_ref().is_some_and(|b| b.last == self.now) {
-                self.arm_timer(idx); // `Due::Gone` or `Due::Body`
+            if c.eof || c.h2.is_some() || c.body.as_ref().is_some_and(|b| b.last == self.now) {
+                self.arm_timer(idx); // `Due::Gone`, `Due::Body` or `Due::H2Body`
             }
             self.service(idx);
         }
@@ -2679,6 +2733,18 @@ impl Conn {
             && !b.whole
         {
             return Some((b.last + limits.timeout, Due::Body));
+        }
+        // HTTP/2: the body timeout of the stream that waits longest, unless
+        // the send stall comes first
+        let h2_due = self.h2.as_ref().and_then(|h| {
+            let body = h.body_since().map(|t| t + limits.timeout);
+            let stall = h.stall_since().map(|t| t + SEND_WAIT);
+            body.into_iter().chain(stall).min()
+        });
+        if let Some(t) = h2_due
+            && self.stuck.is_none_or(|s| t <= s + SEND_WAIT)
+        {
+            return Some((t, Due::H2Body));
         }
         // a write makes no progress: the client does not read
         if let Some(t) = self.stuck {
@@ -3851,18 +3917,27 @@ pub mod fuzz {
     }
 
     /// Feeds `stream` (after the preface) to one `Conn` with HTTP/2 on,
-    /// cut at `cuts`. With `answer`, Dart answers each request at once
-    /// with a body of that many bytes.
-    fn drive_h2(stream: &[u8], cuts: &[usize], small: usize, answer: Option<usize>) -> H2Seen {
+    /// cut at `cuts`. Request bodies may have `max` bytes. With `answer`,
+    /// Dart answers each request at once with a body of that many bytes:
+    /// whole (kind 0) or streamed in 3 parts (kind 6, 7, 8), in turn.
+    fn drive_h2(
+        stream: &[u8],
+        cuts: &[usize],
+        small: usize,
+        max: usize,
+        answer: Option<usize>,
+    ) -> H2Seen {
         let lim = Limits {
             http2: true,
             max_streams: 8,
+            body: max,
+            multipart: 2 * max,
             ..default_limits()
         };
         let now = Instant::now();
         let mut c = Conn::new(sock(), PEER, now);
         c.sniff = true;
-        let (mut seq, mut fed, mut need) = (0u32, 0, 0);
+        let (mut seq, mut fed, mut need, mut streamed) = (0u32, 0, 0, 0u64);
         let mut seen = H2Seen {
             recs: Vec::new(),
             out: Vec::new(),
@@ -3886,9 +3961,10 @@ pub mod fuzz {
                 let mut p = 0;
                 while p < n {
                     let (rec, len) = decode(&inb[p..n]);
-                    assert_eq!(rec.flags, 8, "flag bit 3, nothing else");
+                    // flag bit 3, and bit 2 for a big body
+                    assert_eq!(rec.flags & !4, 8, "flags {}", rec.flags);
                     assert!(!rec.method.is_empty() && !rec.target.is_empty());
-                    assert!(rec.target.is_ascii() && rec.body.is_empty());
+                    assert!(rec.target.is_ascii() && rec.body.len() <= 2 * max);
                     for (name, value) in &rec.headers {
                         assert!(!name.iter().any(u8::is_ascii_uppercase), "{name:?}");
                         assert!(!value.iter().any(|&b| b == 0 || b == b'\r' || b == b'\n'));
@@ -3896,7 +3972,13 @@ pub mod fuzz {
                     let id = u64::from_le_bytes(inb[p..p + 8].try_into().unwrap());
                     if let (Some(size), Some(h2)) = (answer, c.h2.as_mut()) {
                         let body = vec![b'x'; size];
-                        h2.answer(id as u32, 200, b"X-A: 1\r\n", &body, date, &mut c.wbuf);
+                        let (seq, w) = (id as u32, &mut c.wbuf);
+                        if seq % 2 == 0 {
+                            h2.answer(seq, 200, b"X-A: 1\r\n", &body, date, w);
+                        } else if h2.start(seq, 200, b"", id, &body[..size / 3], date, w) {
+                            h2.part(seq, &body[size / 3..], false, true, w);
+                            h2.part(seq, b"", true, seq % 4 == 1, w);
+                        }
                     }
                     seen.recs.push(rec);
                     p += len;
@@ -3909,13 +3991,18 @@ pub mod fuzz {
                 // write all that may go: the client reads everything
                 if let Some(h2) = c.h2.as_mut() {
                     loop {
-                        h2.send(&mut c.wbuf, c.wpos);
+                        h2.send(&mut c.wbuf, c.wpos, c.written, &mut c.marks);
+                        c.written += c.wbuf.len() as u64;
                         seen.out.append(&mut c.wbuf);
                         if !h2.can_send() {
                             break;
                         }
                     }
+                    // STREAM_SENT: never more bytes than the answers have
+                    streamed += c.marks.drain(..).map(|m| m.2).sum::<u64>();
+                    assert!(streamed <= (answer.unwrap_or(0) * seen.recs.len()) as u64);
                     h2.gone.clear();
+                    h2.gone_streams.clear();
                 }
                 c.paused = false;
                 if need == 0 && (seen.recs.len(), c.rpos) == before {
@@ -3959,10 +4046,10 @@ pub mod fuzz {
 
     /// HTTP/2: random bytes after the preface and an empty SETTINGS, so
     /// most of them are frames. Byte 0 picks the read pieces, byte 1 the
-    /// room in Dart's buffer, byte 2 the answer size. When Dart does not
-    /// answer, the output hangs only on the bytes, not on how they came
-    /// in: all at once or in pieces must give the same. With answers, the
-    /// frames must be valid.
+    /// room in Dart's buffer, byte 2 the answer size and the body limit.
+    /// When Dart does not answer, the output hangs only on the bytes, not
+    /// on how they came in: all at once or in pieces must give the same.
+    /// With answers, the frames must be valid.
     pub fn h2_conn(data: &[u8]) {
         let [seed, small, size, rest @ ..] = data else {
             return;
@@ -3971,7 +4058,8 @@ pub mod fuzz {
         crate::h2::frame::write(&mut stream, crate::h2::frame::SETTINGS, 0, 0, b"");
         stream.extend_from_slice(rest);
         let big = REQ_HEAD + 4 * stream.len() + MAX_HEAD;
-        let want = drive_h2(&stream, &[stream.len()], big, None);
+        let max = usize::from(*size) * 256;
+        let want = drive_h2(&stream, &[stream.len()], big, max, None);
         check_h2_out(&want.out);
         let mut cuts = Vec::new();
         let (mut end, mut rng) = (0, u32::from(*seed) | 1);
@@ -3985,11 +4073,11 @@ pub mod fuzz {
             (&cuts[..], big, "in pieces"),
             (&cuts[..], small, "in pieces, small buffer"),
         ] {
-            assert_eq!(drive_h2(&stream, cuts, room, None), want, "{what}");
+            assert_eq!(drive_h2(&stream, cuts, room, max, None), want, "{what}");
         }
         let size = usize::from(*size) * 1024;
         for cuts in [&[stream.len()][..], &cuts[..]] {
-            let seen = drive_h2(&stream, cuts, big, Some(size));
+            let seen = drive_h2(&stream, cuts, big, max, Some(size));
             check_h2_out(&seen.out);
         }
     }
