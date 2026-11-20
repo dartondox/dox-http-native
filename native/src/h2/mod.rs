@@ -50,6 +50,10 @@ const MAX_FRAME_LIMIT: u32 = (1 << 24) - 1;
 /// Answer bytes in the write buffer before more DATA frames are added.
 /// The rest waits in its stream, so the buffer stays small and the
 /// streams take turns.
+/// How many full-size uploads one connection may hold at once. The memory
+/// stays bounded at this many times one HTTP/1.1 connection.
+const BODY_STREAMS_CAP: usize = 4;
+
 const HOLD: usize = 64 * 1024;
 /// Request flag bit 3: the request came over HTTP/2.
 const FLAG_H2: u32 = 8;
@@ -508,10 +512,10 @@ impl H2 {
             self.drop_stream(id);
             return Ok(());
         }
-        // all bodies of the connection together: the same bound as one
-        // HTTP/1.1 connection. Dart has not seen this request, so the
-        // client may retry it.
-        if self.buffered + data.len() > self.max_body.max(self.max_multipart) {
+        // all bodies of the connection together: BODY_STREAMS_CAP full-size
+        // uploads at once. Dart has not seen this request, so the client
+        // may retry it.
+        if self.buffered + data.len() > BODY_STREAMS_CAP * self.max_body.max(self.max_multipart) {
             self.reset(out, id, frame::REFUSED_STREAM);
             return Ok(());
         }
@@ -960,6 +964,7 @@ impl H2 {
             let flags = if end { frame::END_STREAM } else { 0 };
             frame::write(out, frame::DATA, flags, id, &s.body[s.sent..s.sent + k]);
             s.sent += k;
+            s.stalled = None; // bytes moved: the stall clock starts again
             self.data_sent += k as u64;
             s.window -= k as i64;
             self.window -= k as i64;

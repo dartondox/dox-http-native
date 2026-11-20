@@ -2187,35 +2187,40 @@ mod conn {
         assert!(!c.h2.over());
     }
 
-    /// All bodies of one connection together stay under the bound: the
-    /// stream that goes over it is refused (RST_STREAM REFUSED_STREAM, no
-    /// 413), and the bytes are given back when a stream goes.
+    /// All bodies of one connection together stay under the bound
+    /// (BODY_STREAMS_CAP times the body limit): the stream that goes over
+    /// it is refused (RST_STREAM REFUSED_STREAM, no 413), and the bytes
+    /// are given back when a stream goes.
     #[test]
     fn the_bodies_of_a_connection_have_a_bound() {
-        let mut c = Client::with_max(250, 1000); // the bound is 2000
-        for id in [1, 3, 5] {
+        let mut c = Client::with_max(250, 1000); // the bound is 4 * 2000
+        let ids: Vec<u32> = (0..9).map(|i| 1 + 2 * i).collect();
+        for &id in &ids {
             c.send(frame::HEADERS, frame::END_HEADERS, id, &post(1000));
         }
-        assert!(c.send(frame::DATA, 0, 1, &[0; 900]).is_empty());
-        assert!(c.send(frame::DATA, 0, 3, &[0; 900]).is_empty());
-        let fs = c.send(frame::DATA, 0, 5, &[0; 900]);
-        assert_eq!(kinds(&fs), [(frame::RST_STREAM, 0, 5)]);
+        for &id in &ids[..8] {
+            assert!(c.send(frame::DATA, 0, id, &[0; 900]).is_empty());
+        }
+        let fs = c.send(frame::DATA, 0, 17, &[0; 900]);
+        assert_eq!(kinds(&fs), [(frame::RST_STREAM, 0, 17)]);
         assert_eq!(code(&fs), frame::REFUSED_STREAM);
-        assert_eq!(c.h2.buffered, 1800);
+        assert_eq!(c.h2.buffered, 7200);
         assert!(!c.h2.over());
         // late DATA of the refused stream is ignored
-        assert!(c.send(frame::DATA, 0, 5, &[0; 10]).is_empty());
+        assert!(c.send(frame::DATA, 0, 17, &[0; 10]).is_empty());
         // a stream that ends hands its body over: the bytes are free
         assert!(
             c.send(frame::DATA, frame::END_STREAM, 1, &[0; 100])
                 .is_empty()
         );
-        assert_eq!(c.h2.buffered, 900);
-        c.send(frame::RST_STREAM, 0, 3, &8u32.to_be_bytes());
+        assert_eq!(c.h2.buffered, 6300);
+        for &id in &ids[1..8] {
+            c.send(frame::RST_STREAM, 0, id, &8u32.to_be_bytes());
+        }
         assert_eq!(c.h2.buffered, 0);
         // a retry fits now
-        c.send(frame::HEADERS, frame::END_HEADERS, 7, &post(1000));
-        assert!(c.send(frame::DATA, 0, 7, &[0; 900]).is_empty());
+        c.send(frame::HEADERS, frame::END_HEADERS, 19, &post(1000));
+        assert!(c.send(frame::DATA, 0, 19, &[0; 900]).is_empty());
     }
 
     /// A streamed answer whose stream window stays 0 for SEND_WAIT is
@@ -2256,5 +2261,48 @@ mod conn {
         c.h2.expire(t0 + wait, wait, wait, DATE, &mut out);
         assert!(out.is_empty());
         assert_eq!(c.h2.stall_since(), None);
+    }
+
+    /// A stream that drained and then stalls again gets a fresh clock.
+    #[test]
+    fn a_stall_after_a_drain_starts_a_fresh_clock() {
+        let mut c = Client::new(250);
+        c.send(frame::SETTINGS, 0, 0, b"\0\x04\0\0\0\x0a"); // window 10
+        let t0 = c.now;
+        c.get(1, GET);
+        start(&mut c, 0, b"", &[1u8; 20]);
+        c.h2.stall_mark(t0);
+        assert_eq!(c.h2.stall_since(), Some(t0));
+        // the window opens: the rest goes out and the stream waits for Dart
+        c.send(frame::WINDOW_UPDATE, 0, 1, &10u32.to_be_bytes());
+        let mut out = Vec::new();
+        c.send_into(&mut out, 0);
+        // more bytes, a window of 10 again: a new stall
+        c.send(frame::WINDOW_UPDATE, 0, 1, &10u32.to_be_bytes());
+        part(&mut c, 0, &[2u8; 20], false, true);
+        let t1 = t0 + Duration::from_secs(20);
+        c.h2.stall_mark(t1);
+        assert_eq!(c.h2.stall_since(), Some(t1));
+    }
+
+    /// Small WINDOW_UPDATEs are progress: the stream lives past SEND_WAIT.
+    #[test]
+    fn small_window_updates_keep_a_slow_stream_alive() {
+        let mut c = Client::new(250);
+        c.send(frame::SETTINGS, 0, 0, b"\0\x04\0\0\0\x0a"); // window 10
+        let t0 = c.now;
+        c.get(1, GET);
+        start(&mut c, 0, b"", &vec![1u8; 100_000]);
+        c.h2.stall_mark(t0);
+        let t1 = t0 + SEND_WAIT - Duration::from_secs(1);
+        // exactly the gap: window 0 again at the next mark
+        c.send(frame::WINDOW_UPDATE, 0, 1, &10u32.to_be_bytes());
+        let mut out = Vec::new();
+        c.send_into(&mut out, 0);
+        c.h2.stall_mark(t1);
+        let mut out = Vec::new();
+        c.h2.expire(t0 + SEND_WAIT, SEND_WAIT, SEND_WAIT, DATE, &mut out);
+        assert!(out.is_empty(), "bytes moved, so no cancel");
+        assert_eq!(c.h2.stall_since(), Some(t1));
     }
 }
