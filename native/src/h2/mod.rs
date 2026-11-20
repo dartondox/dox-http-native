@@ -20,7 +20,7 @@ mod stream;
 use std::collections::{HashMap, VecDeque};
 
 use frame::{Error, Frame, Head};
-use hpack::{Decoder, encode_field};
+use hpack::{Decoded, Decoder, encode_field};
 use stream::Stream;
 
 use crate::run::{MAX_HEADERS, escape_target, write_head};
@@ -42,6 +42,9 @@ const DEFAULT_WINDOW: i64 = 65_535;
 /// The HPACK table size we allow the client (the default 4096).
 const TABLE_SIZE: usize = 4096;
 /// The largest MAX_FRAME_SIZE a client may set (RFC 9113 6.5.2).
+/// How many reset stream ids we remember.
+const RESETS: usize = 64;
+
 const MAX_FRAME_LIMIT: u32 = (1 << 24) - 1;
 /// Answer bytes in the write buffer before more DATA frames are added.
 /// The rest waits in its stream, so the buffer stays small and the
@@ -98,8 +101,14 @@ pub(crate) struct H2 {
     /// a header block that waits for CONTINUATION: (stream id,
     /// END_STREAM, bytes so far)
     block: Option<(u32, bool, Vec<u8>)>,
-    /// the highest stream id of the client so far
+    /// the highest stream id of the client so far (for the stream states)
+    seen: u32,
+    /// the highest stream id we took in (for GOAWAY): ignored and refused
+    /// streams are not in it (RFC 9113 6.8)
     last: u32,
+    /// the last streams we reset or refused: frames of the client that
+    /// were already on their way are ignored (RFC 9113 5.1)
+    resets: VecDeque<u32>,
     /// we sent GOAWAY NO_ERROR: no new streams
     away: bool,
     /// the client sent GOAWAY
@@ -149,7 +158,9 @@ impl H2 {
             window: DEFAULT_WINDOW,
             recv: CONN_WINDOW,
             block: None,
+            seen: 0,
             last: 0,
+            resets: VecDeque::new(),
             away: false,
             peer_away: false,
             dead: false,
@@ -184,7 +195,7 @@ impl H2 {
     pub(crate) fn state(&self, id: u32) -> State {
         if self.streams.contains_key(&id) {
             State::Open
-        } else if !id.is_multiple_of(2) && id <= self.last {
+        } else if !id.is_multiple_of(2) && id <= self.seen {
             State::Closed
         } else {
             State::Idle
@@ -265,6 +276,8 @@ impl H2 {
                     return Err(conn_err(frame::PROTOCOL_ERROR));
                 }
                 match self.state(h.id) {
+                    // a stream we reset: ignored after the decode
+                    State::Closed if self.resets.contains(&h.id) => {}
                     State::Closed => return Err(conn_err(frame::STREAM_CLOSED)),
                     // trailers come in 2b; on a stream whose request is
                     // whole this is a STREAM_CLOSED stream error, after
@@ -425,26 +438,37 @@ impl H2 {
         date: &[u8],
     ) -> Result<(), Error> {
         let known = self.streams.contains_key(&id);
-        if !known {
-            self.last = id;
-        }
+        let closed = !known && self.state(id) == State::Closed;
         let mut req = Req::default();
         // any HPACK error leaves our table out of sync with the client's:
         // the connection must close
-        self.dec
+        let list = self
+            .dec
             .decode(block, MAX_HEAD, |n, v| req.field(n, v))
             .map_err(|_| conn_err(frame::COMPRESSION_ERROR))?;
+        if closed {
+            return Ok(()); // a stream we reset (see `frame`)
+        }
         if known {
             return Err(stream_err(frame::STREAM_CLOSED));
         }
+        self.seen = id;
         if self.away || self.peer_away {
+            self.remember(id);
             return Ok(()); // after GOAWAY: ignored (RFC 9113 6.8)
         }
         if self.streams.len() >= self.max_streams {
             frame::write_rst(out, id, frame::REFUSED_STREAM);
+            self.remember(id);
             return Ok(());
         }
-        match req.check(end_stream) {
+        self.last = id;
+        let check = if list == Decoded::TooLarge {
+            Check::Status(431)
+        } else {
+            req.check(end_stream)
+        };
+        match check {
             Check::Bad => Err(stream_err(frame::PROTOCOL_ERROR)),
             Check::Status(status) => {
                 self.reply(out, id, status, end_stream, date);
@@ -479,16 +503,27 @@ impl H2 {
         frame::write_headers(out, id, &block, true, self.peer_frame);
         if !whole {
             frame::write_rst(out, id, frame::NO_ERROR);
+            self.remember(id);
         }
+    }
+
+    /// Notes that we reset stream `id`. Only the last [RESETS] are kept.
+    fn remember(&mut self, id: u32) {
+        if self.resets.len() >= RESETS {
+            self.resets.pop_front();
+        }
+        self.resets.push_back(id);
     }
 
     /// A stream error: RST_STREAM, and the stream is gone.
     fn reset(&mut self, out: &mut Vec<u8>, id: u32, code: u32) {
         frame::write_rst(out, id, code);
+        self.remember(id);
         self.drop_stream(id);
     }
 
     fn drop_stream(&mut self, id: u32) {
+        self.turns.retain(|&t| t != id);
         if let Some(s) = self.streams.remove(&id) {
             self.seqs.remove(&s.seq);
             if !s.answered {
@@ -639,6 +674,9 @@ impl H2 {
     /// Adds DATA frames to `out` while less than [HOLD] waits there and
     /// the windows allow. Streams take turns, one frame each.
     pub(crate) fn send(&mut self, out: &mut Vec<u8>, wpos: usize) {
+        if self.dead {
+            return; // no frame after a GOAWAY with an error
+        }
         let mut misses = 0;
         while out.len() - wpos < HOLD && self.window > 0 && misses < self.turns.len() {
             let id = self.turns.pop_front().unwrap();
@@ -647,7 +685,8 @@ impl H2 {
             };
             let k = s
                 .left()
-                .min(self.peer_frame)
+                // a big peer frame size must not break [HOLD]
+                .min(self.peer_frame.min(MAX_FRAME))
                 .min(self.window as usize)
                 .min(s.window.max(0) as usize);
             if k == 0 {
@@ -673,11 +712,19 @@ impl H2 {
 
     /// True when [send] can add a frame now.
     pub(crate) fn can_send(&self) -> bool {
-        self.window > 0
+        !self.dead
+            && self.window > 0
             && self
                 .turns
                 .iter()
                 .any(|id| self.streams.get(id).is_some_and(|s| s.window > 0))
+    }
+
+    /// True when body bytes wait but a window of the client is 0. The
+    /// connection then needs a timer (`SEND_WAIT`): no write waits that
+    /// could start one.
+    pub(crate) fn blocked(&self) -> bool {
+        !self.dead && !self.turns.is_empty() && !self.can_send()
     }
 }
 

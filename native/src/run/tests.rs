@@ -1554,6 +1554,7 @@ fn http2_preface_in_pieces_and_http1_on_the_same_port() {
                             String::from_utf8_lossy(v)
                         ))
                     })
+                    .map(|_| ())
                     .unwrap(),
                 frame::DATA => s.1.extend_from_slice(payload),
                 _ => {}

@@ -21,8 +21,16 @@ pub(crate) enum HpackError {
     BadHuffman,
     /// A table size update over our limit, or after the first field.
     BadSizeUpdate,
-    /// The decoded header list is over `max_list`.
-    ListTooLarge,
+}
+
+/// How a header block that decoded fine ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Decoded {
+    /// All fields were passed to `emit`.
+    Whole,
+    /// The list went over `max_list`. Fields after that point were not
+    /// passed to `emit`. The dynamic table is in sync.
+    TooLarge,
 }
 
 /// Each field counts its name, its value and 32 bytes (RFC 7541 4.1).
@@ -159,21 +167,23 @@ impl Decoder {
     /// frames) and calls `emit(name, value)` for each field, in order.
     ///
     /// `max_list` caps the decoded list: each field counts name + value +
-    /// 32 bytes. Over the cap, it stops at once with `ListTooLarge` and
-    /// decodes nothing more. The dynamic table is then out of sync with
-    /// the client, so the caller must close the connection. It must do so
-    /// on any error anyway (COMPRESSION_ERROR). We chose this over
-    /// "decode on but drop the fields": it is simpler, and it stops the
-    /// work of a header bomb at once.
+    /// 32 bytes. Over the cap, `emit` is not called any more, but the
+    /// block is still read to its end, so the dynamic table stays in sync
+    /// with the client's. The result is then `Decoded::TooLarge`, and the
+    /// caller may answer just that request (431). Nothing grows past the
+    /// cap or the table size: a long string is counted, not copied.
+    /// Real errors (`HpackError`) leave the table out of sync: the caller
+    /// must close the connection.
     pub(crate) fn decode(
         &mut self,
         block: &[u8],
         max_list: usize,
         mut emit: impl FnMut(&[u8], &[u8]),
-    ) -> Result<(), HpackError> {
+    ) -> Result<Decoded, HpackError> {
         let mut pos = 0;
         let mut list = 0usize;
         let mut fields = false;
+        let mut over = false;
         while pos < block.len() {
             let b = block[pos];
             if b & 0xe0 == 0x20 {
@@ -191,60 +201,66 @@ impl Decoder {
                 continue;
             }
             fields = true;
-            // every field needs at least its 32 bytes of room
-            let room = (max_list - list)
-                .checked_sub(FIELD_OVERHEAD)
-                .ok_or(HpackError::ListTooLarge)?;
+            // The strings may be as long as the list has room, or as the
+            // table can keep. A longer one is counted, not copied.
+            let list_room = if over { 0 } else { max_list - list };
+            let room = list_room.max(self.limit);
+            let (name, nlen, value, vlen, indexing);
             if b & 0x80 != 0 {
                 // an indexed field
                 let index = read_int(block, &mut pos, 7)?;
-                let (name, value) = lookup(&self.table, index)?;
-                if name.len() + value.len() > room {
-                    return Err(HpackError::ListTooLarge);
-                }
-                list += name.len() + value.len() + FIELD_OVERHEAD;
-                emit(name, value);
-                continue;
-            }
-            // a literal: with incremental indexing (01), without indexing
-            // (0000) or never indexed (0001)
-            let indexing = b & 0x40 != 0;
-            let index = read_int(block, &mut pos, if indexing { 6 } else { 4 })?;
-            let name = if index == 0 {
-                read_str(block, &mut pos, &mut self.name_buf, room)?
+                (name, value) = lookup(&self.table, index)?;
+                (nlen, vlen, indexing) = (name.len(), value.len(), false);
             } else {
-                let name = lookup(&self.table, index)?.0;
-                if name.len() > room {
-                    return Err(HpackError::ListTooLarge);
-                }
-                name
-            };
-            let value = read_str(block, &mut pos, &mut self.value_buf, room - name.len())?;
-            list += name.len() + value.len() + FIELD_OVERHEAD;
+                // a literal: with incremental indexing (01), without
+                // indexing (0000) or never indexed (0001)
+                indexing = b & 0x40 != 0;
+                let index = read_int(block, &mut pos, if indexing { 6 } else { 4 })?;
+                (name, nlen) = if index == 0 {
+                    read_str(block, &mut pos, &mut self.name_buf, room)?
+                } else {
+                    let n = lookup(&self.table, index)?.0;
+                    (n, n.len())
+                };
+                (value, vlen) = read_str(
+                    block,
+                    &mut pos,
+                    &mut self.value_buf,
+                    room.saturating_sub(nlen),
+                )?;
+            }
+            let size = nlen + vlen + FIELD_OVERHEAD;
+            if !over && size <= list_room {
+                list += size;
+                emit(name, value);
+            } else {
+                over = true;
+            }
             if indexing {
                 // copy first: adding the entry can evict the entry the
-                // name came from
-                let entry = Entry::new(name, value);
-                emit(entry.name(), entry.value());
+                // name came from. A too big entry is never copied (its
+                // strings may be cut): it only empties the table.
+                let entry = (size <= self.max).then(|| Entry::new(name, value));
                 self.insert(entry);
-            } else {
-                emit(name, value);
             }
         }
-        Ok(())
+        Ok(if over {
+            Decoded::TooLarge
+        } else {
+            Decoded::Whole
+        })
     }
 
     /// Adds an entry as index 62 and evicts the oldest ones until the
-    /// table fits. An entry bigger than the whole table empties it and is
-    /// not added (RFC 7541 4.4).
-    fn insert(&mut self, entry: Entry) {
-        let size = entry.size();
-        if size > self.max {
+    /// table fits. `None` is an entry bigger than the whole table: it
+    /// empties the table and is not added (RFC 7541 4.4).
+    fn insert(&mut self, entry: Option<Entry>) {
+        let Some(entry) = entry else {
             self.table.clear();
             self.size = 0;
             return;
-        }
-        self.size += size;
+        };
+        self.size += entry.size();
         self.table.push_front(entry);
         self.evict();
     }
@@ -317,27 +333,26 @@ pub(super) fn read_int(block: &[u8], pos: &mut usize, prefix: u32) -> Result<usi
         .ok_or(HpackError::IntegerOverflow)
 }
 
-/// Reads a string literal (RFC 7541 5.2). A plain string is a slice of
-/// `block`, so it costs no copy. A Huffman string is decoded into `buf`.
-/// Longer than `room` gives `ListTooLarge`, before any copy.
+/// Reads a string literal (RFC 7541 5.2) and gives (bytes, full length).
+/// A plain string is a slice of `block`, so it costs no copy. A Huffman
+/// string is decoded into `buf`. Only the first `room` bytes are kept: for
+/// a longer string the bytes are cut and the full length says so.
 fn read_str<'a>(
     block: &'a [u8],
     pos: &mut usize,
     buf: &'a mut Vec<u8>,
     room: usize,
-) -> Result<&'a [u8], HpackError> {
+) -> Result<(&'a [u8], usize), HpackError> {
     let huffman = *block.get(*pos).ok_or(HpackError::Truncated)? & 0x80 != 0;
     let len = read_int(block, pos, 7)?;
     let raw = block[*pos..].get(..len).ok_or(HpackError::Truncated)?;
     *pos += len;
     if huffman {
         buf.clear();
-        huffman::decode(raw, buf, room)?;
-        Ok(buf)
-    } else if len > room {
-        Err(HpackError::ListTooLarge)
+        let full = huffman::decode(raw, buf, room)?;
+        Ok((buf, full))
     } else {
-        Ok(raw)
+        Ok((&raw[..len.min(room)], len))
     }
 }
 

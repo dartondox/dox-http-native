@@ -1,4 +1,4 @@
-use super::hpack::{Decoder, HpackError, encode_field, read_int, write_int};
+use super::hpack::{Decoded, Decoder, HpackError, encode_field, read_int, write_int};
 use super::huffman::{self, CODES};
 
 /// Bytes from hex text; spaces are skipped.
@@ -320,7 +320,7 @@ fn huffman_bad_input() {
     let mut out = Vec::new();
     assert_eq!(
         huffman::decode(&huffman_encode(b"abcdef"), &mut out, 3),
-        Err(HpackError::ListTooLarge)
+        Ok(6)
     );
     assert_eq!(out, b"abc");
 }
@@ -456,32 +456,69 @@ fn truncated() {
     );
 }
 
+/// Decodes with a cap and gives (fields, result).
+fn capped(d: &mut Decoder, block: &[u8], cap: usize) -> (Fields, Result<Decoded, HpackError>) {
+    let mut out = Vec::new();
+    let res = d.decode(block, cap, |n, v| {
+        out.push((
+            String::from_utf8(n.to_vec()).unwrap(),
+            String::from_utf8(v.to_vec()).unwrap(),
+        ))
+    });
+    (out, res)
+}
+
 #[test]
 fn list_over_cap() {
     let block = hex("8286 8441 0f77 7777 2e65 7861 6d70 6c65 2e63 6f6d");
     // sizes: 42 + 43 + 38 + 57 = 180
     let mut d = Decoder::new(4096);
-    assert_eq!(decode(&mut d, &block, 180).unwrap().len(), 4);
+    assert_eq!(capped(&mut d, &block, 180).0.len(), 4);
+    // over the cap: the fields before are given, the rest is read to the
+    // end (the table stays in sync), and the result says so
     let mut d = Decoder::new(4096);
-    let mut seen = 0;
-    let res = d.decode(&block, 179, |_, _| seen += 1);
-    assert_eq!(res, Err(HpackError::ListTooLarge));
-    assert_eq!(seen, 3);
-    // a Huffman string stops as soon as it is over the room
+    let (got, res) = capped(&mut d, &block, 179);
+    assert_eq!(res, Ok(Decoded::TooLarge));
+    assert_eq!(got.len(), 3);
+    assert_eq!(d.table().0, 57, "the last field is in the table");
+    // a long Huffman string is counted, not kept
     let value = huffman_encode(&[b'a'; 1000]);
     let mut block = vec![0x00, 0x01, b'x'];
     write_int(value.len(), 7, 0x80, &mut block);
     block.extend_from_slice(&value);
     let mut d = Decoder::new(4096);
-    assert_eq!(
-        decode(&mut d, &block, 32 + 1 + 100),
-        Err(HpackError::ListTooLarge)
-    );
-    // a plain string over the room is refused too
+    let (got, res) = capped(&mut d, &block, 32 + 1 + 100);
+    assert_eq!((got.len(), res), (0, Ok(Decoded::TooLarge)));
+    // a plain string over the room is the same
     let mut d = Decoder::new(4096);
+    let (got, res) = capped(&mut d, &[0x00, 0x01, b'x', 0x02, b'a', b'b'], 34);
+    assert_eq!((got.len(), res), (0, Ok(Decoded::TooLarge)));
+}
+
+#[test]
+fn over_cap_keeps_the_table_in_sync() {
+    // a field that is over the cap but is added to the table, then a
+    // field that is not
+    let big = "v".repeat(300);
+    let mut block = indexed_literal("a", &big[..100]);
+    block.extend(indexed_literal("b", "2"));
+    let mut d = Decoder::new(4096);
+    let (got, res) = capped(&mut d, &block, 100);
+    assert_eq!((got.len(), res), (0, Ok(Decoded::TooLarge)));
+    let (size, entries) = d.table();
+    assert_eq!(size, 133 + 34);
+    assert_eq!(entries[0], (&b"b"[..], &b"2"[..]));
+    // a string over the table size empties the table, even over the cap
+    let mut long = vec![0x40, 1, b'c'];
+    write_int(5000, 7, 0, &mut long);
+    long.extend(vec![b'z'; 5000]);
+    let (_, res) = capped(&mut d, &long, 100);
+    assert_eq!(res, Ok(Decoded::TooLarge));
+    assert_eq!(d.table().0, 0);
+    // a real error after the cap is still an error
     assert_eq!(
-        decode(&mut d, &[0x00, 0x01, b'x', 0x02, b'a', b'b'], 34),
-        Err(HpackError::ListTooLarge)
+        capped(&mut d, &[0x82, 0x82, 0x82, 0x80 | 100], 50).1,
+        Err(HpackError::BadIndex)
     );
 }
 
@@ -533,12 +570,9 @@ fn indexed_field_over_cap_is_list_too_large() {
     // static index 2 is :method GET: 7 + 3 + 32 = 42
     let mut d = Decoder::new(4096);
     assert_eq!(decode(&mut d, &[0x82], 42).unwrap().len(), 1);
-    assert_eq!(decode(&mut d, &[0x82], 41), Err(HpackError::ListTooLarge));
+    assert_eq!(capped(&mut d, &[0x82], 41).1, Ok(Decoded::TooLarge));
     // the second field pushes the list over: 42 + 42 = 84
-    assert_eq!(
-        decode(&mut d, &[0x82, 0x82], 83),
-        Err(HpackError::ListTooLarge)
-    );
+    assert_eq!(capped(&mut d, &[0x82, 0x82], 83).1, Ok(Decoded::TooLarge));
     assert_eq!(decode(&mut d, &[0x82, 0x82], 84).unwrap().len(), 2);
     // dynamic index 62: 10 + 13 + 32 = 55
     decode(
@@ -547,7 +581,7 @@ fn indexed_field_over_cap_is_list_too_large() {
         usize::MAX,
     )
     .unwrap();
-    assert_eq!(decode(&mut d, &[0xbe], 54), Err(HpackError::ListTooLarge));
+    assert_eq!(capped(&mut d, &[0xbe], 54).1, Ok(Decoded::TooLarge));
     assert_eq!(decode(&mut d, &[0xbe], 55).unwrap().len(), 1);
 }
 
@@ -573,7 +607,7 @@ fn name_from_entry_evicted_by_same_insert() {
 
 mod conn {
     use super::super::frame::{self, Error, Frame, Head};
-    use super::super::hpack::{Decoder, encode_field};
+    use super::super::hpack::{Decoder, encode_field, write_int};
     use super::super::{CONN_WINDOW, DEFAULT_WINDOW, H2, HOLD, State};
     use crate::run::MAX_HEADERS;
 
@@ -837,8 +871,12 @@ mod conn {
         }
 
         fn get(&mut self, id: u32, fields: &[(&str, &str)]) -> Vec<(Head, Vec<u8>)> {
+            self.get_block(id, &block(fields))
+        }
+
+        fn get_block(&mut self, id: u32, block: &[u8]) -> Vec<(Head, Vec<u8>)> {
             let flags = frame::END_STREAM | frame::END_HEADERS;
-            self.send(frame::HEADERS, flags, id, &block(fields))
+            self.send(frame::HEADERS, flags, id, block)
         }
 
         /// Answer of Dart for request `seq`, then the frames that go out.
@@ -1366,7 +1404,8 @@ mod conn {
         );
         c.send(frame::WINDOW_UPDATE, 0, 1, &60_000u32.to_be_bytes());
         let lens: Vec<_> = c.pump().iter().map(|f| f.1.len()).collect();
-        assert_eq!(lens, [20_000, 20_000, 10_000]);
+        // frames stay at 16 KiB, so one frame never breaks HOLD
+        assert_eq!(lens, [16_384, 16_384, 16_384, 848]);
         // a MAX_FRAME_SIZE out of range
         goaway(
             &c.send(frame::SETTINGS, 0, 0, b"\0\x05\0\0\x10\0"),
@@ -1470,5 +1509,173 @@ mod conn {
         }
         assert!(updates >= 8 << 20, "{updates}");
         assert!(!c.h2.over(), "no flow control error");
+    }
+
+    /// A big peer MAX_FRAME_SIZE must not let one frame break HOLD.
+    #[test]
+    fn a_big_peer_frame_size_keeps_hold() {
+        let mut c = Client::new(250);
+        // MAX_FRAME_SIZE 1 MiB
+        c.send(frame::SETTINGS, 0, 0, b"\0\x05\0\x10\0\0");
+        c.send(frame::WINDOW_UPDATE, 0, 0, &10_000_000u32.to_be_bytes());
+        c.send(frame::SETTINGS, 0, 0, b"\0\x04\0\x10\0\0");
+        c.get(1, GET);
+        let fs = c.answer(0, 200, b"", &[1; 600_000]);
+        assert!(fs.iter().all(|f| f.1.len() <= 16_384));
+        let sent: usize = fs.iter().map(|f| f.1.len()).sum();
+        assert!(sent < HOLD + 16_384 + 100, "{sent}");
+    }
+
+    /// A window that stays 0 with data waiting: `blocked`, so the
+    /// connection gets the SEND_WAIT timer. Progress ends it.
+    #[test]
+    fn a_closed_window_is_blocked() {
+        let mut c = Client::new(250);
+        assert!(!c.h2.blocked());
+        c.get(1, GET);
+        c.answer(0, 200, b"", &vec![7u8; 100_000]);
+        assert!(c.h2.blocked(), "the stream window is used up");
+        c.send(frame::WINDOW_UPDATE, 0, 1, &100_000u32.to_be_bytes());
+        assert!(c.h2.blocked(), "the connection window is used up");
+        c.send(frame::WINDOW_UPDATE, 0, 0, &100_000u32.to_be_bytes());
+        assert!(!c.h2.blocked());
+        c.pump();
+        assert!(!c.h2.blocked(), "all sent");
+    }
+
+    /// GET then RST cycles with a closed window must not grow `turns`.
+    #[test]
+    fn dropped_streams_leave_the_turns() {
+        let mut c = Client::new(250);
+        // the connection window is used up by the first answer
+        c.get(1, GET);
+        c.answer(0, 200, b"", &vec![7u8; 100_000]);
+        assert!(!c.h2.can_send());
+        for i in 0..50u32 {
+            let id = 3 + 2 * i;
+            c.get(id, GET);
+            c.answer(i + 1, 200, b"", b"body");
+            c.send(frame::RST_STREAM, 0, id, &8u32.to_be_bytes());
+        }
+        assert!(c.h2.turns.len() <= 1, "{}", c.h2.turns.len());
+    }
+
+    /// GOAWAY may not carry a higher last stream id than an earlier one
+    /// (RFC 9113 6.8).
+    #[test]
+    fn goaway_last_id_never_rises() {
+        let mut c = Client::new(250);
+        c.get(1, GET);
+        let mut out = Vec::new();
+        c.h2.drain(&mut out);
+        let fs = frames(&out);
+        assert_eq!(fs[0].1[..4], 1u32.to_be_bytes());
+        // a new stream after the drain is ignored, so it does not count
+        assert!(c.get(3, GET).is_empty());
+        let fs = c.send(frame::SETTINGS, 0, 0, b"\0\x05\0\0\x10\0");
+        assert_eq!(fs[0].1[..4], 1u32.to_be_bytes());
+        goaway(&fs, frame::PROTOCOL_ERROR);
+        // a refused stream and a stream with an HPACK error: same
+        let mut c = Client::new(1);
+        c.get(1, GET);
+        assert_eq!(code(&c.get(3, GET)), frame::REFUSED_STREAM);
+        let fs = c.send(
+            frame::HEADERS,
+            frame::END_STREAM | frame::END_HEADERS,
+            5,
+            &[0x80 | 70],
+        );
+        goaway(&fs, frame::COMPRESSION_ERROR);
+        assert_eq!(fs[0].1[..4], 1u32.to_be_bytes());
+    }
+
+    /// No frame is written after a GOAWAY with an error, not even DATA.
+    #[test]
+    fn no_data_after_a_goaway_error() {
+        let mut c = Client::new(250);
+        c.send(frame::WINDOW_UPDATE, 0, 0, &1_000_000u32.to_be_bytes());
+        c.get(1, GET);
+        let mut out = Vec::new();
+        c.h2.answer(0, 200, b"", &[1; 100_000], DATE, &mut out);
+        out.clear();
+        goaway(
+            &c.send(frame::PING, 0, 1, b"12345678"),
+            frame::PROTOCOL_ERROR,
+        );
+        assert!(!c.h2.can_send() && !c.h2.blocked());
+        c.h2.send(&mut out, 0);
+        assert!(out.is_empty());
+    }
+
+    /// A body request gets 501 and RST_STREAM. Trailers that were already
+    /// on their way are ignored, and the connection goes on.
+    #[test]
+    fn frames_after_our_reset_are_ignored() {
+        let mut c = Client::new(250);
+        let fs = c.send(frame::HEADERS, frame::END_HEADERS, 1, &block(GET));
+        assert_eq!(code(&fs), frame::NO_ERROR);
+        let trailers = block(&[("x-t", "1")]);
+        let flags = frame::END_STREAM | frame::END_HEADERS;
+        assert!(c.send(frame::HEADERS, flags, 1, &trailers).is_empty());
+        assert!(!c.h2.over());
+        // the same with the header block in two parts
+        assert!(c.send(frame::HEADERS, 0, 1, &trailers).is_empty());
+        assert!(
+            c.send(frame::CONTINUATION, frame::END_HEADERS, 1, b"")
+                .is_empty()
+        );
+        // a refused stream too
+        let mut c = Client::new(1);
+        c.get(1, GET);
+        assert_eq!(code(&c.get(3, GET)), frame::REFUSED_STREAM);
+        assert!(c.send(frame::HEADERS, flags, 3, &trailers).is_empty());
+        // the next stream works
+        c.answer(0, 200, b"", b"");
+        assert!(c.get(5, GET).is_empty());
+        assert_eq!(c.recs.len(), 2);
+        // a stream that ended normally: HEADERS on it is still an error
+        let mut c = Client::new(250);
+        c.get(1, GET);
+        c.answer(0, 200, b"", b"");
+        goaway(
+            &c.send(frame::HEADERS, flags, 1, &trailers),
+            frame::STREAM_CLOSED,
+        );
+    }
+
+    /// Only the last RESETS ids are remembered.
+    #[test]
+    fn the_reset_memory_is_bounded() {
+        let mut c = Client::new(250);
+        for i in 0..500u32 {
+            c.send(frame::HEADERS, frame::END_HEADERS, 1 + 2 * i, &block(GET));
+        }
+        assert!(c.h2.resets.len() <= 64);
+    }
+
+    /// A header list over the cap is a 431 for that stream only. The
+    /// table stays in sync, so the next stream works.
+    #[test]
+    fn a_huge_header_list_gets_431_on_its_stream() {
+        let mut c = Client::new(250);
+        // x-big: 3000 bytes, added to the table as index 62
+        let mut b = block(GET);
+        b.extend([0x40, 5]);
+        b.extend(b"x-big");
+        write_int(3000, 7, 0, &mut b);
+        b.extend(vec![b'a'; 3000]);
+        assert!(c.get_block(1, &b).is_empty());
+        // 7 x 3000 bytes, over 16 KiB, in a few bytes
+        let mut b = block(GET);
+        b.extend([0xbe; 7]);
+        let fs = c.get_block(3, &b);
+        assert_eq!(decode(&fs[0].1)[0], (":status".into(), "431".into()));
+        assert!(!c.h2.over());
+        assert_eq!(c.recs.len(), 1);
+        // the table still works
+        let mut b = block(GET);
+        b.push(0xbe);
+        assert!(c.get_block(5, &b).is_empty());
+        assert_eq!(c.recs.len(), 2);
     }
 }

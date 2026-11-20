@@ -1897,7 +1897,8 @@ impl Core {
             c.shut |= h2.over();
         }
         // a write starts to wait: make sure its timer runs
-        let wait_starts = c.stuck.is_none() && c.pending() > 0;
+        let blocked = c.h2.as_ref().is_some_and(|h| h.blocked());
+        let wait_starts = c.stuck.is_none() && (c.pending() > 0 || blocked);
         while let Some(&(end, sid, n)) = c.marks.front() {
             if end > c.written {
                 break;
@@ -1910,7 +1911,8 @@ impl Core {
             // side, see `due`) counts from the last write
             c.since = now;
         }
-        if c.pending() == 0 {
+        // HTTP/2: a closed window with data waiting also counts as stuck
+        if c.pending() == 0 && !blocked {
             c.stuck = None;
         } else if c.written > before || c.stuck.is_none() {
             c.stuck = Some(now);
