@@ -568,3 +568,907 @@ fn name_from_entry_evicted_by_same_insert() {
         vec![(&b"aa"[..], &b"ee"[..]), (&b"cc"[..], &b"dd"[..])]
     );
 }
+
+// ---- frames and the connection --------------------------------------
+
+mod conn {
+    use super::super::frame::{self, Error, Frame, Head};
+    use super::super::hpack::{Decoder, encode_field};
+    use super::super::{CONN_WINDOW, DEFAULT_WINDOW, H2, HOLD, State};
+    use crate::run::MAX_HEADERS;
+
+    fn head(len: usize, kind: u8, flags: u8, id: u32) -> Head {
+        Head {
+            len,
+            kind,
+            flags,
+            id,
+        }
+    }
+
+    /// Writes a frame, reads it back.
+    fn round(kind: u8, flags: u8, id: u32, payload: &[u8]) -> (Head, Vec<u8>) {
+        let mut out = Vec::new();
+        frame::write(&mut out, kind, flags, id, payload);
+        let h = frame::read_head(&out).unwrap();
+        assert_eq!(h, head(payload.len(), kind, flags, id));
+        (h, out[frame::HEAD..].to_vec())
+    }
+
+    fn parse(kind: u8, flags: u8, id: u32, payload: &[u8]) -> Result<String, Error> {
+        let (h, p) = round(kind, flags, id, payload);
+        frame::parse(&h, &p).map(|f| format!("{f:?}"))
+    }
+
+    fn conn_err(code: u32) -> Error {
+        Error {
+            code,
+            stream: false,
+        }
+    }
+
+    #[test]
+    fn frame_round_trips() {
+        let ok = |kind, flags, id, p: &[u8], want: Frame| {
+            assert_eq!(parse(kind, flags, id, p), Ok(format!("{want:?}")));
+        };
+        ok(
+            frame::DATA,
+            frame::END_STREAM | frame::PADDED,
+            1,
+            b"\x02abc\0\0",
+            Frame::Data {
+                end: true,
+                data: b"abc",
+                flow: 6,
+            },
+        );
+        ok(
+            frame::HEADERS,
+            frame::END_HEADERS | frame::PRIORITY_FLAG,
+            3,
+            b"\x80\0\0\x01\x10xy",
+            Frame::Headers {
+                end_stream: false,
+                end_headers: true,
+                dep: Some(1),
+                block: b"xy",
+            },
+        );
+        ok(
+            frame::PRIORITY,
+            0,
+            3,
+            b"\0\0\0\x05\x10",
+            Frame::Priority { dep: 5 },
+        );
+        ok(
+            frame::RST_STREAM,
+            0,
+            3,
+            &8u32.to_be_bytes(),
+            Frame::RstStream { code: 8 },
+        );
+        ok(
+            frame::SETTINGS,
+            0,
+            0,
+            b"\0\x04\0\0\x01\0",
+            Frame::Settings {
+                ack: false,
+                params: b"\0\x04\0\0\x01\0",
+            },
+        );
+        ok(
+            frame::PUSH_PROMISE,
+            frame::END_HEADERS,
+            1,
+            b"\0\0\0\x02zz",
+            Frame::PushPromise {
+                end_headers: true,
+                promised: 2,
+                block: b"zz",
+            },
+        );
+        ok(
+            frame::PING,
+            frame::ACK,
+            0,
+            b"12345678",
+            Frame::Ping {
+                ack: true,
+                data: *b"12345678",
+            },
+        );
+        ok(
+            frame::GOAWAY,
+            0,
+            0,
+            b"\0\0\0\x07\0\0\0\x01dbg",
+            Frame::GoAway {
+                last: 7,
+                code: 1,
+                debug: b"dbg",
+            },
+        );
+        ok(
+            frame::WINDOW_UPDATE,
+            0,
+            0,
+            &100u32.to_be_bytes(),
+            Frame::WindowUpdate { inc: 100 },
+        );
+        ok(
+            frame::CONTINUATION,
+            frame::END_HEADERS,
+            1,
+            b"q",
+            Frame::Continuation {
+                end_headers: true,
+                block: b"q",
+            },
+        );
+        ok(0xfa, 0, 0, b"anything", Frame::Unknown);
+        let pairs: Vec<_> = frame::settings(b"\0\x03\0\0\0\x64\0\x05\0\0\x40\0").collect();
+        assert_eq!(pairs, vec![(3, 100), (5, 16384)]);
+    }
+
+    #[test]
+    fn bad_frames() {
+        use frame::{
+            ACK, CONTINUATION, DATA, FRAME_SIZE_ERROR, GOAWAY, HEADERS, PADDED, PING, PRIORITY,
+            PROTOCOL_ERROR, RST_STREAM, SETTINGS, WINDOW_UPDATE,
+        };
+        let size = conn_err(FRAME_SIZE_ERROR);
+        let proto = conn_err(PROTOCOL_ERROR);
+        assert_eq!(parse(PING, 0, 0, b"1234567"), Err(size));
+        assert_eq!(parse(RST_STREAM, 0, 1, b"123"), Err(size));
+        assert_eq!(parse(WINDOW_UPDATE, 0, 1, b"12345"), Err(size));
+        assert_eq!(parse(SETTINGS, 0, 0, b"12345"), Err(size));
+        assert_eq!(parse(SETTINGS, ACK, 0, b"123456"), Err(size));
+        assert_eq!(parse(GOAWAY, 0, 0, b"1234567"), Err(size));
+        // PRIORITY with a wrong size hits only its stream
+        assert_eq!(
+            parse(PRIORITY, 0, 1, b"1234"),
+            Err(Error {
+                code: FRAME_SIZE_ERROR,
+                stream: true
+            })
+        );
+        // padding as long as the payload
+        assert_eq!(parse(DATA, PADDED, 1, b"\x04abc"), Err(proto));
+        assert_eq!(parse(HEADERS, PADDED, 1, b""), Err(size));
+        // stream frames need an id, connection frames must not have one
+        assert_eq!(parse(DATA, 0, 0, b"x"), Err(proto));
+        assert_eq!(parse(HEADERS, 0, 0, b"x"), Err(proto));
+        assert_eq!(parse(CONTINUATION, 0, 0, b"x"), Err(proto));
+        assert_eq!(parse(SETTINGS, 0, 1, b""), Err(proto));
+        assert_eq!(parse(PING, 0, 1, b"12345678"), Err(proto));
+        assert_eq!(parse(GOAWAY, 0, 3, b"12345678"), Err(proto));
+    }
+
+    #[test]
+    fn a_big_header_block_is_split_into_continuation() {
+        let mut out = Vec::new();
+        frame::write_headers(&mut out, 5, &[1u8; 40], true, 16);
+        let fs = frames(&out);
+        let kinds: Vec<_> = fs.iter().map(|(h, p)| (h.kind, h.flags, p.len())).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (frame::HEADERS, frame::END_STREAM, 16),
+                (frame::CONTINUATION, 0, 16),
+                (frame::CONTINUATION, frame::END_HEADERS, 8),
+            ]
+        );
+    }
+
+    // ---- a connection, driven frame by frame ----
+
+    const DATE: &[u8] = b"date: Thu, 01 Jan 2026 00:00:00 GMT\r\n";
+
+    /// All frames in `b`.
+    fn frames(b: &[u8]) -> Vec<(Head, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut p = 0;
+        while let Some(h) = frame::read_head(&b[p..]) {
+            let end = p + frame::HEAD + h.len;
+            out.push((h, b[p + frame::HEAD..end].to_vec()));
+            p = end;
+        }
+        assert_eq!(p, b.len(), "a cut frame");
+        out
+    }
+
+    struct Client {
+        h2: Box<H2>,
+        seq: u32,
+        /// records Dart got
+        recs: Vec<Vec<u8>>,
+    }
+
+    impl Client {
+        /// A connection after the preface and the client SETTINGS.
+        fn new(max_streams: u32) -> Self {
+            let mut out = Vec::new();
+            let h2 = H2::new(1, [0; 18], max_streams, &mut out);
+            let fs = frames(&out);
+            assert_eq!(fs[0].0.kind, frame::SETTINGS);
+            let ours: Vec<_> = frame::settings(&fs[0].1).collect();
+            assert_eq!(
+                ours,
+                vec![
+                    (3, max_streams),
+                    (4, 1 << 20),
+                    (5, 16384),
+                    (6, 16384),
+                    (2, 0)
+                ]
+            );
+            assert_eq!(fs[1].0.kind, frame::WINDOW_UPDATE);
+            assert_eq!(
+                fs[1].1,
+                ((CONN_WINDOW - DEFAULT_WINDOW) as u32).to_be_bytes()
+            );
+            let mut c = Client {
+                h2,
+                seq: 0,
+                recs: Vec::new(),
+            };
+            let acks = c.send(frame::SETTINGS, 0, 0, b"");
+            assert_eq!(kinds(&acks), vec![(frame::SETTINGS, frame::ACK, 0)]);
+            c
+        }
+
+        /// Feeds raw bytes, returns the frames the server wrote.
+        fn feed(&mut self, b: &[u8]) -> Vec<(Head, Vec<u8>)> {
+            let mut out = Vec::new();
+            let mut pos = 0;
+            while self.h2.step(b, &mut pos, &mut out, &mut self.seq, DATE) {
+                self.recs.extend(self.h2.held.take());
+            }
+            frames(&out)
+        }
+
+        fn send(&mut self, kind: u8, flags: u8, id: u32, p: &[u8]) -> Vec<(Head, Vec<u8>)> {
+            let mut b = Vec::new();
+            frame::write(&mut b, kind, flags, id, p);
+            self.feed(&b)
+        }
+
+        fn get(&mut self, id: u32, fields: &[(&str, &str)]) -> Vec<(Head, Vec<u8>)> {
+            let flags = frame::END_STREAM | frame::END_HEADERS;
+            self.send(frame::HEADERS, flags, id, &block(fields))
+        }
+
+        /// Answer of Dart for request `seq`, then the frames that go out.
+        fn answer(
+            &mut self,
+            seq: u32,
+            status: u16,
+            lines: &[u8],
+            body: &[u8],
+        ) -> Vec<(Head, Vec<u8>)> {
+            let mut out = Vec::new();
+            self.h2.answer(seq, status, lines, body, DATE, &mut out);
+            self.h2.send(&mut out, 0);
+            frames(&out)
+        }
+
+        fn pump(&mut self) -> Vec<(Head, Vec<u8>)> {
+            let mut out = Vec::new();
+            self.h2.send(&mut out, 0);
+            frames(&out)
+        }
+    }
+
+    const GET: &[(&str, &str)] = &[
+        (":method", "GET"),
+        (":scheme", "http"),
+        (":path", "/a?b"),
+        (":authority", "example.test"),
+    ];
+
+    fn block(fields: &[(&str, &str)]) -> Vec<u8> {
+        let mut b = Vec::new();
+        for (n, v) in fields {
+            encode_field(n.as_bytes(), v.as_bytes(), &mut b);
+        }
+        b
+    }
+
+    fn kinds(fs: &[(Head, Vec<u8>)]) -> Vec<(u8, u8, u32)> {
+        fs.iter().map(|(h, _)| (h.kind, h.flags, h.id)).collect()
+    }
+
+    fn rst(id: u32, code: u32) -> Vec<(u8, u8, u32)> {
+        let _ = code;
+        vec![(frame::RST_STREAM, 0, id)]
+    }
+
+    /// The error code of the one RST_STREAM or GOAWAY in `fs`.
+    fn code(fs: &[(Head, Vec<u8>)]) -> u32 {
+        let (h, p) = fs.last().expect("a frame");
+        match h.kind {
+            frame::RST_STREAM => u32::from_be_bytes(p[..4].try_into().unwrap()),
+            frame::GOAWAY => u32::from_be_bytes(p[4..8].try_into().unwrap()),
+            k => panic!("frame type {k}"),
+        }
+    }
+
+    fn goaway(fs: &[(Head, Vec<u8>)], want: u32) {
+        assert_eq!(fs.last().map(|f| f.0.kind), Some(frame::GOAWAY), "{fs:?}");
+        assert_eq!(code(fs), want);
+    }
+
+    fn decode(p: &[u8]) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        Decoder::new(4096)
+            .decode(p, usize::MAX, |n, v| {
+                out.push((
+                    String::from_utf8(n.to_vec()).unwrap(),
+                    String::from_utf8(v.to_vec()).unwrap(),
+                ))
+            })
+            .unwrap();
+        out
+    }
+
+    /// (method, target, headers) of a record.
+    fn record(r: &[u8]) -> (u32, String, String, Vec<(String, String)>) {
+        let flags = u32::from_le_bytes(r[8..12].try_into().unwrap());
+        let ml = u16::from_le_bytes(r[12..14].try_into().unwrap()) as usize;
+        let tl = u16::from_le_bytes(r[14..16].try_into().unwrap()) as usize;
+        let hl = u32::from_le_bytes(r[16..20].try_into().unwrap()) as usize;
+        let mut p = crate::REQ_HEAD;
+        let m = String::from_utf8(r[p..p + ml].to_vec()).unwrap();
+        p += ml;
+        let t = String::from_utf8(r[p..p + tl].to_vec()).unwrap();
+        p += tl;
+        let end = p + hl;
+        assert_eq!(end, r.len());
+        let mut hs = Vec::new();
+        while p < end {
+            let nl = u16::from_le_bytes(r[p..p + 2].try_into().unwrap()) as usize;
+            let vl = u16::from_le_bytes(r[p + 2..p + 4].try_into().unwrap()) as usize;
+            p += 4;
+            let n = String::from_utf8(r[p..p + nl].to_vec()).unwrap();
+            let v = String::from_utf8(r[p + nl..p + nl + vl].to_vec()).unwrap();
+            hs.push((n, v));
+            p += nl + vl;
+        }
+        (flags, m, t, hs)
+    }
+
+    #[test]
+    fn the_first_frame_must_be_settings() {
+        let mut out = Vec::new();
+        let mut h2 = H2::new(0, [0; 18], 250, &mut out);
+        out.clear();
+        let mut b = Vec::new();
+        frame::write(&mut b, frame::PING, 0, 0, b"12345678");
+        let (mut pos, mut seq) = (0, 0);
+        h2.step(&b, &mut pos, &mut out, &mut seq, DATE);
+        goaway(&frames(&out), frame::PROTOCOL_ERROR);
+        assert!(h2.over());
+    }
+
+    #[test]
+    fn ping_settings_and_unknown_frames() {
+        let mut c = Client::new(250);
+        let fs = c.send(frame::PING, 0, 0, b"abcdefgh");
+        assert_eq!(kinds(&fs), vec![(frame::PING, frame::ACK, 0)]);
+        assert_eq!(fs[0].1, b"abcdefgh");
+        assert!(c.send(frame::PING, frame::ACK, 0, b"abcdefgh").is_empty());
+        assert!(c.send(0x20, 0, 0, b"?").is_empty(), "unknown frame");
+        assert!(c.send(frame::PRIORITY, 0, 9, b"\0\0\0\x01\x10").is_empty());
+        let fs = c.send(frame::PRIORITY, 0, 9, b"\0\0\0\x09\x10");
+        assert_eq!(code(&fs), frame::PROTOCOL_ERROR, "depends on itself");
+        // ENABLE_PUSH 2 is not allowed
+        goaway(
+            &c.send(frame::SETTINGS, 0, 0, b"\0\x02\0\0\0\x02"),
+            frame::PROTOCOL_ERROR,
+        );
+    }
+
+    #[test]
+    fn a_frame_over_our_max_frame_size() {
+        let mut c = Client::new(250);
+        // only the head is there: the error comes before the payload
+        let mut b = Vec::new();
+        frame::write(&mut b, frame::DATA, 0, 1, &[0; 16385]);
+        goaway(&c.feed(&b[..frame::HEAD]), frame::FRAME_SIZE_ERROR);
+        assert!(c.h2.over());
+    }
+
+    #[test]
+    fn a_get_becomes_a_record() {
+        let mut c = Client::new(250);
+        let mut fields = GET.to_vec();
+        fields.extend([
+            ("cookie", "a=1"),
+            ("x-y", "z"),
+            ("cookie", "b=2"),
+            ("te", "trailers"),
+        ]);
+        assert!(c.get(1, &fields).is_empty());
+        let (flags, m, t, hs) = record(&c.recs[0]);
+        assert_eq!(flags, 8, "flag bit 3: HTTP/2");
+        assert_eq!((m.as_str(), t.as_str()), ("GET", "/a?b"));
+        let hs: Vec<_> = hs.iter().map(|(n, v)| format!("{n}: {v}")).collect();
+        assert_eq!(
+            hs,
+            [
+                "x-y: z",
+                "te: trailers",
+                "cookie: a=1; b=2",
+                "host: example.test"
+            ]
+        );
+        // the id: connection 1, seq 0
+        assert_eq!(
+            u64::from_le_bytes(c.recs[0][..8].try_into().unwrap()),
+            1 << 32
+        );
+        // a host header wins over :authority; a raw byte in the path is escaped
+        let mut b = Vec::new();
+        for (n, v) in [
+            (":method", &b"GET"[..]),
+            (":scheme", b"http"),
+            (":path", b"/\xc3\xa9"),
+            (":authority", b"a"),
+            ("host", b"h"),
+        ] {
+            encode_field(n.as_bytes(), v, &mut b);
+        }
+        c.send(
+            frame::HEADERS,
+            frame::END_STREAM | frame::END_HEADERS,
+            3,
+            &b,
+        );
+        let (_, _, t, hs) = record(&c.recs[1]);
+        assert_eq!(t, "/%C3%A9");
+        assert_eq!(hs, [("host".to_string(), "h".to_string())]);
+    }
+
+    #[test]
+    fn headers_with_continuation() {
+        let mut c = Client::new(250);
+        let b = block(GET);
+        assert!(
+            c.send(frame::HEADERS, frame::END_STREAM, 1, &b[..3])
+                .is_empty()
+        );
+        // nothing else may come in between
+        let mut d = Client::new(250);
+        d.send(frame::HEADERS, frame::END_STREAM, 1, &b[..3]);
+        goaway(
+            &d.send(frame::PING, 0, 0, b"12345678"),
+            frame::PROTOCOL_ERROR,
+        );
+        assert!(c.send(frame::CONTINUATION, 0, 1, &b[3..5]).is_empty());
+        assert!(
+            c.send(frame::CONTINUATION, frame::END_HEADERS, 1, &b[5..])
+                .is_empty()
+        );
+        assert_eq!(c.recs.len(), 1);
+        // a CONTINUATION with no HEADERS
+        goaway(
+            &c.send(frame::CONTINUATION, frame::END_HEADERS, 3, &b),
+            frame::PROTOCOL_ERROR,
+        );
+    }
+
+    #[test]
+    fn request_checks() {
+        let bad: &[&[(&str, &str)]] = &[
+            &[(":method", "GET"), (":scheme", "http")],
+            &[(":method", "GET"), (":path", "/")],
+            &[(":scheme", "http"), (":path", "/")],
+            &[
+                (":method", "GET"),
+                (":method", "GET"),
+                (":scheme", "http"),
+                (":path", "/"),
+            ],
+            &[
+                (":method", "GET"),
+                (":scheme", "http"),
+                ("x", "1"),
+                (":path", "/"),
+            ],
+            &[
+                (":method", "GET"),
+                (":scheme", "http"),
+                (":path", "/"),
+                (":status", "200"),
+            ],
+            &[
+                (":method", "GET"),
+                (":scheme", "http"),
+                (":path", "/"),
+                (":foo", "1"),
+            ],
+            &[
+                (":method", "GET"),
+                (":scheme", "http"),
+                (":path", "/"),
+                ("X-Up", "1"),
+            ],
+            &[
+                (":method", "GET"),
+                (":scheme", "http"),
+                (":path", "/"),
+                ("connection", "close"),
+            ],
+            &[
+                (":method", "GET"),
+                (":scheme", "http"),
+                (":path", "/"),
+                ("upgrade", "x"),
+            ],
+            &[
+                (":method", "GET"),
+                (":scheme", "http"),
+                (":path", "/"),
+                ("transfer-encoding", "chunked"),
+            ],
+            &[
+                (":method", "GET"),
+                (":scheme", "http"),
+                (":path", "/"),
+                ("te", "gzip"),
+            ],
+            &[
+                (":method", "GET"),
+                (":scheme", "http"),
+                (":path", "/"),
+                ("x", "a\r\nb"),
+            ],
+            &[
+                (":method", "GET"),
+                (":scheme", "http"),
+                (":path", "/"),
+                ("x", " a"),
+            ],
+            &[(":method", "GET"), (":scheme", "http"), (":path", "/a b")],
+            &[(":method", "GET"), (":scheme", "http"), (":path", "")],
+            // a body length, but END_STREAM is on HEADERS
+            &[
+                (":method", "GET"),
+                (":scheme", "http"),
+                (":path", "/"),
+                ("content-length", "5"),
+            ],
+        ];
+        for (i, fields) in bad.iter().enumerate() {
+            let mut c = Client::new(250);
+            let id = 1;
+            let fs = c.get(id, fields);
+            assert_eq!(kinds(&fs), rst(id, 0), "{fields:?}");
+            assert_eq!(code(&fs), frame::PROTOCOL_ERROR, "case {i}");
+            assert!(c.recs.is_empty());
+            // the connection goes on
+            assert!(c.get(3, GET).is_empty());
+            assert_eq!(c.recs.len(), 1);
+        }
+        let mut c = Client::new(250);
+        assert!(
+            c.get(1, &[GET, &[("content-length", "0")]].concat())
+                .is_empty()
+        );
+        // CONNECT gets 405, too many headers 431
+        let fs = c.get(3, &[(":method", "CONNECT"), (":authority", "a:1")]);
+        assert_eq!(
+            kinds(&fs),
+            vec![(frame::HEADERS, frame::END_STREAM | frame::END_HEADERS, 3)]
+        );
+        assert_eq!(decode(&fs[0].1)[0], (":status".into(), "405".into()));
+        let many: Vec<(String, String)> = (0..=MAX_HEADERS)
+            .map(|i| (format!("x{i}"), "v".into()))
+            .collect();
+        let many: Vec<(&str, &str)> = many.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
+        let fs = c.get(5, &[GET, &many].concat());
+        assert_eq!(decode(&fs[0].1)[0], (":status".into(), "431".into()));
+        assert_eq!(c.recs.len(), 1);
+    }
+
+    #[test]
+    fn an_hpack_error_closes_the_connection() {
+        let mut c = Client::new(250);
+        // index 70 is past the end of the table
+        let fs = c.send(
+            frame::HEADERS,
+            frame::END_STREAM | frame::END_HEADERS,
+            1,
+            &[0x80 | 70],
+        );
+        goaway(&fs, frame::COMPRESSION_ERROR);
+    }
+
+    #[test]
+    fn stream_states() {
+        let mut c = Client::new(250);
+        goaway(&c.get(2, GET), frame::PROTOCOL_ERROR); // even id
+        let mut c = Client::new(250);
+        c.get(5, GET);
+        assert_eq!(c.h2.state(5), State::Open);
+        assert_eq!(c.h2.state(3), State::Closed);
+        assert_eq!(c.h2.state(7), State::Idle);
+        // DATA after END_STREAM: a stream error, Dart hears it is gone
+        let fs = c.send(frame::DATA, 0, 5, b"x");
+        assert_eq!(code(&fs), frame::STREAM_CLOSED);
+        assert_eq!(c.h2.gone, vec![0]);
+        assert_eq!(c.h2.state(5), State::Closed);
+        // DATA on a closed stream is ignored, on an idle one it is an error
+        assert!(c.send(frame::DATA, 0, 5, b"x").is_empty());
+        goaway(&c.send(frame::DATA, 0, 7, b"x"), frame::PROTOCOL_ERROR);
+        // a lower id than one used before
+        let mut c = Client::new(250);
+        c.get(5, GET);
+        goaway(&c.get(3, GET), frame::STREAM_CLOSED);
+        // RST_STREAM on an idle stream, PUSH_PROMISE from a client
+        let mut c = Client::new(250);
+        goaway(
+            &c.send(frame::RST_STREAM, 0, 1, &[0; 4]),
+            frame::PROTOCOL_ERROR,
+        );
+        let mut c = Client::new(250);
+        goaway(
+            &c.send(frame::PUSH_PROMISE, frame::END_HEADERS, 1, &[0, 0, 0, 2]),
+            frame::PROTOCOL_ERROR,
+        );
+    }
+
+    #[test]
+    fn a_client_reset_makes_the_request_gone() {
+        let mut c = Client::new(250);
+        c.get(1, GET);
+        c.get(3, GET);
+        assert!(
+            c.send(frame::RST_STREAM, 0, 1, &8u32.to_be_bytes())
+                .is_empty()
+        );
+        assert_eq!(c.h2.gone, vec![0]);
+        assert_eq!(c.h2.open(), 1);
+        // a late answer goes nowhere
+        assert!(c.answer(0, 200, b"", b"late").is_empty());
+        assert_eq!(
+            kinds(&c.answer(1, 200, b"", b"")),
+            vec![(frame::HEADERS, 5, 3)]
+        );
+        assert_eq!(c.h2.open(), 0);
+    }
+
+    #[test]
+    fn answer_headers() {
+        let mut c = Client::new(250);
+        c.get(1, GET);
+        let lines =
+            b"Content-Type: text/plain\r\nconnection: close\r\nx-a: 1\r\ncontent-length: 99\r\n";
+        let fs = c.answer(0, 200, lines, b"hello");
+        assert_eq!(
+            kinds(&fs),
+            vec![
+                (frame::HEADERS, frame::END_HEADERS, 1),
+                (frame::DATA, frame::END_STREAM, 1)
+            ]
+        );
+        let hs: Vec<_> = decode(&fs[0].1)
+            .iter()
+            .map(|(n, v)| format!("{n}: {v}"))
+            .collect();
+        assert_eq!(
+            hs,
+            [
+                ":status: 200",
+                "content-type: text/plain",
+                "x-a: 1",
+                "content-length: 5",
+                "date: Thu, 01 Jan 2026 00:00:00 GMT"
+            ]
+        );
+        assert_eq!(fs[1].1, b"hello");
+        // HEAD, 204 and an empty body: END_STREAM on HEADERS, no DATA
+        let mut c = Client::new(250);
+        c.get(
+            1,
+            &[(":method", "HEAD"), (":scheme", "http"), (":path", "/")],
+        );
+        c.get(3, GET);
+        c.get(5, GET);
+        let end = frame::END_STREAM | frame::END_HEADERS;
+        assert_eq!(
+            kinds(&c.answer(0, 200, b"", b"body")),
+            vec![(frame::HEADERS, end, 1)]
+        );
+        let fs = c.answer(1, 204, b"", b"");
+        assert_eq!(kinds(&fs), vec![(frame::HEADERS, end, 3)]);
+        assert!(!decode(&fs[0].1).iter().any(|(n, _)| n == "content-length"));
+        assert_eq!(
+            kinds(&c.answer(2, 200, b"", b"")),
+            vec![(frame::HEADERS, end, 5)]
+        );
+        assert_eq!(c.h2.open(), 0);
+    }
+
+    #[test]
+    fn send_windows() {
+        let mut c = Client::new(250);
+        c.get(1, GET);
+        let body = vec![7u8; 100_000];
+        let fs = c.answer(0, 200, b"", &body);
+        // the default windows: 65535 bytes in frames of 16384
+        let sent: usize = fs
+            .iter()
+            .filter(|f| f.0.kind == frame::DATA)
+            .map(|f| f.1.len())
+            .sum();
+        assert_eq!(sent, 65_535);
+        assert!(fs.iter().all(|f| f.1.len() <= 16_384));
+        assert!(!c.h2.can_send());
+        // the connection window alone is not enough
+        c.send(frame::WINDOW_UPDATE, 0, 0, &100_000u32.to_be_bytes());
+        assert!(!c.h2.can_send());
+        c.send(frame::WINDOW_UPDATE, 0, 1, &10u32.to_be_bytes());
+        let fs = c.pump();
+        assert_eq!(fs.iter().map(|f| f.1.len()).sum::<usize>(), 10);
+        // a bigger INITIAL_WINDOW_SIZE raises the open streams too
+        c.send(frame::SETTINGS, 0, 0, b"\0\x04\0\x10\0\0");
+        let fs = c.pump();
+        let last = fs.last().unwrap();
+        assert_eq!(last.0.flags, frame::END_STREAM);
+        assert_eq!(
+            fs.iter().map(|f| f.1.len()).sum::<usize>(),
+            100_000 - 65_545
+        );
+        assert_eq!(c.h2.open(), 0);
+        // a 0 increment, and a window over 2^31 - 1
+        let mut c = Client::new(250);
+        c.get(1, GET);
+        assert_eq!(
+            code(&c.send(frame::WINDOW_UPDATE, 0, 1, &[0; 4])),
+            frame::PROTOCOL_ERROR
+        );
+        c.get(3, GET);
+        let fs = c.send(frame::WINDOW_UPDATE, 0, 3, &0x7fff_ffffu32.to_be_bytes());
+        assert_eq!(code(&fs), frame::FLOW_CONTROL_ERROR);
+        assert_eq!(fs[0].0.kind, frame::RST_STREAM);
+        goaway(
+            &c.send(frame::WINDOW_UPDATE, 0, 0, &[0; 4]),
+            frame::PROTOCOL_ERROR,
+        );
+        let mut c = Client::new(250);
+        goaway(
+            &c.send(frame::WINDOW_UPDATE, 0, 0, &0x7fff_ffffu32.to_be_bytes()),
+            frame::FLOW_CONTROL_ERROR,
+        );
+        let mut c = Client::new(250);
+        goaway(
+            &c.send(frame::SETTINGS, 0, 0, b"\0\x04\x80\0\0\0"),
+            frame::FLOW_CONTROL_ERROR,
+        );
+    }
+
+    #[test]
+    fn a_bigger_max_frame_size_and_a_smaller_window() {
+        let mut c = Client::new(250);
+        // MAX_FRAME_SIZE 20000, and INITIAL_WINDOW_SIZE 0
+        c.send(frame::SETTINGS, 0, 0, b"\0\x05\0\0\x4e\x20\0\x04\0\0\0\0");
+        c.send(frame::WINDOW_UPDATE, 0, 0, &1_000_000u32.to_be_bytes());
+        c.get(1, GET);
+        let fs = c.answer(0, 200, b"", &[1u8; 50_000]);
+        assert_eq!(
+            kinds(&fs),
+            vec![(frame::HEADERS, frame::END_HEADERS, 1)],
+            "no window"
+        );
+        c.send(frame::WINDOW_UPDATE, 0, 1, &60_000u32.to_be_bytes());
+        let lens: Vec<_> = c.pump().iter().map(|f| f.1.len()).collect();
+        assert_eq!(lens, [20_000, 20_000, 10_000]);
+        // a MAX_FRAME_SIZE out of range
+        goaway(
+            &c.send(frame::SETTINGS, 0, 0, b"\0\x05\0\0\x10\0"),
+            frame::PROTOCOL_ERROR,
+        );
+    }
+
+    #[test]
+    fn streams_take_turns() {
+        let mut c = Client::new(250);
+        c.send(frame::WINDOW_UPDATE, 0, 0, &10_000_000u32.to_be_bytes());
+        c.send(frame::SETTINGS, 0, 0, b"\0\x04\0\x10\0\0");
+        c.get(1, GET);
+        c.get(3, GET);
+        c.get(5, GET);
+        let mut out = Vec::new();
+        c.h2.answer(0, 200, b"", &[1; 40_000], DATE, &mut out);
+        c.h2.answer(1, 200, b"", &[2; 40_000], DATE, &mut out);
+        c.h2.answer(2, 200, b"", b"small", DATE, &mut out);
+        c.h2.send(&mut out, 0);
+        // HOLD is full after 4 frames; once written, the rest goes
+        let written = out.len();
+        c.h2.send(&mut out, written);
+        let ids: Vec<_> = frames(&out)
+            .iter()
+            .filter(|f| f.0.kind == frame::DATA)
+            .map(|f| f.0.id)
+            .collect();
+        assert_eq!(ids, [1, 3, 5, 1, 3, 1, 3]);
+        // the write buffer holds at most HOLD answer bytes before a write
+        let mut c = Client::new(250);
+        c.send(frame::WINDOW_UPDATE, 0, 0, &10_000_000u32.to_be_bytes());
+        c.send(frame::SETTINGS, 0, 0, b"\0\x04\0\x10\0\0");
+        c.get(1, GET);
+        let fs = c.answer(0, 200, b"", &[1; 400_000]);
+        let sent: usize = fs.iter().map(|f| f.1.len()).sum();
+        assert!(sent < HOLD + 16_384 + 100, "{sent}");
+        assert!(c.h2.can_send());
+    }
+
+    #[test]
+    fn max_concurrent_streams() {
+        let mut c = Client::new(2);
+        c.get(1, GET);
+        c.get(3, GET);
+        let fs = c.get(5, GET);
+        assert_eq!(kinds(&fs), rst(5, 0));
+        assert_eq!(code(&fs), frame::REFUSED_STREAM);
+        assert_eq!(c.recs.len(), 2);
+        c.answer(0, 200, b"", b"");
+        assert!(c.get(7, GET).is_empty(), "room again");
+        assert_eq!(c.recs.len(), 3);
+    }
+
+    #[test]
+    fn graceful_drain() {
+        let mut c = Client::new(250);
+        c.get(1, GET);
+        c.get(3, GET);
+        let mut out = Vec::new();
+        c.h2.drain(&mut out);
+        let fs = frames(&out);
+        goaway(&fs, frame::NO_ERROR);
+        assert_eq!(fs[0].1[..4], 3u32.to_be_bytes(), "the last stream id");
+        // new streams are ignored, open ones finish
+        assert!(c.get(5, GET).is_empty());
+        assert_eq!(c.recs.len(), 2);
+        assert!(!c.h2.over());
+        c.answer(0, 200, b"", b"a");
+        c.answer(1, 200, b"", b"b");
+        assert!(c.h2.over());
+        // a GOAWAY from the client works the same
+        let mut c = Client::new(250);
+        c.get(1, GET);
+        c.send(frame::GOAWAY, 0, 0, &[0; 8]);
+        assert!(!c.h2.over());
+        c.answer(0, 200, b"", b"");
+        assert!(c.h2.over());
+    }
+
+    /// 2b: a request with a body gets 501 and RST_STREAM NO_ERROR. Its
+    /// DATA still counts against the connection window, which goes back
+    /// to the client with WINDOW_UPDATE.
+    #[test]
+    fn a_body_gets_501_and_the_window_goes_back() {
+        let mut c = Client::new(250);
+        let fs = c.send(frame::HEADERS, frame::END_HEADERS, 1, &block(GET));
+        assert_eq!(
+            kinds(&fs),
+            vec![(frame::HEADERS, 5, 1), (frame::RST_STREAM, 0, 1)]
+        );
+        assert_eq!(decode(&fs[0].1)[0], (":status".into(), "501".into()));
+        assert_eq!(code(&fs), frame::NO_ERROR);
+        assert!(c.recs.is_empty());
+        let mut updates = 0u64;
+        for _ in 0..1100 {
+            for (h, p) in c.send(frame::DATA, 0, 1, &[0; 16_384]) {
+                assert_eq!((h.kind, h.id), (frame::WINDOW_UPDATE, 0));
+                updates += u64::from(u32::from_be_bytes(p[..4].try_into().unwrap()));
+            }
+        }
+        assert!(updates >= 8 << 20, "{updates}");
+        assert!(!c.h2.over(), "no flow control error");
+    }
+}

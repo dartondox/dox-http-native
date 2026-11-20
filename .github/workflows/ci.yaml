@@ -57,6 +57,8 @@ jobs:
       - name: Dart tests
         run: |
           dart test --concurrency=1
+          # the HTTP/1.1 tests again, with HTTP/2 on: nothing may change
+          DOX_TEST_HTTP2=1 dart test --concurrency=1 test/server_test.dart
 
   build:
     if: startsWith(github.ref, 'refs/tags/v')

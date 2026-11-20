@@ -1,11 +1,864 @@
-//! HTTP/2. For now only HPACK; the connection code comes in the next PR.
+//! HTTP/2 over cleartext TCP ("h2c" with prior knowledge, RFC 9113).
+//!
+//! With `http2` on, the first bytes of a new connection pick the protocol:
+//! the client preface means HTTP/2 (see `Conn::sniff` in run.rs). Then all
+//! bytes of the connection go to its [H2]. It turns each request into the
+//! same request record Dart reads for HTTP/1.1 (flag bit 3 set), and each
+//! answer of Dart into HEADERS and DATA frames. Answers go out as soon as
+//! they come, in any order. Streams with body bytes take turns, one DATA
+//! frame each.
+//!
+//! 2a: a request must end with its HEADERS (END_STREAM). A request with a
+//! body gets 501 (marked `2b:`). Streamed answers (kind 6) get
+//! RST_STREAM. No flood limits yet (plan 4.10, PR 2c).
 
-// ponytail: nothing outside tests uses this yet. Drop this line when the
-// connection code uses the decoder and the encoder.
-#![allow(dead_code)]
-
+pub(crate) mod frame;
 pub(crate) mod hpack;
 mod huffman;
+mod stream;
+
+use std::collections::{HashMap, VecDeque};
+
+use frame::{Error, Frame, Head};
+use hpack::{Decoder, encode_field};
+use stream::Stream;
+
+use crate::run::{MAX_HEADERS, escape_target, write_head};
+use crate::{MAX_HEAD, REQ_HEAD};
+
+/// The client preface (RFC 9113 3.4).
+pub(crate) const PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+/// Our SETTINGS_MAX_FRAME_SIZE (the default). A bigger frame from the
+/// client is a FRAME_SIZE_ERROR.
+const MAX_FRAME: usize = 16 * 1024;
+/// Our SETTINGS_INITIAL_WINDOW_SIZE: bytes a client may send on one stream
+/// before our WINDOW_UPDATE.
+const STREAM_WINDOW: u32 = 1 << 20;
+/// Our connection receive window, raised to this right after our SETTINGS.
+const CONN_WINDOW: i64 = 16 << 20;
+/// The window of a new connection or stream before any SETTINGS or
+/// WINDOW_UPDATE (RFC 9113 6.9.2).
+const DEFAULT_WINDOW: i64 = 65_535;
+/// The HPACK table size we allow the client (the default 4096).
+const TABLE_SIZE: usize = 4096;
+/// The largest MAX_FRAME_SIZE a client may set (RFC 9113 6.5.2).
+const MAX_FRAME_LIMIT: u32 = (1 << 24) - 1;
+/// Answer bytes in the write buffer before more DATA frames are added.
+/// The rest waits in its stream, so the buffer stays small and the
+/// streams take turns.
+const HOLD: usize = 64 * 1024;
+/// Request flag bit 3: the request came over HTTP/2.
+const FLAG_H2: u32 = 8;
+
+// SETTINGS ids (RFC 9113 6.5.2)
+const ENABLE_PUSH: u16 = 2;
+const MAX_CONCURRENT_STREAMS: u16 = 3;
+const INITIAL_WINDOW_SIZE: u16 = 4;
+const MAX_FRAME_SIZE: u16 = 5;
+const MAX_HEADER_LIST_SIZE: u16 = 6;
+
+const fn conn_err(code: u32) -> Error {
+    Error {
+        code,
+        stream: false,
+    }
+}
+
+const fn stream_err(code: u32) -> Error {
+    Error { code, stream: true }
+}
+
+/// Where a stream id is, as seen from the frames of the client (RFC 9113
+/// 5.1). 2a keeps a stream only while its answer is due, so "open" here
+/// is "half-closed (remote)".
+#[derive(Debug, PartialEq)]
+pub(crate) enum State {
+    Idle,
+    Open,
+    Closed,
+}
+
+/// The HTTP/2 state of one connection.
+pub(crate) struct H2 {
+    /// (connection index << 32): the high half of each request id
+    base: u64,
+    peer: [u8; 18],
+    dec: Decoder,
+    /// our MAX_CONCURRENT_STREAMS
+    max_streams: usize,
+    /// the client sent its first SETTINGS
+    greeted: bool,
+    /// the client's MAX_FRAME_SIZE and INITIAL_WINDOW_SIZE
+    peer_frame: usize,
+    peer_window: i64,
+    /// the connection send window
+    window: i64,
+    /// the connection receive window left
+    recv: i64,
+    /// a header block that waits for CONTINUATION: (stream id,
+    /// END_STREAM, bytes so far)
+    block: Option<(u32, bool, Vec<u8>)>,
+    /// the highest stream id of the client so far
+    last: u32,
+    /// we sent GOAWAY NO_ERROR: no new streams
+    away: bool,
+    /// the client sent GOAWAY
+    peer_away: bool,
+    /// a connection error: GOAWAY is sent, close once it is written
+    dead: bool,
+    streams: HashMap<u32, Stream>,
+    /// request seq to stream id
+    seqs: HashMap<u32, u32>,
+    /// streams with body bytes to send, in turn order
+    turns: VecDeque<u32>,
+    /// the record of the last request, until it fits in Dart's buffer
+    pub(crate) held: Option<Vec<u8>>,
+    /// requests whose stream ended before Dart answered: Dart gets
+    /// REQUEST_GONE for each
+    pub(crate) gone: Vec<u32>,
+}
+
+impl H2 {
+    /// After the client preface: writes our SETTINGS and raises the
+    /// connection window.
+    pub(crate) fn new(
+        idx: usize,
+        peer: [u8; 18],
+        max_streams: u32,
+        out: &mut Vec<u8>,
+    ) -> Box<Self> {
+        frame::write_settings(
+            out,
+            &[
+                (MAX_CONCURRENT_STREAMS, max_streams),
+                (INITIAL_WINDOW_SIZE, STREAM_WINDOW),
+                (MAX_FRAME_SIZE, MAX_FRAME as u32),
+                (MAX_HEADER_LIST_SIZE, MAX_HEAD as u32),
+                (ENABLE_PUSH, 0),
+            ],
+        );
+        frame::write_window(out, 0, (CONN_WINDOW - DEFAULT_WINDOW) as u32);
+        Box::new(H2 {
+            base: (idx as u64) << 32,
+            peer,
+            dec: Decoder::new(TABLE_SIZE),
+            max_streams: max_streams as usize,
+            greeted: false,
+            peer_frame: MAX_FRAME,
+            peer_window: DEFAULT_WINDOW,
+            window: DEFAULT_WINDOW,
+            recv: CONN_WINDOW,
+            block: None,
+            last: 0,
+            away: false,
+            peer_away: false,
+            dead: false,
+            streams: HashMap::new(),
+            seqs: HashMap::new(),
+            turns: VecDeque::new(),
+            held: None,
+            gone: Vec::new(),
+        })
+    }
+
+    /// Streams whose answer is not all sent.
+    pub(crate) fn open(&self) -> usize {
+        self.streams.len()
+    }
+
+    /// The seqs of requests Dart has not answered (for REQUEST_GONE when
+    /// the connection dies).
+    pub(crate) fn unanswered(&self) -> impl Iterator<Item = u32> + '_ {
+        self.streams
+            .values()
+            .filter(|s| !s.answered)
+            .map(|s| s.seq)
+            .chain(self.gone.iter().copied())
+    }
+
+    /// True when the connection can close once the write buffer is out.
+    pub(crate) fn over(&self) -> bool {
+        self.dead || ((self.away || self.peer_away) && self.streams.is_empty())
+    }
+
+    pub(crate) fn state(&self, id: u32) -> State {
+        if self.streams.contains_key(&id) {
+            State::Open
+        } else if !id.is_multiple_of(2) && id <= self.last {
+            State::Closed
+        } else {
+            State::Idle
+        }
+    }
+
+    /// Reads one whole frame of `buf[*pos..]`. A request goes to `held`.
+    /// False when no whole frame is there (or the connection is dead).
+    pub(crate) fn step(
+        &mut self,
+        buf: &[u8],
+        pos: &mut usize,
+        out: &mut Vec<u8>,
+        seq: &mut u32,
+        date: &[u8],
+    ) -> bool {
+        if self.dead {
+            *pos = buf.len(); // the connection closes: drop the rest
+            return false;
+        }
+        let Some(h) = frame::read_head(&buf[*pos..]) else {
+            return false;
+        };
+        if h.len > MAX_FRAME {
+            self.fail(out, frame::FRAME_SIZE_ERROR);
+            return false;
+        }
+        let end = *pos + frame::HEAD + h.len;
+        if buf.len() < end {
+            return false;
+        }
+        let payload = &buf[*pos + frame::HEAD..end];
+        *pos = end;
+        if let Err(e) = self.frame(&h, payload, out, seq, date) {
+            if e.stream {
+                self.reset(out, h.id, e.code);
+            } else {
+                self.fail(out, e.code);
+            }
+        }
+        true
+    }
+
+    fn frame(
+        &mut self,
+        h: &Head,
+        p: &[u8],
+        out: &mut Vec<u8>,
+        seq: &mut u32,
+        date: &[u8],
+    ) -> Result<(), Error> {
+        // the client's first frame must be SETTINGS (RFC 9113 3.4)
+        if !self.greeted {
+            if h.kind != frame::SETTINGS || h.flags & frame::ACK != 0 {
+                return Err(conn_err(frame::PROTOCOL_ERROR));
+            }
+            self.greeted = true;
+        }
+        // a header block in parts: only its CONTINUATION frames may come
+        // in between (RFC 9113 6.10)
+        if let Some((id, ..)) = self.block
+            && (h.kind != frame::CONTINUATION || h.id != id)
+        {
+            return Err(conn_err(frame::PROTOCOL_ERROR));
+        }
+        match frame::parse(h, p)? {
+            Frame::Data { flow, .. } => self.data(h.id, flow, out),
+            Frame::Headers {
+                end_stream,
+                end_headers,
+                dep,
+                block,
+            } => {
+                // ponytail: a stream that depends on itself is a stream
+                // error in the RFC. A connection error is allowed too and
+                // needs no HPACK decode of the block.
+                if dep == Some(h.id) || h.id.is_multiple_of(2) {
+                    return Err(conn_err(frame::PROTOCOL_ERROR));
+                }
+                match self.state(h.id) {
+                    State::Closed => return Err(conn_err(frame::STREAM_CLOSED)),
+                    // trailers come in 2b; on a stream whose request is
+                    // whole this is a STREAM_CLOSED stream error, after
+                    // the decode (the table must stay in sync)
+                    State::Open | State::Idle => {}
+                }
+                if end_headers {
+                    self.request(h.id, end_stream, block, out, seq, date)
+                } else {
+                    self.block = Some((h.id, end_stream, block.to_vec()));
+                    Ok(())
+                }
+            }
+            Frame::Continuation { end_headers, block } => {
+                let Some((_, _, b)) = self.block.as_mut() else {
+                    return Err(conn_err(frame::PROTOCOL_ERROR));
+                };
+                // ponytail: the encoded block is capped at MAX_HEAD, like
+                // the decoded list. A real client never comes close.
+                if b.len() + block.len() > MAX_HEAD {
+                    return Err(conn_err(frame::ENHANCE_YOUR_CALM));
+                }
+                b.extend_from_slice(block);
+                if end_headers {
+                    let (id, end_stream, b) = self.block.take().unwrap();
+                    return self.request(id, end_stream, &b, out, seq, date);
+                }
+                Ok(())
+            }
+            // the priority scheme is deprecated (RFC 9113 5.3.2): ignored
+            Frame::Priority { dep } if dep == h.id => Err(stream_err(frame::PROTOCOL_ERROR)),
+            Frame::Priority { .. } => Ok(()),
+            Frame::RstStream { .. } => {
+                if self.state(h.id) == State::Idle {
+                    return Err(conn_err(frame::PROTOCOL_ERROR));
+                }
+                self.drop_stream(h.id);
+                Ok(())
+            }
+            Frame::Settings { ack: true, .. } => Ok(()),
+            Frame::Settings { params, .. } => {
+                self.settings(params)?;
+                frame::write(out, frame::SETTINGS, frame::ACK, 0, &[]);
+                Ok(())
+            }
+            // a client may not push (RFC 9113 8.4)
+            Frame::PushPromise { .. } => Err(conn_err(frame::PROTOCOL_ERROR)),
+            Frame::Ping { ack: true, .. } => Ok(()),
+            Frame::Ping { data, .. } => {
+                frame::write(out, frame::PING, frame::ACK, 0, &data);
+                Ok(())
+            }
+            // the client opens no more streams: finish the open ones
+            Frame::GoAway { .. } => {
+                self.peer_away = true;
+                Ok(())
+            }
+            Frame::WindowUpdate { inc } => self.window_update(h.id, inc),
+            Frame::Unknown => Ok(()),
+        }
+    }
+
+    /// DATA. 2b: request bodies. Here only the connection window counts
+    /// it, and the bytes are dropped.
+    fn data(&mut self, id: u32, flow: usize, out: &mut Vec<u8>) -> Result<(), Error> {
+        let state = self.state(id);
+        if state == State::Idle {
+            return Err(conn_err(frame::PROTOCOL_ERROR));
+        }
+        if flow as i64 > self.recv {
+            return Err(conn_err(frame::FLOW_CONTROL_ERROR));
+        }
+        self.recv -= flow as i64;
+        // give the window back once half of it is used, so the
+        // connection never stalls
+        if self.recv < CONN_WINDOW / 2 {
+            frame::write_window(out, 0, (CONN_WINDOW - self.recv) as u32);
+            self.recv = CONN_WINDOW;
+        }
+        if state == State::Open {
+            // the request is whole: no more DATA (RFC 9113 5.1)
+            return Err(stream_err(frame::STREAM_CLOSED));
+        }
+        // ponytail: DATA on a closed stream is ignored. It may be a stream
+        // we reset (its DATA was in flight); we keep no list of those.
+        Ok(())
+    }
+
+    fn window_update(&mut self, id: u32, inc: u32) -> Result<(), Error> {
+        let inc = i64::from(inc);
+        if id == 0 {
+            if inc == 0 {
+                return Err(conn_err(frame::PROTOCOL_ERROR));
+            }
+            self.window += inc;
+            if self.window > frame::MAX_WINDOW {
+                return Err(conn_err(frame::FLOW_CONTROL_ERROR));
+            }
+            return Ok(());
+        }
+        if self.state(id) == State::Idle {
+            return Err(conn_err(frame::PROTOCOL_ERROR));
+        }
+        if inc == 0 {
+            return Err(stream_err(frame::PROTOCOL_ERROR));
+        }
+        if let Some(s) = self.streams.get_mut(&id) {
+            s.window += inc;
+            if s.window > frame::MAX_WINDOW {
+                return Err(stream_err(frame::FLOW_CONTROL_ERROR));
+            }
+        }
+        Ok(())
+    }
+
+    fn settings(&mut self, params: &[u8]) -> Result<(), Error> {
+        for (id, v) in frame::settings(params) {
+            match id {
+                ENABLE_PUSH if v > 1 => return Err(conn_err(frame::PROTOCOL_ERROR)),
+                INITIAL_WINDOW_SIZE => {
+                    let v = i64::from(v);
+                    if v > frame::MAX_WINDOW {
+                        return Err(conn_err(frame::FLOW_CONTROL_ERROR));
+                    }
+                    // the change applies to all open streams (RFC 9113 6.9.2)
+                    let delta = v - self.peer_window;
+                    for s in self.streams.values_mut() {
+                        s.window += delta;
+                        if s.window > frame::MAX_WINDOW {
+                            return Err(conn_err(frame::FLOW_CONTROL_ERROR));
+                        }
+                    }
+                    self.peer_window = v;
+                }
+                MAX_FRAME_SIZE => {
+                    if !(MAX_FRAME as u32..=MAX_FRAME_LIMIT).contains(&v) {
+                        return Err(conn_err(frame::PROTOCOL_ERROR));
+                    }
+                    self.peer_frame = v as usize;
+                }
+                // the rest does not matter to us: we never push, and our
+                // encoder uses no dynamic table
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// A whole header block of stream `id`: decode it, check it, and make
+    /// the request record (or answer the error).
+    fn request(
+        &mut self,
+        id: u32,
+        end_stream: bool,
+        block: &[u8],
+        out: &mut Vec<u8>,
+        seq: &mut u32,
+        date: &[u8],
+    ) -> Result<(), Error> {
+        let known = self.streams.contains_key(&id);
+        if !known {
+            self.last = id;
+        }
+        let mut req = Req::default();
+        // any HPACK error leaves our table out of sync with the client's:
+        // the connection must close
+        self.dec
+            .decode(block, MAX_HEAD, |n, v| req.field(n, v))
+            .map_err(|_| conn_err(frame::COMPRESSION_ERROR))?;
+        if known {
+            return Err(stream_err(frame::STREAM_CLOSED));
+        }
+        if self.away || self.peer_away {
+            return Ok(()); // after GOAWAY: ignored (RFC 9113 6.8)
+        }
+        if self.streams.len() >= self.max_streams {
+            frame::write_rst(out, id, frame::REFUSED_STREAM);
+            return Ok(());
+        }
+        match req.check(end_stream) {
+            Check::Bad => Err(stream_err(frame::PROTOCOL_ERROR)),
+            Check::Status(status) => {
+                self.reply(out, id, status, end_stream, date);
+                Ok(())
+            }
+            // 2b: request bodies. Until then: 501, and the client stops.
+            Check::Ok if !end_stream => {
+                self.reply(out, id, 501, false, date);
+                Ok(())
+            }
+            Check::Ok => {
+                let head = req.method == b"HEAD";
+                let rec = req.record(self.base | u64::from(*seq), &self.peer);
+                self.held = Some(rec);
+                self.streams
+                    .insert(id, Stream::new(*seq, self.peer_window, head));
+                self.seqs.insert(*seq, id);
+                *seq = seq.wrapping_add(1);
+                Ok(())
+            }
+        }
+    }
+
+    /// Answers from Rust (eg. 405) with no body. When the client still
+    /// sends a body, RST_STREAM NO_ERROR then tells it to stop (RFC 9113
+    /// 8.1).
+    fn reply(&mut self, out: &mut Vec<u8>, id: u32, status: u16, whole: bool, date: &[u8]) {
+        let mut block = Vec::new();
+        status_field(status, &mut block);
+        encode_field(b"content-length", b"0", &mut block);
+        date_field(date, &mut block);
+        frame::write_headers(out, id, &block, true, self.peer_frame);
+        if !whole {
+            frame::write_rst(out, id, frame::NO_ERROR);
+        }
+    }
+
+    /// A stream error: RST_STREAM, and the stream is gone.
+    fn reset(&mut self, out: &mut Vec<u8>, id: u32, code: u32) {
+        frame::write_rst(out, id, code);
+        self.drop_stream(id);
+    }
+
+    fn drop_stream(&mut self, id: u32) {
+        if let Some(s) = self.streams.remove(&id) {
+            self.seqs.remove(&s.seq);
+            if !s.answered {
+                self.gone.push(s.seq);
+            }
+        }
+    }
+
+    /// A connection error: GOAWAY with this code, then close.
+    fn fail(&mut self, out: &mut Vec<u8>, code: u32) {
+        if !self.dead {
+            frame::write_goaway(out, self.last, code);
+            self.dead = true;
+        }
+    }
+
+    /// Graceful close: GOAWAY NO_ERROR with the last stream id. The open
+    /// streams finish, new ones are ignored.
+    pub(crate) fn drain(&mut self, out: &mut Vec<u8>) {
+        if !self.away && !self.dead {
+            frame::write_goaway(out, self.last, frame::NO_ERROR);
+            self.away = true;
+        }
+    }
+
+    /// The stream of request `seq`, when it waits for its answer.
+    fn due(&mut self, seq: u32) -> Option<(u32, &mut Stream)> {
+        if self.dead {
+            return None;
+        }
+        let id = *self.seqs.get(&seq)?;
+        let s = self.streams.get_mut(&id)?;
+        (!s.answered).then_some((id, s))
+    }
+
+    /// A gzip job starts for the answer of `seq`: keep its status and
+    /// lines. False when there is nothing to zip for (HEAD, or the stream
+    /// is gone).
+    pub(crate) fn defer(&mut self, seq: u32, status: u16, lines: &[u8]) -> bool {
+        match self.due(seq) {
+            Some((_, s)) if !s.head => {
+                s.answered = true;
+                s.zip = Some((status, lines.to_vec()));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The gzip job of `seq` is done: send the answer.
+    pub(crate) fn zipped(&mut self, seq: u32, body: &[u8], date: &[u8], out: &mut Vec<u8>) {
+        let Some(&id) = self.seqs.get(&seq) else {
+            return;
+        };
+        let Some((status, lines)) = self.streams.get_mut(&id).and_then(|s| s.zip.take()) else {
+            return;
+        };
+        self.send_answer(id, status, &lines, body, date, out);
+    }
+
+    /// A whole answer (kind 0) from Dart for request `seq`.
+    pub(crate) fn answer(
+        &mut self,
+        seq: u32,
+        status: u16,
+        lines: &[u8],
+        body: &[u8],
+        date: &[u8],
+        out: &mut Vec<u8>,
+    ) {
+        let Some((id, s)) = self.due(seq) else {
+            return; // the client reset it (or a second answer)
+        };
+        s.answered = true;
+        self.send_answer(id, status, lines, body, date, out);
+    }
+
+    /// 2b: streamed answers (kind 6) and WebSocket accepts (kind 1) on
+    /// HTTP/2. For now the stream gets RST_STREAM INTERNAL_ERROR.
+    pub(crate) fn refuse(&mut self, seq: u32, out: &mut Vec<u8>) {
+        if let Some((id, s)) = self.due(seq) {
+            s.answered = true;
+            self.reset(out, id, frame::INTERNAL_ERROR);
+        }
+    }
+
+    fn send_answer(
+        &mut self,
+        id: u32,
+        status: u16,
+        lines: &[u8],
+        body: &[u8],
+        date: &[u8],
+        out: &mut Vec<u8>,
+    ) {
+        if self.dead {
+            return;
+        }
+        let Some(s) = self.streams.get_mut(&id) else {
+            return;
+        };
+        // ponytail: a 1xx as the final answer is not valid in HTTP/2, and
+        // a status out of range is not either: both go out as 500
+        let status = if (200..=999).contains(&status) {
+            status
+        } else {
+            500
+        };
+        let no_body = status == 204 || status == 304;
+        let mut block = Vec::with_capacity(64 + lines.len());
+        status_field(status, &mut block);
+        for line in lines.split(|&c| c == b'\n') {
+            let Some(at) = line.iter().position(|&c| c == b':') else {
+                continue;
+            };
+            let name = line[..at].trim_ascii().to_ascii_lowercase();
+            if matches!(
+                &name[..],
+                b"connection"
+                    | b"keep-alive"
+                    | b"proxy-connection"
+                    | b"transfer-encoding"
+                    | b"upgrade"
+                    | b"content-length"
+            ) {
+                continue;
+            }
+            encode_field(&name, line[at + 1..].trim_ascii(), &mut block);
+        }
+        if !no_body {
+            encode_field(
+                b"content-length",
+                body.len().to_string().as_bytes(),
+                &mut block,
+            );
+        }
+        date_field(date, &mut block);
+        let silent = no_body || s.head || body.is_empty();
+        frame::write_headers(out, id, &block, silent, self.peer_frame);
+        if silent {
+            self.drop_stream(id);
+        } else {
+            s.body = body.to_vec();
+            self.turns.push_back(id);
+        }
+    }
+
+    /// Adds DATA frames to `out` while less than [HOLD] waits there and
+    /// the windows allow. Streams take turns, one frame each.
+    pub(crate) fn send(&mut self, out: &mut Vec<u8>, wpos: usize) {
+        let mut misses = 0;
+        while out.len() - wpos < HOLD && self.window > 0 && misses < self.turns.len() {
+            let id = self.turns.pop_front().unwrap();
+            let Some(s) = self.streams.get_mut(&id) else {
+                continue; // reset by the client
+            };
+            let k = s
+                .left()
+                .min(self.peer_frame)
+                .min(self.window as usize)
+                .min(s.window.max(0) as usize);
+            if k == 0 {
+                // no stream window: it waits for a WINDOW_UPDATE
+                self.turns.push_back(id);
+                misses += 1;
+                continue;
+            }
+            misses = 0;
+            let end = k == s.left();
+            let flags = if end { frame::END_STREAM } else { 0 };
+            frame::write(out, frame::DATA, flags, id, &s.body[s.sent..s.sent + k]);
+            s.sent += k;
+            s.window -= k as i64;
+            self.window -= k as i64;
+            if end {
+                self.drop_stream(id);
+            } else {
+                self.turns.push_back(id);
+            }
+        }
+    }
+
+    /// True when [send] can add a frame now.
+    pub(crate) fn can_send(&self) -> bool {
+        self.window > 0
+            && self
+                .turns
+                .iter()
+                .any(|id| self.streams.get(id).is_some_and(|s| s.window > 0))
+    }
+}
+
+fn status_field(status: u16, out: &mut Vec<u8>) {
+    encode_field(b":status", status.to_string().as_bytes(), out);
+}
+
+/// `date` is the `date: ...\r\n` line of HTTP/1.1.
+fn date_field(date: &[u8], out: &mut Vec<u8>) {
+    if let Some(v) = date.strip_prefix(b"date: ") {
+        encode_field(b"date", v.trim_ascii_end(), out);
+    }
+}
+
+/// What the checks of a request found.
+#[derive(Debug, PartialEq)]
+enum Check {
+    Ok,
+    /// malformed (RFC 9113 8.1.1): RST_STREAM PROTOCOL_ERROR
+    Bad,
+    /// answer with this status (eg. 405 for CONNECT)
+    Status(u16),
+}
+
+/// A request from its decoded header fields (RFC 9113 8.3).
+#[derive(Default)]
+struct Req {
+    method: Vec<u8>,
+    path: Vec<u8>,
+    authority: Option<Vec<u8>>,
+    scheme: bool,
+    /// the headers in record format: u16 name length, u16 value length,
+    /// name, value
+    headers: Vec<u8>,
+    count: usize,
+    host: bool,
+    cookie: Vec<u8>,
+    /// a content-length that is not 0 (or not a number)
+    length: bool,
+    /// a regular header came: no pseudo header may follow
+    regular: bool,
+    bad: bool,
+}
+
+impl Req {
+    fn field(&mut self, name: &[u8], value: &[u8]) {
+        if self.bad {
+            return;
+        }
+        if let Some(pseudo) = name.strip_prefix(b":") {
+            // each one once, not empty, and before the regular headers.
+            // An unknown one (eg. `:status`) is malformed too.
+            let ok = !self.regular
+                && !value.is_empty()
+                && match pseudo {
+                    b"method" if self.method.is_empty() => {
+                        self.method = value.to_vec();
+                        true
+                    }
+                    b"path" if self.path.is_empty() => {
+                        self.path = value.to_vec();
+                        true
+                    }
+                    b"scheme" if !self.scheme => {
+                        self.scheme = true;
+                        true
+                    }
+                    b"authority" if self.authority.is_none() => {
+                        self.authority = Some(value.to_vec());
+                        value.iter().all(|&c| c > b' ' && c < 0x7f)
+                    }
+                    _ => false,
+                };
+            self.bad |= !ok;
+            return;
+        }
+        self.regular = true;
+        // names are lowercase tokens, values have no line breaks, no NUL
+        // and no white space at the ends (RFC 9113 8.2.1)
+        let name_ok = !name.is_empty()
+            && name.iter().all(|&c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || b"!#$%&'*+-.^_`|~".contains(&c)
+            });
+        let value_ok = !value.iter().any(|&c| c == 0 || c == b'\r' || c == b'\n')
+            && !value.first().is_some_and(|&c| c == b' ' || c == b'\t')
+            && !value.last().is_some_and(|&c| c == b' ' || c == b'\t');
+        let conn_specific = matches!(
+            name,
+            b"connection" | b"keep-alive" | b"proxy-connection" | b"transfer-encoding" | b"upgrade"
+        );
+        if !name_ok || !value_ok || conn_specific || (name == b"te" && value != b"trailers") {
+            self.bad = true;
+            return;
+        }
+        match name {
+            // many cookie fields are one header for Dart (RFC 9113 8.2.3)
+            b"cookie" => {
+                if !self.cookie.is_empty() {
+                    self.cookie.extend_from_slice(b"; ");
+                }
+                self.cookie.extend_from_slice(value);
+                return;
+            }
+            b"host" => self.host = true,
+            b"content-length" => self.length = value != b"0",
+            _ => {}
+        }
+        self.push(name, value);
+    }
+
+    fn push(&mut self, name: &[u8], value: &[u8]) {
+        self.count += 1;
+        let h = &mut self.headers;
+        h.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        h.extend_from_slice(&(value.len() as u16).to_le_bytes());
+        h.extend_from_slice(name);
+        h.extend_from_slice(value);
+    }
+
+    fn check(&self, end_stream: bool) -> Check {
+        if self.bad || self.method.is_empty() {
+            return Check::Bad;
+        }
+        if self.method == b"CONNECT" {
+            return Check::Status(405);
+        }
+        let path_ok = self.path.iter().all(|&c| c > b' ' && c != 0x7f);
+        if !self.scheme || self.path.is_empty() || !path_ok {
+            return Check::Bad;
+        }
+        if !self.method.iter().all(|c| c.is_ascii_graphic()) {
+            return Check::Bad;
+        }
+        // a body length but no body (2a: END_STREAM is on HEADERS)
+        if end_stream && self.length {
+            return Check::Bad;
+        }
+        if self.count + usize::from(!self.cookie.is_empty()) > MAX_HEADERS {
+            return Check::Status(431);
+        }
+        Check::Ok
+    }
+
+    /// The request record for Dart (see lib.rs), with flag bit 3.
+    fn record(mut self, id: u64, peer: &[u8; 18]) -> Vec<u8> {
+        if !self.cookie.is_empty() {
+            let cookie = std::mem::take(&mut self.cookie);
+            self.push(b"cookie", &cookie);
+        }
+        // `:authority` is the host (RFC 9113 8.3.1)
+        if !self.host
+            && let Some(a) = self.authority.take()
+        {
+            self.push(b"host", &a);
+        }
+        let escaped;
+        let target = if self.path.is_ascii() {
+            &self.path[..]
+        } else {
+            escaped = escape_target(&self.path);
+            &escaped[..]
+        };
+        let (m, t, h) = (&self.method, target, &self.headers);
+        let mut rec = vec![0u8; REQ_HEAD];
+        write_head(
+            &mut rec,
+            id,
+            FLAG_H2,
+            m.len(),
+            t.len(),
+            h.len(),
+            0,
+            [peer[16], peer[17]],
+            &peer[..16],
+        );
+        rec.extend_from_slice(m);
+        rec.extend_from_slice(t);
+        rec.extend_from_slice(h);
+        rec
+    }
+}
 
 #[cfg(test)]
 mod tests;

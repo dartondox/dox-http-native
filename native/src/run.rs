@@ -76,6 +76,7 @@ use tungstenite::protocol::frame::coding::CloseCode;
 use tungstenite::protocol::{CloseFrame, Role, WebSocketConfig, WebSocketContext};
 use tungstenite::{Error as WsError, Message, Utf8Bytes};
 
+use crate::h2::{H2, PREFACE};
 use crate::{
     CLOSE_WAIT, DRAIN_MAX, EXTERNAL_MIN, Key, MAX_HEAD, MAX_RESERVE, MIN_QUEUE, POST, REQ_HEAD,
     REQUEST_GONE, RES_HEAD, SEND_WAIT, STREAM_GONE, STREAM_SENT, WS_BINARY, WS_CLOSED, WS_TEXT,
@@ -123,7 +124,7 @@ const KEEP_WBUF: usize = 64 * 1024;
 /// The longest body or idle timeout (a year). Longer is cut to this.
 const MAX_TIMEOUT: Duration = Duration::from_secs(365 * 24 * 3600);
 /// Most headers of one request. More gets 431.
-const MAX_HEADERS: usize = 100;
+pub(crate) const MAX_HEADERS: usize = 100;
 /// most bytes of a chunk size line, with its extensions
 const CHUNK_LINE: usize = 1024;
 
@@ -342,6 +343,11 @@ struct Conn {
     slots: VecDeque<Slot>,
     body: Option<Box<BodyRead>>,
     ws: Option<Box<Ws>>,
+    /// HTTP/2: all bytes go here (see h2/mod.rs)
+    h2: Option<Box<H2>>,
+    /// HTTP/2 is on and no bytes were parsed yet: the first ones pick
+    /// HTTP/1.1 or HTTP/2
+    sniff: bool,
     /// in the ready queue
     queued: bool,
     /// in the touched list of `respond`
@@ -430,6 +436,10 @@ struct Limits {
     /// most open connections (0: no limit). At the limit Rust stops
     /// accepting until one closes. New clients wait in the listen queue.
     conns: usize,
+    /// a connection that starts with the HTTP/2 preface speaks HTTP/2
+    http2: bool,
+    /// HTTP/2: most open streams of one connection
+    max_streams: u32,
 }
 
 /// How to write the head of an answer.
@@ -572,7 +582,7 @@ fn record_len(b: &[u8]) -> usize {
 
 /// Writes a record head (no method, target, headers or body).
 #[allow(clippy::too_many_arguments)]
-fn write_head(
+pub(crate) fn write_head(
     b: &mut [u8],
     id: u64,
     flags: u32,
@@ -736,6 +746,8 @@ impl Conn {
             slots: VecDeque::new(),
             body: None,
             ws: None,
+            h2: None,
+            sniff: false,
             queued: false,
             dirty: false,
             closing: false,
@@ -758,6 +770,12 @@ impl Conn {
 
     fn live_ws(&self) -> bool {
         self.ws.as_ref().is_some_and(|w| w.live)
+    }
+
+    /// true while a request waits for its answer (or its answer is not
+    /// all sent, on HTTP/2)
+    fn busy(&self) -> bool {
+        !self.slots.is_empty() || self.h2.as_ref().is_some_and(|h| h.open() > 0)
     }
 
     /// true when it may read and parse more requests now
@@ -878,7 +896,7 @@ impl Conn {
         self.pending() == 0
             && !self.live_ws()
             && self.eof
-            && self.slots.is_empty()
+            && !self.busy()
             && self.body.is_none()
             && !self.queued
     }
@@ -944,6 +962,28 @@ impl Conn {
         }
     }
 
+    /// HTTP/2 is on and this is the start of the connection: the client
+    /// preface makes it HTTP/2, anything else HTTP/1.1. True while the
+    /// bytes so far match the preface but are fewer: wait for more.
+    fn sniff(&mut self, idx: usize, lim: &Limits) -> bool {
+        let data = &self.rbuf[self.rpos..self.rlen];
+        let k = data.len().min(PREFACE.len());
+        if data[..k] != PREFACE[..k] {
+            self.sniff = false;
+            return false;
+        }
+        if k < PREFACE.len() {
+            if self.eof {
+                self.rpos = self.rlen; // closed in the middle of it
+            }
+            return true;
+        }
+        self.sniff = false;
+        self.rpos += PREFACE.len();
+        self.h2 = Some(H2::new(idx, self.peer, lim.max_streams, &mut self.wbuf));
+        false
+    }
+
     /// Answers a bad request from Rust and closes after it.
     fn fail(&mut self, status: u16, date: &[u8]) {
         self.body = None;
@@ -988,6 +1028,37 @@ impl Conn {
         date: &[u8],
         now: Instant,
     ) -> Result<(), usize> {
+        if self.sniff && self.sniff(idx, lim) {
+            return Ok(());
+        }
+        if let Some(h2) = self.h2.as_mut() {
+            loop {
+                if let Some(rec) = h2.held.take() {
+                    if inb.len() - *n < rec.len() {
+                        let size = rec.len();
+                        h2.held = Some(rec);
+                        return Err(size);
+                    }
+                    inb[*n..*n + rec.len()].copy_from_slice(&rec);
+                    *n += rec.len();
+                    self.since = now;
+                }
+                if self.wbuf.len() - self.wpos >= MAX_PENDING {
+                    self.paused = true; // read on once the answers went out
+                    break;
+                }
+                if !h2.step(
+                    &self.rbuf[..self.rlen],
+                    &mut self.rpos,
+                    &mut self.wbuf,
+                    seq,
+                    date,
+                ) {
+                    break;
+                }
+            }
+            return Ok(());
+        }
         loop {
             if self.body.is_some() {
                 let before = self.rpos;
@@ -1320,7 +1391,7 @@ fn ws_key_ok(k: &[u8]) -> bool {
 /// A target with raw bytes over 0x7f (eg. UTF-8 from a client that does
 /// not encode): those bytes as `%XX`. Dart reads the target as ASCII, and
 /// `Uri` decodes `%XX` as UTF-8.
-fn escape_target(target: &[u8]) -> Vec<u8> {
+pub(crate) fn escape_target(target: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(target.len() * 3);
     for &c in target {
         if c.is_ascii() {
@@ -1364,6 +1435,28 @@ struct Job {
     body: Vec<u8>,
     date: Vec<u8>,
     way: Way,
+    /// HTTP/2: only the zipped body, the H2 code makes the frames
+    h2: bool,
+}
+
+impl Job {
+    /// The answer: zipped and rendered (HTTP/1.1), or only zipped (HTTP/2).
+    fn run(&self) -> Vec<u8> {
+        let zipped = gzip(&self.body);
+        if self.h2 {
+            return zipped;
+        }
+        let mut out = Vec::with_capacity(zipped.len() + 256);
+        render(
+            &mut out,
+            self.status,
+            &self.lines,
+            &zipped,
+            &self.date,
+            self.way,
+        );
+        out
+    }
 }
 
 /// A done gzip job: the rendered answer.
@@ -1515,6 +1608,12 @@ impl Core {
                 self.msgs.push(sid, STREAM_GONE, 0, b"");
             } else if !s.answered {
                 let id = ((idx as u64) << 32) | u64::from(s.seq);
+                self.msgs.push(id, REQUEST_GONE, 0, b"");
+            }
+        }
+        if let Some(h2) = &c.h2 {
+            for seq in h2.unanswered() {
+                let id = ((idx as u64) << 32) | u64::from(seq);
                 self.msgs.push(id, REQUEST_GONE, 0, b"");
             }
         }
@@ -1693,6 +1792,7 @@ impl Core {
                         continue;
                     }
                     let mut conn = Conn::new(sock, peer_bytes(addr), self.now);
+                    conn.sniff = self.limits.http2;
                     conn.queued = true; // the request is often there already
                     entry.insert(conn);
                     self.ready.push_back(idx);
@@ -1776,9 +1876,25 @@ impl Core {
             }
         }
         let before = c.written;
-        if c.pending() > 0 && !c.flush() {
-            self.kill(idx);
-            return;
+        loop {
+            if let Some(h2) = c.h2.as_mut() {
+                h2.send(&mut c.wbuf, c.wpos);
+            }
+            if c.pending() > 0 && !c.flush() {
+                self.kill(idx);
+                return;
+            }
+            // HTTP/2: all written, and more DATA may go now
+            if c.pending() > 0 || !c.h2.as_ref().is_some_and(|h| h.can_send()) {
+                break;
+            }
+        }
+        if let Some(h2) = c.h2.as_mut() {
+            for seq in h2.gone.drain(..) {
+                let id = ((idx as u64) << 32) | u64::from(seq);
+                self.msgs.push(id, REQUEST_GONE, 0, b"");
+            }
+            c.shut |= h2.over();
         }
         // a write starts to wait: make sure its timer runs
         let wait_starts = c.stuck.is_none() && c.pending() > 0;
@@ -2011,6 +2127,44 @@ impl Core {
         let idx = (id >> 32) as usize;
         let seq = id as u32;
         let date = &self.date.1;
+        if let Some(c) = self.conns.get_mut(idx)
+            && let Some(h2) = c.h2.as_mut()
+        {
+            // HTTP/2: no answer order. Kind bit 0x200 does not matter.
+            let zip = kind & 0xff == 0
+                && kind & 0x100 != 0
+                && !body.is_empty()
+                && h2.defer(seq, status, lines);
+            match kind & 0xff {
+                0 if zip => {}
+                0 => h2.answer(seq, status, lines, body, date, &mut c.wbuf),
+                // 2b: streamed answers on HTTP/2 (and a WebSocket can not
+                // come: the request never has flag bit 1)
+                _ => h2.refuse(seq, &mut c.wbuf),
+            }
+            self.touch(idx);
+            if zip {
+                let job = Job {
+                    idx,
+                    seq,
+                    status,
+                    lines: Vec::new(),
+                    body: body.to_vec(),
+                    date: Vec::new(),
+                    way: Way {
+                        http10: false,
+                        head: false,
+                        close: false,
+                        said: false,
+                    },
+                    h2: true,
+                };
+                self.zip(job);
+            } else if kind & 0xff != 0 {
+                self.answer_gone(kind, body);
+            }
+            return;
+        }
         let found = self.conns.get_mut(idx).and_then(|c| {
             let first = c.slots.front()?.seq;
             let i = seq.wrapping_sub(first) as usize;
@@ -2019,17 +2173,7 @@ impl Core {
         });
         let Some(i) = found else {
             // the client is gone (or a second answer)
-            match kind & 0xff {
-                1 if body.len() >= 8 => {
-                    let ws = u64::from_le_bytes(body[..8].try_into().unwrap());
-                    self.msgs.ws(ws, WS_CLOSED, 1006, b"");
-                }
-                6 if body.len() >= 8 => {
-                    let sid = u64::from_le_bytes(body[..8].try_into().unwrap());
-                    self.msgs.push(sid, STREAM_GONE, 0, b"");
-                }
-                _ => {}
-            }
+            self.answer_gone(kind, body);
             return;
         };
         let c = &mut self.conns[idx];
@@ -2055,6 +2199,7 @@ impl Core {
                     body: body.to_vec(),
                     date: date.clone(),
                     way,
+                    h2: false,
                 };
                 self.zip(job);
                 return;
@@ -2141,6 +2286,22 @@ impl Core {
             }
         }
         self.touch(idx);
+    }
+
+    /// An answer that has no request to go to: tell Dart its WebSocket
+    /// (kind 1) or stream (kind 6) is over.
+    fn answer_gone(&mut self, kind: u16, body: &[u8]) {
+        match kind & 0xff {
+            1 if body.len() >= 8 => {
+                let ws = u64::from_le_bytes(body[..8].try_into().unwrap());
+                self.msgs.ws(ws, WS_CLOSED, 1006, b"");
+            }
+            6 if body.len() >= 8 => {
+                let sid = u64::from_le_bytes(body[..8].try_into().unwrap());
+                self.msgs.push(sid, STREAM_GONE, 0, b"");
+            }
+            _ => {}
+        }
     }
 
     /// A part (or the end) of the streamed body `sid`.
@@ -2270,26 +2431,14 @@ impl Core {
                 .spawn(move || {
                     // ends when the server drops the sender
                     for job in rx {
-                        let zipped = gzip(&job.body);
-                        let mut out = Vec::with_capacity(zipped.len() + 256);
-                        render(
-                            &mut out, job.status, &job.lines, &zipped, &job.date, job.way,
-                        );
+                        let out = job.run();
                         results.lock().unwrap().push((job.idx, job.seq, out));
                         let _ = waker.wake();
                     }
                 });
             if started.is_err() {
                 // no thread: zip here
-                let mut out = Vec::new();
-                render(
-                    &mut out,
-                    job.status,
-                    &job.lines,
-                    &gzip(&job.body),
-                    &job.date,
-                    job.way,
-                );
+                let out = job.run();
                 self.zipped.lock().unwrap().push((job.idx, job.seq, out));
                 return;
             }
@@ -2305,6 +2454,11 @@ impl Core {
             let Some(c) = self.conns.get_mut(idx) else {
                 continue;
             };
+            if let Some(h2) = c.h2.as_mut() {
+                h2.zipped(seq, &out, &self.date.1, &mut c.wbuf);
+                self.touch(idx);
+                continue;
+            }
             let Some(i) = c.slots.iter().position(|s| s.seq == seq) else {
                 continue;
             };
@@ -2436,6 +2590,12 @@ impl Core {
         let all: Vec<usize> = self.conns.iter().map(|(i, _)| i).collect();
         for idx in all {
             let c = &mut self.conns[idx];
+            if let Some(h2) = c.h2.as_mut() {
+                // GOAWAY: the open streams finish, then it closes
+                h2.drain(&mut c.wbuf);
+                self.service(idx);
+                continue;
+            }
             c.closing = true;
             if let Some(ws) = c.ws.as_mut() {
                 if ws.live {
@@ -2527,7 +2687,7 @@ impl Conn {
         if self.ws.is_some() || self.body.is_some() || self.pending() > 0 {
             return None;
         }
-        if self.slots.is_empty() {
+        if !self.busy() {
             return Some((self.since + limits.idle, Due::Head));
         }
         // The client closed its side while answers wait. It may still
@@ -2563,6 +2723,8 @@ fn limits_of(
     body_timeout_ms: i64,
     max_conns: i64,
     idle_ms: i64,
+    http2: bool,
+    max_streams: i64,
 ) -> Limits {
     Limits {
         body: max_body.max(0) as usize,
@@ -2570,6 +2732,8 @@ fn limits_of(
         timeout: Duration::from_millis(body_timeout_ms.max(0) as u64).min(MAX_TIMEOUT),
         idle: Duration::from_millis(idle_ms.max(0) as u64).min(MAX_TIMEOUT),
         conns: max_conns.max(0) as usize,
+        http2,
+        max_streams: max_streams.clamp(0, i64::from(u32::MAX)) as u32,
     }
 }
 
@@ -2716,7 +2880,9 @@ impl Native {
 /// multipart form) get 413. A body with no new bytes for
 /// `body_timeout_ms` gets 408. With `max_conns` > 0 it holds at most that
 /// many connections open. A connection with no request for `idle_ms`
-/// closes. Returns a handle (> 0), or < 0: -1 not
+/// closes. With `http2`, a connection that starts with the HTTP/2
+/// preface speaks HTTP/2, with at most `max_streams` open streams.
+/// Returns a handle (> 0), or < 0: -1 not
 /// initialized, -2 no poller or thread, -(1000 + errno) when the bind
 /// fails.
 #[unsafe(no_mangle)]
@@ -2731,6 +2897,8 @@ pub extern "C" fn dox_bind(
     addr_lo: u64,
     max_conns: i64,
     idle_ms: i64,
+    http2: bool,
+    max_streams: i64,
 ) -> i64 {
     if POST.get().is_none() {
         return -1;
@@ -2739,7 +2907,15 @@ pub extern "C" fn dox_bind(
         Ok(l) => l,
         Err(e) => return -(1000 + i64::from(e.raw_os_error().unwrap_or(0))),
     };
-    let limits = limits_of(max_body, max_multipart, body_timeout_ms, max_conns, idle_ms);
+    let limits = limits_of(
+        max_body,
+        max_multipart,
+        body_timeout_ms,
+        max_conns,
+        idle_ms,
+        http2,
+        max_streams,
+    );
     let Ok(core) = Core::new(listener, key, limits) else {
         unbind(key);
         return -2;
@@ -2928,10 +3104,18 @@ pub mod fuzz {
     }
 
     /// The defaults of `NativeHttpServer.bind` in lib/src/server.dart
-    /// (`maxBodySize`, `maxMultipartSize`, `bodyTimeout`, `idleTimeout`).
-    /// Keep them the same when those change.
+    /// (`maxBodySize`, `maxMultipartSize`, `bodyTimeout`, `idleTimeout`,
+    /// `maxConcurrentStreams`). Keep them the same when those change.
     fn default_limits() -> Limits {
-        limits_of(100 * 1024 * 1024, 100 * 1024 * 1024, 120_000, 0, 30_000)
+        limits_of(
+            100 * 1024 * 1024,
+            100 * 1024 * 1024,
+            120_000,
+            0,
+            30_000,
+            false,
+            250,
+        )
     }
 
     /// Remote ip and port of the test client. Not zero, so the record
@@ -3645,6 +3829,158 @@ pub mod fuzz {
                 conts <= asked,
                 "{what}: {conts} `100 Continue` for {asked} requests"
             );
+        }
+    }
+
+    /// What one HTTP/2 connection gave Dart and the client.
+    #[derive(Debug, PartialEq)]
+    struct H2Seen {
+        recs: Vec<Rec>,
+        /// all bytes the server wrote
+        out: Vec<u8>,
+    }
+
+    /// Feeds `stream` (after the preface) to one `Conn` with HTTP/2 on,
+    /// cut at `cuts`. With `answer`, Dart answers each request at once
+    /// with a body of that many bytes.
+    fn drive_h2(stream: &[u8], cuts: &[usize], small: usize, answer: Option<usize>) -> H2Seen {
+        let lim = Limits {
+            http2: true,
+            max_streams: 8,
+            ..default_limits()
+        };
+        let now = Instant::now();
+        let mut c = Conn::new(sock(), PEER, now);
+        c.sniff = true;
+        let (mut seq, mut fed, mut need) = (0u32, 0, 0);
+        let mut seen = H2Seen {
+            recs: Vec::new(),
+            out: Vec::new(),
+        };
+        let date = b"date: Thu, 01 Jan 2026 00:00:00 GMT\r\n";
+        for &end in cuts {
+            c.rbuf.drain(..c.rpos);
+            c.rlen -= c.rpos;
+            c.rpos = 0;
+            c.rbuf.extend_from_slice(&stream[fed..end]);
+            c.rlen = c.rbuf.len();
+            fed = end;
+            loop {
+                let before = (seen.recs.len(), c.rpos);
+                let room = small.max(need);
+                need = 0;
+                let mut inb = vec![0u8; room];
+                let mut n = 0;
+                let res = c.parse(1, &mut inb, &mut n, &mut seq, &lim, date, now);
+                assert!(c.rpos <= c.rlen && c.rlen <= c.rbuf.len());
+                let mut p = 0;
+                while p < n {
+                    let (rec, len) = decode(&inb[p..n]);
+                    assert_eq!(rec.flags, 8, "flag bit 3, nothing else");
+                    assert!(!rec.method.is_empty() && !rec.target.is_empty());
+                    assert!(rec.target.is_ascii() && rec.body.is_empty());
+                    for (name, value) in &rec.headers {
+                        assert!(!name.iter().any(u8::is_ascii_uppercase), "{name:?}");
+                        assert!(!value.iter().any(|&b| b == 0 || b == b'\r' || b == b'\n'));
+                    }
+                    let id = u64::from_le_bytes(inb[p..p + 8].try_into().unwrap());
+                    if let (Some(size), Some(h2)) = (answer, c.h2.as_mut()) {
+                        let body = vec![b'x'; size];
+                        h2.answer(id as u32, 200, b"X-A: 1\r\n", &body, date, &mut c.wbuf);
+                    }
+                    seen.recs.push(rec);
+                    p += len;
+                }
+                assert_eq!(p, n);
+                if let Err(size) = res {
+                    assert!(size > room - n);
+                    need = size;
+                }
+                // write all that may go: the client reads everything
+                if let Some(h2) = c.h2.as_mut() {
+                    loop {
+                        h2.send(&mut c.wbuf, c.wpos);
+                        seen.out.append(&mut c.wbuf);
+                        if !h2.can_send() {
+                            break;
+                        }
+                    }
+                    h2.gone.clear();
+                }
+                c.paused = false;
+                if need == 0 && (seen.recs.len(), c.rpos) == before {
+                    break;
+                }
+            }
+        }
+        assert!(c.h2.as_ref().is_none_or(|h| h.held.is_none()));
+        seen
+    }
+
+    /// Checks the frames the server wrote: whole and valid, no frame
+    /// after a GOAWAY with an error, and each stream ends once.
+    fn check_h2_out(out: &[u8]) {
+        use crate::h2::frame;
+        let mut p = 0;
+        let mut ended = std::collections::HashSet::new();
+        let mut dead = false;
+        while p < out.len() {
+            let h = frame::read_head(&out[p..]).expect("a whole frame head");
+            let end = p + frame::HEAD + h.len;
+            assert!(end <= out.len(), "a cut frame");
+            assert!(!dead, "a frame after GOAWAY with an error");
+            let f = frame::parse(&h, &out[p + frame::HEAD..end]).expect("a valid frame");
+            match f {
+                crate::h2::frame::Frame::GoAway { code, .. } => dead = code != 0,
+                crate::h2::frame::Frame::Data { end, .. }
+                | crate::h2::frame::Frame::Headers {
+                    end_stream: end, ..
+                } => {
+                    assert!(!ended.contains(&h.id), "a frame after END_STREAM");
+                    if end {
+                        ended.insert(h.id);
+                    }
+                }
+                _ => {}
+            }
+            p = end;
+        }
+    }
+
+    /// HTTP/2: random bytes after the preface and an empty SETTINGS, so
+    /// most of them are frames. Byte 0 picks the read pieces, byte 1 the
+    /// room in Dart's buffer, byte 2 the answer size. When Dart does not
+    /// answer, the output hangs only on the bytes, not on how they came
+    /// in: all at once or in pieces must give the same. With answers, the
+    /// frames must be valid.
+    pub fn h2_conn(data: &[u8]) {
+        let [seed, small, size, rest @ ..] = data else {
+            return;
+        };
+        let mut stream = crate::h2::PREFACE.to_vec();
+        crate::h2::frame::write(&mut stream, crate::h2::frame::SETTINGS, 0, 0, b"");
+        stream.extend_from_slice(rest);
+        let big = REQ_HEAD + 4 * stream.len() + MAX_HEAD;
+        let want = drive_h2(&stream, &[stream.len()], big, None);
+        check_h2_out(&want.out);
+        let mut cuts = Vec::new();
+        let (mut end, mut rng) = (0, u32::from(*seed) | 1);
+        while end < stream.len() {
+            end = (end + 1 + next(&mut rng) % 128).min(stream.len());
+            cuts.push(end);
+        }
+        let small = usize::from(*small) * 4;
+        for (cuts, room, what) in [
+            (&[stream.len()][..], small, "small buffer"),
+            (&cuts[..], big, "in pieces"),
+            (&cuts[..], small, "in pieces, small buffer"),
+        ] {
+            assert_eq!(drive_h2(&stream, cuts, room, None), want, "{what}");
+        }
+        let size = usize::from(*size) * 1024;
+        for cuts in [&[stream.len()][..], &cuts[..]] {
+            let seen = drive_h2(&stream, cuts, big, Some(size));
+            check_h2_out(&seen.out);
         }
     }
 

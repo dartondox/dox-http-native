@@ -18,7 +18,8 @@
 //!
 //! Request record (little endian, 44 byte head): u64 id, u32 flags
 //! (bit 0: HTTP/1.0, bit 1: can upgrade to a WebSocket, bit 2: the body is
-//! external, see below. Bits 8 to 15: a message kind, see below), u16
+//! external, see below, bit 3: HTTP/2. Bits 8 to 15: a message kind, see
+//! below), u16
 //! method_len, u16 target_len, u32 headers_len, u32 body_len, u16
 //! remote_port, u16 reserved, 16 bytes remote ip (IPv6, IPv4 is mapped).
 //! Then method, target, headers, body. Each header is u16 name_len, u16

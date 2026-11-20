@@ -19,6 +19,7 @@ class NativeRequest extends Stream<Uint8List> implements HttpRequest {
     this._ip,
     this._remotePort, {
     required this._http10,
+    this._http2 = false,
     this.isWebSocketUpgrade = false,
   });
 
@@ -37,6 +38,9 @@ class NativeRequest extends Stream<Uint8List> implements HttpRequest {
   Uint8List _ip;
   final int _remotePort;
   final bool _http10;
+
+  /// the request came over HTTP/2
+  final bool _http2;
 
   /// true when Rust found a valid WebSocket upgrade request (GET,
   /// HTTP/1.1, `Upgrade: websocket`, version 13, a key).
@@ -123,10 +127,10 @@ class NativeRequest extends Stream<Uint8List> implements HttpRequest {
   }
 
   @override
-  bool get persistentConnection => headers.persistentConnection;
+  bool get persistentConnection => _http2 || headers.persistentConnection;
 
   @override
-  String get protocolVersion => _http10 ? '1.0' : '1.1';
+  String get protocolVersion => _http2 ? '2.0' : (_http10 ? '1.0' : '1.1');
 
   @override
   X509Certificate? get certificate => null;

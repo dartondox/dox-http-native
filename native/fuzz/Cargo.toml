@@ -74,3 +74,10 @@ path = "fuzz_targets/hpack.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "h2_conn"
+path = "fuzz_targets/h2_conn.rs"
+test = false
+doc = false
+bench = false

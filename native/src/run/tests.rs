@@ -14,6 +14,8 @@ fn limits() -> Limits {
         timeout: Duration::from_millis(50),
         conns: 0,
         idle: IDLE,
+        http2: true,
+        max_streams: 250,
     }
 }
 
@@ -992,7 +994,7 @@ fn raw_bytes_in_the_target_are_escaped() {
 /// A huge body timeout from Dart does not overflow the clock.
 #[test]
 fn huge_body_timeout_is_cut() {
-    let lim = limits_of(1, 1, i64::MAX, 0, i64::MAX);
+    let lim = limits_of(1, 1, i64::MAX, 0, i64::MAX, false, 250);
     assert_eq!(lim.timeout, MAX_TIMEOUT);
     assert_eq!(lim.idle, MAX_TIMEOUT);
     let _ = Instant::now() + lim.timeout + lim.idle; // no panic
@@ -1501,5 +1503,81 @@ fn client_that_left_a_waiting_upgrade_is_closed() {
     assert_eq!(
         got.iter().map(|r| (r.id, r.kind())).collect::<Vec<_>>(),
         [(req.id, REQUEST_GONE)]
+    );
+}
+
+/// With HTTP/2 on, the preface may come in pieces. Answers go out as
+/// frames, a gzip answer too. The same port still speaks HTTP/1.1.
+#[test]
+fn http2_preface_in_pieces_and_http1_on_the_same_port() {
+    use crate::h2::frame;
+    use crate::h2::hpack::{Decoder, encode_field};
+    let (port, _) = serve(limits());
+    let mut req = PREFACE.to_vec();
+    frame::write(&mut req, frame::SETTINGS, 0, 0, b"");
+    for (id, path) in [(1, "/h2"), (3, "/zip")] {
+        let mut block = Vec::new();
+        for (n, v) in [(":method", "GET"), (":scheme", "http"), (":path", path)] {
+            encode_field(n.as_bytes(), v.as_bytes(), &mut block);
+        }
+        frame::write_headers(&mut req, id, &block, true, 16 * 1024);
+    }
+    let mut s = connect(port);
+    for part in [&req[..3], &req[3..20], &req[20..]] {
+        s.write_all(part).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // read frames until both streams ended: (headers, body) per stream
+    let mut got = Vec::new();
+    let mut dec = Decoder::new(4096);
+    let mut seen: HashMap<u32, (Vec<String>, Vec<u8>)> = HashMap::new();
+    let mut ended = 0;
+    let mut p = 0;
+    while ended < 2 {
+        let mut buf = [0u8; 4096];
+        let k = s.read(&mut buf).unwrap();
+        assert!(k > 0, "closed");
+        got.extend_from_slice(&buf[..k]);
+        while let Some(h) = frame::read_head(&got[p..]) {
+            let end = p + frame::HEAD + h.len;
+            if end > got.len() {
+                break;
+            }
+            let payload = &got[p + frame::HEAD..end];
+            let s = seen.entry(h.id).or_default();
+            match h.kind {
+                frame::HEADERS => dec
+                    .decode(payload, usize::MAX, |n, v| {
+                        s.0.push(format!(
+                            "{}: {}",
+                            String::from_utf8_lossy(n),
+                            String::from_utf8_lossy(v)
+                        ))
+                    })
+                    .unwrap(),
+                frame::DATA => s.1.extend_from_slice(payload),
+                _ => {}
+            }
+            if h.id != 0 && h.flags & frame::END_STREAM != 0 {
+                ended += 1;
+            }
+            p = end;
+        }
+    }
+    assert_eq!(seen[&1].1, b"/h2");
+    assert!(
+        seen[&3].0.contains(&"content-encoding: gzip".to_string()),
+        "{:?}",
+        seen[&3].0
+    );
+    let mut plain = Vec::new();
+    flate2::read::GzDecoder::new(&seen[&3].1[..])
+        .read_to_end(&mut plain)
+        .unwrap();
+    assert_eq!(plain, b"hello ".repeat(100));
+    let h1 = send(port, b"GET /h1 HTTP/1.1\r\nConnection: close\r\n\r\n");
+    assert!(
+        h1.starts_with("HTTP/1.1 200") && h1.ends_with("/h1"),
+        "{h1:?}"
     );
 }
