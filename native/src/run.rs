@@ -442,6 +442,10 @@ struct Limits {
     http2: bool,
     /// HTTP/2: most open streams of one connection
     max_streams: u32,
+    /// HTTP/2: the reset bucket of one connection, its burst (0: the
+    /// default) and its tokens back per second (see h2/mod.rs)
+    reset_burst: u32,
+    reset_rate: f64,
 }
 
 /// How to write the head of an answer.
@@ -1012,6 +1016,7 @@ impl Conn {
             self.peer,
             lim.max_streams,
             max,
+            (lim.reset_burst, lim.reset_rate),
             &mut self.wbuf,
         ));
         false
@@ -2856,6 +2861,7 @@ fn keepalive() -> socket2::TcpKeepalive {
 
 /// The limits from Dart's values. A timeout is at most [MAX_TIMEOUT], so
 /// `Instant + timeout` can not overflow.
+#[allow(clippy::too_many_arguments)]
 fn limits_of(
     max_body: i64,
     max_multipart: i64,
@@ -2864,6 +2870,8 @@ fn limits_of(
     idle_ms: i64,
     http2: bool,
     max_streams: i64,
+    reset_burst: i64,
+    reset_rate: i64,
 ) -> Limits {
     Limits {
         body: max_body.max(0) as usize,
@@ -2873,6 +2881,8 @@ fn limits_of(
         conns: max_conns.max(0) as usize,
         http2,
         max_streams: max_streams.clamp(0, i64::from(u32::MAX)) as u32,
+        reset_burst: reset_burst.clamp(0, i64::from(u32::MAX)) as u32,
+        reset_rate: reset_rate.max(0) as f64,
     }
 }
 
@@ -3021,6 +3031,8 @@ impl Native {
 /// many connections open. A connection with no request for `idle_ms`
 /// closes. With `http2`, a connection that starts with the HTTP/2
 /// preface speaks HTTP/2, with at most `max_streams` open streams.
+/// `reset_burst` (0: the default) and `reset_rate` set the reset bucket
+/// of one HTTP/2 connection (see h2/mod.rs).
 /// Returns a handle (> 0), or < 0: -1 not
 /// initialized, -2 no poller or thread, -(1000 + errno) when the bind
 /// fails.
@@ -3038,6 +3050,8 @@ pub extern "C" fn dox_bind(
     idle_ms: i64,
     http2: bool,
     max_streams: i64,
+    reset_burst: i64,
+    reset_rate: i64,
 ) -> i64 {
     if POST.get().is_none() {
         return -1;
@@ -3054,6 +3068,8 @@ pub extern "C" fn dox_bind(
         idle_ms,
         http2,
         max_streams,
+        reset_burst,
+        reset_rate,
     );
     let Ok(core) = Core::new(listener, key, limits) else {
         unbind(key);
@@ -3244,7 +3260,7 @@ pub mod fuzz {
 
     /// The defaults of `NativeHttpServer.bind` in lib/src/server.dart
     /// (`maxBodySize`, `maxMultipartSize`, `bodyTimeout`, `idleTimeout`,
-    /// `maxConcurrentStreams`). Keep them the same when those change.
+    /// `maxConcurrentStreams`, `http2ResetBurst`, `http2ResetRate`). Keep them the same when those change.
     fn default_limits() -> Limits {
         limits_of(
             100 * 1024 * 1024,
@@ -3254,6 +3270,8 @@ pub mod fuzz {
             30_000,
             false,
             250,
+            0,
+            100,
         )
     }
 

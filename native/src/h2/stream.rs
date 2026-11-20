@@ -61,9 +61,6 @@ pub(crate) struct Stream {
     /// Some answer bytes went out in DATA: a full answer then gives a
     /// reset token back (see `RESET_REFUND`).
     pub(crate) wrote: bool,
-    /// streamed request body: bytes given to Dart that it has not acked.
-    /// Their connection window waits for the ack (`H2::unacked`).
-    pub(crate) owed: u64,
     /// the trailers of a streamed answer (an HPACK block), sent after the
     /// last DATA. Empty: none.
     pub(crate) trailers: Vec<u8>,
@@ -87,7 +84,6 @@ impl Stream {
             body: Vec::new(),
             sent: 0,
             wrote: false,
-            owed: 0,
             trailers: Vec::new(),
             stalled: None,
         }

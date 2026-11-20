@@ -17,6 +17,8 @@ external int doxInit(Pointer<Void> dlData);
 /// [maxConnections] 0 is no limit. A connection with no request for
 /// [idleTimeoutMs] closes. With [http2], a connection that starts with the
 /// HTTP/2 preface speaks HTTP/2 (at most [maxStreams] open streams).
+/// [resetBurst] (0: the default) and [resetRate] set the reset bucket of
+/// one HTTP/2 connection.
 /// Returns a handle for [doxRun].
 @Native<
   Int64 Function(
@@ -31,6 +33,8 @@ external int doxInit(Pointer<Void> dlData);
     Int64,
     Int64,
     Bool,
+    Int64,
+    Int64,
     Int64,
   )
 >(symbol: 'dox_bind')
@@ -47,6 +51,8 @@ external int doxBind(
   int idleTimeoutMs,
   bool http2,
   int maxStreams,
+  int resetBurst,
+  int resetRate,
 );
 
 @Native<Int32 Function(Int64)>(symbol: 'dox_bound_port', isLeaf: true)

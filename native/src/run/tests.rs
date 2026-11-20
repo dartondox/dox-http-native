@@ -16,6 +16,8 @@ fn limits() -> Limits {
         idle: IDLE,
         http2: true,
         max_streams: 250,
+        reset_burst: 0,
+        reset_rate: crate::h2::RESET_RATE,
     }
 }
 
@@ -1013,7 +1015,7 @@ fn raw_bytes_in_the_target_are_escaped() {
 /// A huge body timeout from Dart does not overflow the clock.
 #[test]
 fn huge_body_timeout_is_cut() {
-    let lim = limits_of(1, 1, i64::MAX, 0, i64::MAX, false, 250);
+    let lim = limits_of(1, 1, i64::MAX, 0, i64::MAX, false, 250, 0, 100);
     assert_eq!(lim.timeout, MAX_TIMEOUT);
     assert_eq!(lim.idle, MAX_TIMEOUT);
     let _ = Instant::now() + lim.timeout + lim.idle; // no panic
