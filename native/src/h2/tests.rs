@@ -2421,29 +2421,34 @@ mod conn {
         );
     }
 
-    /// A busy gRPC client: all calls on one connection, and some go over
-    /// their deadline (a reset). Each stream we answer in full gives a
-    /// token back, so it is not cut. Only time refilled the bucket before:
-    /// this cut it after 1000 resets.
-    #[test]
-    fn answered_streams_give_reset_tokens_back() {
-        let mut c = Client::new(250);
-        let rst = 8u32.to_be_bytes();
-        for i in 0..3000u32 {
-            let id = 1 + 4 * i;
-            c.get(id, GET);
-            c.answer(2 * i, 200, b"", b"ok");
-            c.get(id + 2, GET);
-            assert!(c.send(frame::RST_STREAM, 0, id + 2, &rst).is_empty());
+    /// Sends `answered` streams that Dart answers with `status` and `body`,
+    /// then one stream the client resets at once. `n` counts the streams.
+    fn pair(
+        c: &mut Client,
+        n: &mut u32,
+        answered: u32,
+        status: u16,
+        body: &[u8],
+    ) -> Vec<(Head, Vec<u8>)> {
+        for _ in 0..answered {
+            c.get(1 + 2 * *n, GET);
+            c.answer(*n, status, b"", body);
+            *n += 1;
         }
-        assert!(!c.h2.over());
-        // the tokens do not pile up over the burst: a flood after many
-        // answers is still cut within one burst
+        let id = 1 + 2 * *n;
+        *n += 1;
+        c.get(id, GET);
+        c.send(frame::RST_STREAM, 0, id, &8u32.to_be_bytes())
+    }
+
+    /// After many answers, a flood is still cut within one burst.
+    fn flood_is_cut(c: &mut Client, n: &mut u32) {
         let mut cut = None;
-        for i in 0..=1000u32 {
-            let id = 20001 + 2 * i;
+        for i in 0..=1100u32 {
+            let id = 1 + 2 * *n;
+            *n += 1;
             c.get(id, GET);
-            let fs = c.send(frame::RST_STREAM, 0, id, &rst);
+            let fs = c.send(frame::RST_STREAM, 0, id, &8u32.to_be_bytes());
             if !fs.is_empty() {
                 goaway(&fs, frame::ENHANCE_YOUR_CALM);
                 cut = Some(i);
@@ -2451,6 +2456,75 @@ mod conn {
             }
         }
         assert!(cut.is_some_and(|i| i >= 990), "{cut:?}");
+    }
+
+    /// A busy gRPC client: all calls on one connection, and some go over
+    /// their deadline (a reset). Each answer with a body gives half a token
+    /// back: with 3 answers per reset it is not cut. Only time refilled the
+    /// bucket before: this cut it after 1000 resets.
+    #[test]
+    fn answered_streams_give_reset_tokens_back() {
+        let mut c = Client::new(250);
+        let mut n = 0;
+        for _ in 0..1200 {
+            assert!(pair(&mut c, &mut n, 3, 200, b"ok").is_empty());
+        }
+        assert!(!c.h2.over());
+        // the tokens do not pile up over the burst: a flood after many
+        // answers is still cut within one burst
+        flood_is_cut(&mut c, &mut n);
+    }
+
+    /// One cheap answer (no body) per reset gives nothing back, so the
+    /// attacker is cut within one burst.
+    #[test]
+    fn cheap_answers_give_no_reset_tokens() {
+        for status in [204u16, 304, 200] {
+            let mut c = Client::new(250);
+            let mut n = 0;
+            let mut cut = None;
+            for i in 0..1100u32 {
+                let fs = pair(&mut c, &mut n, 1, status, b"");
+                if !fs.is_empty() {
+                    goaway(&fs, frame::ENHANCE_YOUR_CALM);
+                    cut = Some(i);
+                    break;
+                }
+            }
+            assert!(
+                cut.is_some_and(|i| (990..1100).contains(&i)),
+                "{status} {cut:?}"
+            );
+        }
+    }
+
+    /// One answer with a body per reset (net -0.5 a pair) is cut after
+    /// about 2000 pairs. With a whole token back it was never cut.
+    #[test]
+    fn one_answer_per_reset_is_cut() {
+        let mut c = Client::new(250);
+        let mut n = 0;
+        let mut cut = None;
+        for i in 0..2500u32 {
+            let fs = pair(&mut c, &mut n, 1, 200, b"ok");
+            if !fs.is_empty() {
+                goaway(&fs, frame::ENHANCE_YOUR_CALM);
+                cut = Some(i);
+                break;
+            }
+        }
+        assert!(cut.is_some_and(|i| (1900..2100).contains(&i)), "{cut:?}");
+    }
+
+    /// A stream the client reset before Dart answered gets no refund.
+    #[test]
+    fn answer_of_a_reset_stream_gives_nothing() {
+        let mut c = Client::new(250);
+        c.get(1, GET);
+        c.send(frame::RST_STREAM, 0, 1, &8u32.to_be_bytes());
+        assert_eq!(c.h2.reset_bucket.tokens, 999.0);
+        c.answer(0, 200, b"", b"ok");
+        assert_eq!(c.h2.reset_bucket.tokens, 999.0);
     }
 
     /// HEADERS on a stream we reset are decoded and dropped: each takes a
@@ -2594,9 +2668,9 @@ mod conn {
         c.get(3, GET);
         c.answer(0, 200, b"", b"");
         assert_eq!(c.h2.resets.len(), 1);
-        // the 413 took one token, the answer of stream 3 gave it back:
-        // 1000 are left
-        for _ in 0..1000 {
+        // the 413 took one token: 999 are left (an empty answer gives
+        // nothing back)
+        for _ in 0..999 {
             assert!(
                 c.send(frame::RST_STREAM, 0, 3, &8u32.to_be_bytes())
                     .is_empty()
