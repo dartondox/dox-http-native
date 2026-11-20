@@ -145,6 +145,7 @@ Fuzz targets are in `native/fuzz/`. CI runs each one for 60 seconds when `native
 - `chunked_body`: a chunked body, all at once and in random pieces. Both must give the same result.
 - `conn`: many requests on one connection (pipelined, bodies, keep-alive, close, upgrade). All at once and in random pieces, with a big and a small Dart buffer: Dart must get the same records each time. Nothing may be parsed after a close or a bad request.
 - `aead_open`: the cookie decryption on random data. It must never panic, a sealed value must open again, and one changed byte must make it fail.
+- `hpack`: random HTTP/2 header blocks (HPACK) on one decoder. It must never panic, the decoded list must stay under the size cap, and the table size must stay right. Each decoded block is encoded again and must decode to the same fields.
 
 To run one locally:
 

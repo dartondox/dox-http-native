@@ -1,3 +1,7 @@
+## Unreleased
+
+- New (internal): an HPACK decoder and encoder (RFC 7541), the header compression of HTTP/2. Nothing uses it yet; it is the first step to HTTP/2 and gRPC. It is tested with all RFC 7541 Appendix C examples and has a new fuzz target, `hpack`.
+
 ## 3.2.1
 
 - Fix (leak): a client that closed its connection while its request still waited for an answer kept the connection, its socket and its state for ever when the handler never answered (eg. a database call with no timeout). The same happened to a streamed answer (eg. server-sent events) that wrote nothing after the client left. Now, when the client closed its side and nothing was written for the idle time (`idleTimeout`, 30 seconds by default), the connection closes. A client that only closed its sending side and still waits gets its answer when it comes within that time. A late answer is dropped. This also holds for a connection that reads nothing while it waits (eg. a WebSocket upgrade request, or 64 open requests): the server sees the close in the poll. Note: a client that closed only its sending side (a half-close) now waits at most `idleTimeout` for its answer. Raise `idleTimeout` when such clients call slow handlers.
