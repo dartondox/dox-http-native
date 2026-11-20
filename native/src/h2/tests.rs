@@ -1682,9 +1682,11 @@ mod conn {
     fn the_reset_memory_is_bounded() {
         let mut c = Client::with_max(250, 1);
         for i in 0..500u32 {
-            c.send(frame::HEADERS, frame::END_HEADERS, 1 + 2 * i, &post(5));
+            // refused HEADERS are no work: some real work in between
+            let b = if i % 50 == 49 { block(GET) } else { post(5) };
+            c.send(frame::HEADERS, frame::END_HEADERS, 1 + 2 * i, &b);
         }
-        assert_eq!(c.h2.open(), 0);
+        assert_eq!(c.h2.open(), 10);
         assert_eq!(c.h2.resets.len(), 250);
     }
 
@@ -2026,7 +2028,11 @@ mod conn {
         c.send(frame::HEADERS, frame::END_HEADERS, 1, &post(5));
         let big = vec![0u8; 16_384];
         let mut back = 0u64;
-        for _ in 0..600 {
+        for k in 0..600u32 {
+            if k % 50 == 49 {
+                // DATA on a reset stream is no work: some work in between
+                c.get(3 + 2 * (k / 50), GET);
+            }
             for (id, n) in updates(&c.send(frame::DATA, 0, 1, &big)) {
                 assert_eq!(id, 0);
                 back += u64::from(n);
@@ -2168,33 +2174,62 @@ mod conn {
     fn late_data_after_many_resets_is_ignored() {
         let mut c = Client::with_max(250, 1);
         for i in 0..200u32 {
-            c.send(frame::HEADERS, frame::END_HEADERS, 1 + 2 * i, &post(5));
+            // refused HEADERS are no work: some real work in between
+            let b = if i % 50 == 49 { block(GET) } else { post(5) };
+            c.send(frame::HEADERS, frame::END_HEADERS, 1 + 2 * i, &b);
         }
         assert!(c.send(frame::DATA, 0, 1, b"x").is_empty());
         assert!(!c.h2.over());
     }
 
     /// A stream the client reset: the client sends nothing on it after
-    /// its own reset, so DATA (or HEADERS) on it is STREAM_CLOSED (RFC
-    /// 9113 5.1, h2spec 5.1/8 and 5.1/9).
+    /// its own reset, so DATA (or HEADERS) on it is a stream error
+    /// STREAM_CLOSED (RFC 9113 5.1, h2spec 5.1/8 and 5.1/9). The
+    /// connection stays up, and the HPACK table stays in sync.
     #[test]
-    fn data_after_a_client_reset_is_stream_closed() {
+    fn data_after_a_client_reset_is_a_stream_error() {
         for kind in [frame::DATA, frame::HEADERS] {
             let mut c = Client::new(250);
             c.send(frame::HEADERS, frame::END_HEADERS, 1, &post(5));
             c.send(frame::RST_STREAM, 0, 1, &8u32.to_be_bytes());
-            let p = if kind == frame::DATA {
-                b"abc".to_vec()
+            let (p, flags) = if kind == frame::DATA {
+                (b"abc".to_vec(), 0)
             } else {
-                block(GET)
+                (block(GET), frame::END_HEADERS)
             };
-            let flags = if kind == frame::DATA {
-                0
-            } else {
-                frame::END_HEADERS
-            };
-            goaway(&c.send(kind, flags, 1, &p), frame::STREAM_CLOSED);
+            let fs = c.send(kind, flags, 1, &p);
+            assert_eq!(kinds(&fs), [(frame::RST_STREAM, 0, 1)]);
+            assert_eq!(code(&fs), frame::STREAM_CLOSED);
+            assert!(!c.h2.over());
+            // the connection works on
+            assert!(c.get(3, GET).is_empty());
+            assert_eq!(c.recs.len(), 1);
         }
+        // DATA still counts in the connection window
+        let mut c = Client::new(250);
+        c.send(frame::HEADERS, frame::END_HEADERS, 1, &post(5));
+        c.send(frame::RST_STREAM, 0, 1, &8u32.to_be_bytes());
+        let before = c.h2.recv;
+        c.send(frame::DATA, 0, 1, b"abc");
+        assert_eq!(c.h2.recv, before - 3);
+    }
+
+    /// The memory of client resets is bounded, and RSTs on closed or
+    /// idle ids add nothing to it.
+    #[test]
+    fn the_client_reset_memory_is_bounded() {
+        let mut c = Client::with_max(250, MAX_BODY);
+        for i in 0..300u32 {
+            c.get(1 + 2 * i, GET);
+            c.send(frame::RST_STREAM, 0, 1 + 2 * i, &8u32.to_be_bytes());
+        }
+        assert_eq!(c.h2.client_resets.len(), 250);
+        // closed ids: nothing is added
+        for _ in 0..50 {
+            c.send(frame::RST_STREAM, 0, 1, &8u32.to_be_bytes());
+        }
+        assert_eq!(c.h2.client_resets.len(), 250);
+        assert_eq!(*c.h2.client_resets.back().unwrap(), 599);
     }
 
     /// All bodies of one connection together stay under the bound
@@ -2325,23 +2360,64 @@ mod conn {
     }
 
     /// Rapid Reset (CVE-2023-44487): HEADERS then RST_STREAM, again and
-    /// again. 100 a second are fine, the 101st gets ENHANCE_YOUR_CALM.
+    /// again. The bucket holds 1000 (a burst), then 100 come back each
+    /// second.
     #[test]
     fn attack_rapid_reset() {
         let mut c = Client::new(250);
-        for i in 0..100u32 {
+        let rst = 8u32.to_be_bytes();
+        for i in 0..1000u32 {
             c.get(1 + 2 * i, GET);
-            assert!(
-                c.send(frame::RST_STREAM, 0, 1 + 2 * i, &8u32.to_be_bytes())
-                    .is_empty()
-            );
+            assert!(c.send(frame::RST_STREAM, 0, 1 + 2 * i, &rst).is_empty());
         }
-        c.get(201, GET);
+        c.get(2001, GET);
         goaway(
-            &c.send(frame::RST_STREAM, 0, 201, &8u32.to_be_bytes()),
+            &c.send(frame::RST_STREAM, 0, 2001, &rst),
             frame::ENHANCE_YOUR_CALM,
         );
         assert!(c.h2.over());
+        // a flood that goes on at the sustained rate: 100 a second is fine
+        let mut c = Client::new(250);
+        for i in 0..1000u32 {
+            c.get(1 + 2 * i, GET);
+            c.send(frame::RST_STREAM, 0, 1 + 2 * i, &rst);
+        }
+        for s in 0..5u32 {
+            next_second(&mut c);
+            for i in 0..100u32 {
+                let id = 2001 + 2 * (s * 100 + i);
+                c.get(id, GET);
+                assert!(c.send(frame::RST_STREAM, 0, id, &rst).is_empty());
+            }
+        }
+        // 101 in one second is over the rate
+        next_second(&mut c);
+        for i in 0..100u32 {
+            let id = 3001 + 2 * i;
+            c.get(id, GET);
+            c.send(frame::RST_STREAM, 0, id, &rst);
+        }
+        c.get(4001, GET);
+        goaway(
+            &c.send(frame::RST_STREAM, 0, 4001, &rst),
+            frame::ENHANCE_YOUR_CALM,
+        );
+    }
+
+    /// A client or proxy that cancels all its calls at once is not cut.
+    #[test]
+    fn a_mass_cancel_is_fine() {
+        let mut c = Client::new(250);
+        for i in 0..250u32 {
+            assert!(c.get(1 + 2 * i, GET).is_empty());
+        }
+        assert_eq!(c.h2.open(), 250);
+        for i in 0..250u32 {
+            let fs = c.send(frame::RST_STREAM, 0, 1 + 2 * i, &8u32.to_be_bytes());
+            assert!(fs.is_empty());
+        }
+        assert!(!c.h2.over());
+        assert_eq!(c.h2.open(), 0);
     }
 
     /// "Made you reset" (CVE-2025-8671): each request is followed by a
@@ -2349,18 +2425,61 @@ mod conn {
     #[test]
     fn attack_made_you_reset() {
         let mut c = Client::new(250);
-        for i in 0..100u32 {
+        for i in 0..1000u32 {
             c.get(1 + 2 * i, GET);
             // a WINDOW_UPDATE of 0 on a stream is a stream error
             let fs = c.send(frame::WINDOW_UPDATE, 0, 1 + 2 * i, &[0; 4]);
             assert_eq!(code(&fs), frame::PROTOCOL_ERROR);
         }
-        assert_eq!(c.recs.len(), 100);
-        c.get(201, GET);
+        assert_eq!(c.recs.len(), 1000);
+        c.get(2001, GET);
         goaway(
-            &c.send(frame::WINDOW_UPDATE, 0, 201, &[0; 4]),
+            &c.send(frame::WINDOW_UPDATE, 0, 2001, &[0; 4]),
             frame::ENHANCE_YOUR_CALM,
         );
+        // frames on a stream the client reset: STREAM_CLOSED, also counted
+        let mut c = Client::new(250);
+        c.get(1, GET);
+        c.send(frame::RST_STREAM, 0, 1, &8u32.to_be_bytes());
+        for k in 0..999u32 {
+            if k % 50 == 49 {
+                c.get(3 + 2 * (k / 50), GET); // work: the empty count starts again
+            }
+            assert_eq!(code(&c.send(frame::DATA, 0, 1, b"x")), frame::STREAM_CLOSED);
+        }
+        goaway(&c.send(frame::DATA, 0, 1, b"x"), frame::ENHANCE_YOUR_CALM);
+    }
+
+    /// Refused HEADERS cost an HPACK decode: they take a token too. (Some
+    /// real work in between keeps the empty count from stopping them.)
+    #[test]
+    fn attack_refused_headers() {
+        let mut c = Client::with_max(1, MAX_BODY);
+        // one open stream: each new HEADERS is REFUSED_STREAM
+        c.send(frame::HEADERS, frame::END_HEADERS, 1, &post(100_000));
+        let mut n = 0u32;
+        let fs = loop {
+            n += 1;
+            if n.is_multiple_of(50) {
+                c.send(frame::DATA, 0, 1, b"x");
+            }
+            let fs = c.send(frame::HEADERS, frame::END_HEADERS, 1 + 2 * n, &block(GET));
+            if code(&fs) != frame::REFUSED_STREAM {
+                break fs;
+            }
+            assert!(n < 5000);
+        };
+        goaway(&fs, frame::ENHANCE_YOUR_CALM);
+        assert_eq!(n, 1001);
+        // with no work in between, the empty count stops them first
+        let mut c = Client::with_max(1, MAX_BODY);
+        c.send(frame::HEADERS, frame::END_HEADERS, 1, &post(100_000));
+        for n in 1..=100u32 {
+            let fs = c.send(frame::HEADERS, frame::END_HEADERS, 1 + 2 * n, &block(GET));
+            assert_eq!(code(&fs), frame::REFUSED_STREAM);
+        }
+        let fs = c.send(frame::HEADERS, frame::END_HEADERS, 203, &block(GET));
+        goaway(&fs, frame::ENHANCE_YOUR_CALM);
     }
 
     /// RST_STREAM on closed ids counts toward the limit, and does not push
@@ -2373,13 +2492,15 @@ mod conn {
         c.get(3, GET);
         c.answer(0, 200, b"", b"");
         assert_eq!(c.h2.resets.len(), 1);
-        for _ in 0..100 {
+        // the 413 took one token: 999 are left
+        for _ in 0..999 {
             assert!(
                 c.send(frame::RST_STREAM, 0, 3, &8u32.to_be_bytes())
                     .is_empty()
             );
         }
         assert_eq!(c.h2.resets.len(), 1, "client resets are not remembered");
+        assert!(c.h2.client_resets.is_empty());
         assert!(c.send(frame::DATA, 0, 1, b"late").is_empty());
         goaway(
             &c.send(frame::RST_STREAM, 0, 3, &8u32.to_be_bytes()),
@@ -2488,13 +2609,53 @@ mod conn {
         // this count stops them
         let mut c = Client::new(250);
         c.send(frame::HEADERS, 0, 1, &block(GET));
-        for _ in 0..100 {
+        // the HEADERS counts as one
+        for _ in 0..99 {
             assert!(c.send(frame::CONTINUATION, 0, 1, b"").is_empty());
         }
         goaway(
             &c.send(frame::CONTINUATION, 0, 1, b""),
             frame::ENHANCE_YOUR_CALM,
         );
+    }
+
+    /// A refused HEADERS, or an empty DATA with END_STREAM on a reset
+    /// stream, is no work: it does not start the empty count again.
+    #[test]
+    fn refused_frames_do_not_reset_the_empty_count() {
+        let mut c = Client::with_max(1, MAX_BODY);
+        c.send(frame::HEADERS, frame::END_HEADERS, 1, &post(5));
+        let mut id = 3;
+        let mut last = Vec::new();
+        'outer: for _ in 0..10 {
+            for _ in 0..99 {
+                last = c.send(frame::DATA, 0, 1, b"");
+                if !last.is_empty() {
+                    break 'outer;
+                }
+            }
+            // refused over max_streams: still no work
+            last = c.send(frame::HEADERS, frame::END_HEADERS, id, &block(GET));
+            id += 2;
+            if code(&last) != frame::REFUSED_STREAM {
+                break;
+            }
+        }
+        goaway(&last, frame::ENHANCE_YOUR_CALM);
+        // empty DATA with END_STREAM on a stream the client reset
+        let mut c = Client::new(250);
+        c.get(1, GET);
+        c.send(frame::RST_STREAM, 0, 1, &8u32.to_be_bytes());
+        for _ in 0..10 {
+            for _ in 0..99 {
+                c.send(frame::PRIORITY, 0, 9, b"\0\0\0\x01\x10");
+            }
+            c.send(frame::DATA, frame::END_STREAM, 1, b"");
+            if c.h2.over() {
+                break;
+            }
+        }
+        assert!(c.h2.over());
     }
 
     /// CONTINUATION flood (CVE-2024-27316 family): the header block is
