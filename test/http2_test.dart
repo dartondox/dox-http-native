@@ -547,6 +547,8 @@ void main() {
       expect(utf8.decode(a.body), 'ok');
       await Future<void>.delayed(const Duration(milliseconds: 100));
       expect(goneAfterAnswer, isFalse);
+      // reading `gone` must not leave the response in `watched`
+      expect(server.watched, isEmpty);
     },
   );
 

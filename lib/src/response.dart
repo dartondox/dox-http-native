@@ -217,9 +217,10 @@ class NativeResponse implements HttpResponse {
 
   /// Completes [done], once.
   void _complete() {
+    // also when only [gone] put this response in `watched`
+    _request.server.watched.remove(_request.id);
     Completer<HttpResponse>? done = _done;
     if (done == null || done.isCompleted) return;
-    _request.server.watched.remove(_request.id);
     done.complete(this);
   }
 
@@ -368,7 +369,7 @@ class NativeResponse implements HttpResponse {
     _left = length - _size;
     List<int> first = takeBody();
     // from now on Rust tells [streamed] when the client is gone
-    if (_done != null) _request.server.watched.remove(_request.id);
+    _request.server.watched.remove(_request.id);
     _stream = _request.server.startStream(_request, this, first);
     _unsent += first.length;
     // the head is out: later header and status changes are ignored
