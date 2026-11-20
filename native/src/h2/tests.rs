@@ -484,3 +484,87 @@ fn list_over_cap() {
         Err(HpackError::ListTooLarge)
     );
 }
+
+// dynamic table edge cases
+
+/// A literal with incremental indexing and a new name, no Huffman.
+fn indexed_literal(name: &str, value: &str) -> Vec<u8> {
+    let mut out = vec![0x40, name.len() as u8];
+    out.extend_from_slice(name.as_bytes());
+    out.push(value.len() as u8);
+    out.extend_from_slice(value.as_bytes());
+    out
+}
+
+#[test]
+fn entry_bigger_than_table_empties_it() {
+    let mut d = Decoder::new(50);
+    decode(&mut d, &indexed_literal("a", "b"), usize::MAX).unwrap();
+    assert_eq!(d.table().0, 34);
+    // 10 + 13 + 32 = 55, over the whole table size of 50
+    let block = indexed_literal("custom-key", "custom-header");
+    let got = decode(&mut d, &block, usize::MAX).unwrap();
+    assert_eq!(got, fields(&[("custom-key", "custom-header")]));
+    let (size, entries) = d.table();
+    assert_eq!(size, 0);
+    assert!(entries.is_empty());
+}
+
+#[test]
+fn smaller_size_update_evicts_oldest() {
+    let mut d = Decoder::new(4096);
+    for n in ["n1", "n2", "n3"] {
+        decode(&mut d, &indexed_literal(n, "v1"), usize::MAX).unwrap();
+    }
+    assert_eq!(d.table().0, 108);
+    // size update to 80: 0x20 | 31, then 80 - 31 = 49
+    decode(&mut d, &[0x3f, 0x31], usize::MAX).unwrap();
+    assert_eq!(d.max_size(), 80);
+    let (size, entries) = d.table();
+    assert_eq!(size, 72);
+    assert_eq!(
+        entries,
+        vec![(&b"n3"[..], &b"v1"[..]), (&b"n2"[..], &b"v1"[..])]
+    );
+}
+
+#[test]
+fn indexed_field_over_cap_is_list_too_large() {
+    // static index 2 is :method GET: 7 + 3 + 32 = 42
+    let mut d = Decoder::new(4096);
+    assert_eq!(decode(&mut d, &[0x82], 42).unwrap().len(), 1);
+    assert_eq!(decode(&mut d, &[0x82], 41), Err(HpackError::ListTooLarge));
+    // the second field pushes the list over: 42 + 42 = 84
+    assert_eq!(
+        decode(&mut d, &[0x82, 0x82], 83),
+        Err(HpackError::ListTooLarge)
+    );
+    assert_eq!(decode(&mut d, &[0x82, 0x82], 84).unwrap().len(), 2);
+    // dynamic index 62: 10 + 13 + 32 = 55
+    decode(
+        &mut d,
+        &indexed_literal("custom-key", "custom-header"),
+        usize::MAX,
+    )
+    .unwrap();
+    assert_eq!(decode(&mut d, &[0xbe], 54), Err(HpackError::ListTooLarge));
+    assert_eq!(decode(&mut d, &[0xbe], 55).unwrap().len(), 1);
+}
+
+#[test]
+fn name_from_entry_evicted_by_same_insert() {
+    let mut d = Decoder::new(100);
+    decode(&mut d, &indexed_literal("aa", "bb"), usize::MAX).unwrap();
+    decode(&mut d, &indexed_literal("cc", "dd"), usize::MAX).unwrap();
+    assert_eq!(d.table().0, 72);
+    // name from index 63 (the oldest, "aa"); the new entry is 36 bytes, so
+    // the table is 108 and "aa" is evicted
+    let got = decode(&mut d, &[0x7f, 0x00, 0x02, b'e', b'e'], usize::MAX).unwrap();
+    assert_eq!(got, fields(&[("aa", "ee")]));
+    let (size, entries) = d.table();
+    assert_eq!(size, 72);
+    assert_eq!(
+        entries,
+        vec![(&b"aa"[..], &b"ee"[..]), (&b"cc"[..], &b"dd"[..])]
+    );
+}
