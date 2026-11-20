@@ -68,6 +68,11 @@ const MAX_FRAME_LIMIT: u32 = (1 << 24) - 1;
 /// deadline is a reset: a busy client with some timeouts must not be cut.
 /// A client with up to about a third of its calls reset is not cut. An
 /// attacker needs two real answers per reset.
+/// Known limit (the same trade as Envoy's premature-reset check): the two
+/// answers may come from a cheap route and the reset from a costly one.
+/// The handler of a reset request still runs to its end in Dart. A full
+/// fix counts those handlers against `max_streams` until they answer (as
+/// grpc-go does).
 const RESET_BURST_MIN: u32 = 1000;
 /// Tokens that come back each second (the sustained rate of resets).
 const RESET_RATE: f64 = 100.0;
@@ -1328,7 +1333,9 @@ impl H2 {
             } else {
                 frame::write_headers(out, id, &s.trailers, true, self.peer_frame);
             }
-            self.finish(out, id, true);
+            // no DATA bytes (eg. a gRPC error with trailers only): no refund
+            let paid = s.wrote;
+            self.finish(out, id, paid);
         }
     }
 
@@ -1405,6 +1412,7 @@ impl H2 {
             };
             frame::write(out, frame::DATA, flags, id, &s.body[s.sent..s.sent + k]);
             s.sent += k;
+            s.wrote |= k > 0;
             s.stalled = None; // bytes moved: the stall clock starts again
             self.data_sent += k as u64;
             self.pings_rate.n = 0; // see MAX_PINGS

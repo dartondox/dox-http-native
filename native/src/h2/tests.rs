@@ -2527,6 +2527,26 @@ mod conn {
         assert_eq!(c.h2.reset_bucket.tokens, 999.0);
     }
 
+    /// A streamed answer with no DATA bytes (eg. a gRPC error with
+    /// trailers only) gives no refund. One with bytes gives half a token.
+    #[test]
+    fn streamed_answer_without_bytes_gives_nothing() {
+        let mut c = Client::new(250);
+        c.get(1, GET);
+        c.send(frame::RST_STREAM, 0, 1, &8u32.to_be_bytes());
+        c.get(3, GET);
+        assert!(start(&mut c, 1, b"", b"").0);
+        end_with(&mut c, 1, b"grpc-status: 13\r\n");
+        assert!(!c.h2.streams.contains_key(&3), "answered");
+        assert_eq!(c.h2.reset_bucket.tokens, 999.0);
+        c.get(5, GET);
+        assert!(start(&mut c, 2, b"", b"").0);
+        part(&mut c, 2, b"hi", false, true);
+        end_with(&mut c, 2, b"grpc-status: 0\r\n");
+        assert!(!c.h2.streams.contains_key(&5), "answered");
+        assert_eq!(c.h2.reset_bucket.tokens, 999.5);
+    }
+
     /// HEADERS on a stream we reset are decoded and dropped: each takes a
     /// token. Work in between (a new stream) does not stop the cost.
     #[test]
