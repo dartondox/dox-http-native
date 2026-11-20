@@ -1788,7 +1788,12 @@ fn http2_streamed_body_acks_and_connection_death() {
         frame::write(&mut req, frame::DATA, 0, 1, &part);
     }
     let mut s = connect(port);
-    s.write_all(&req).unwrap();
+    // 600 KiB is more than the socket buffers hold (smaller on macOS under
+    // load), and only `core.run` below reads them. Writing on this thread
+    // would block forever, so a second thread writes.
+    let mut w = s.try_clone().unwrap();
+    let sent = req.clone();
+    let writer = std::thread::spawn(move || w.write_all(&sent).unwrap());
     let mut recs = Vec::new();
     let end = Instant::now() + Duration::from_secs(5);
     let want = 600 / 16 * part.len();
@@ -1802,6 +1807,7 @@ fn http2_streamed_body_acks_and_connection_death() {
         let n = core.run(&[], &mut inb, 1000).unwrap();
         recs.extend(records(&inb[..n]));
     }
+    writer.join().unwrap();
     assert_eq!(recs[0].flags, 8 | 16, "the request comes first, bit 4");
     assert!(recs[0].body.is_empty());
     assert_eq!(body(&recs), want);
@@ -1846,16 +1852,18 @@ fn http2_streamed_body_acks_and_connection_death() {
 
     // the client closes its side: the body ends at once, the answer may
     // still go out. No second end when the connection closes.
-    let mut s = connect(port);
-    s.write_all(&req[..req.len() - 10 * (frame::HEAD + part.len())])
-        .unwrap();
-    s.shutdown(std::net::Shutdown::Write).unwrap();
+    let s = connect(port);
+    let writer = write_then_close(
+        &s,
+        req[..req.len() - 10 * (frame::HEAD + part.len())].to_vec(),
+    );
     let mut recs = Vec::new();
     let end = Instant::now() + Duration::from_secs(5);
     while !recs.iter().any(|r: &Rec| r.kind() == BODY_END) && Instant::now() < end {
         let n = core.run(&[], &mut inb, 1000).unwrap();
         recs.extend(records(&inb[..n]));
     }
+    writer.join().unwrap();
     let last = recs.last().unwrap();
     assert_eq!((last.kind(), last.code), (BODY_END, 1));
     let id = recs[0].id;
@@ -1869,17 +1877,16 @@ fn http2_streamed_body_acks_and_connection_death() {
 
     // the client closes its side in the middle of a frame: the body ends
     // at once too
-    let mut s = connect(port);
+    let s = connect(port);
     let cut = req.len() - 10 * (frame::HEAD + part.len());
-    s.write_all(&req[..cut]).unwrap();
-    s.write_all(&req[cut..cut + 5]).unwrap();
-    s.shutdown(std::net::Shutdown::Write).unwrap();
+    let writer = write_then_close(&s, req[..cut + 5].to_vec());
     let mut recs = Vec::new();
     let end = Instant::now() + Duration::from_secs(5);
     while !recs.iter().any(|r: &Rec| r.kind() == BODY_END) && Instant::now() < end {
         let n = core.run(&[], &mut inb, 1000).unwrap();
         recs.extend(records(&inb[..n]));
     }
+    writer.join().unwrap();
     let last = recs.last().unwrap();
     assert_eq!((last.kind(), last.code), (BODY_END, 1));
 }
@@ -1958,4 +1965,16 @@ fn http2_stream_entry_lives_until_end_expiry_or_close() {
     assert!(core.streams.contains_key(&78));
     core.kill((id2 >> 32) as usize);
     assert!(!core.streams.contains_key(&78), "closed: the entry goes");
+}
+
+/// Writes `bytes` on a second thread, then closes the write side. A big
+/// write can be more than the socket buffers hold (smaller on macOS under
+/// load), and only `core.run` on the test thread reads them: on the test
+/// thread it would block forever.
+fn write_then_close(s: &StdStream, bytes: Vec<u8>) -> std::thread::JoinHandle<()> {
+    let mut w = s.try_clone().unwrap();
+    std::thread::spawn(move || {
+        w.write_all(&bytes).unwrap();
+        w.shutdown(std::net::Shutdown::Write).unwrap();
+    })
 }
