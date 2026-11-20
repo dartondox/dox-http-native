@@ -9,7 +9,10 @@
 //! frame each.
 //!
 //! A request body is read whole before Dart gets the request (buffered,
-//! like HTTP/1.1). Streamed answers (kind 6, 7, 8) go out as DATA frames
+//! like HTTP/1.1). A gRPC request (`content-type: application/grpc*`)
+//! streams its body to Dart instead: BODY_PART records, and the client gets
+//! its window back only when Dart acks the bytes (BODY_ACK). Streamed
+//! answers (kind 6, 7, 8) go out as DATA frames
 //! under the send windows. Floods of small frames get GOAWAY
 //! ENHANCE_YOUR_CALM (plan 4.10): see the `MAX_*` limits below.
 
@@ -26,7 +29,7 @@ use hpack::{Decoded, Decoder, encode_field};
 use stream::{Recv, Stream};
 
 use crate::run::{MAX_HEADERS, escape_target, length_line, parse_len, write_head};
-use crate::{MAX_HEAD, REQ_HEAD};
+use crate::{BODY_END, BODY_PART, MAX_HEAD, REQ_HEAD};
 
 /// The client preface (RFC 9113 3.4).
 pub(crate) const PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -85,6 +88,16 @@ const BODY_STREAMS_CAP: usize = 4;
 const HOLD: usize = 64 * 1024;
 /// Request flag bit 3: the request came over HTTP/2.
 const FLAG_H2: u32 = 8;
+/// Request flag bit 4: the body comes in parts (BODY_PART, BODY_END).
+const FLAG_STREAMED: u32 = 16;
+/// A streamed body: acked bytes go back to the client (WINDOW_UPDATE) once
+/// there are this many, so small acks do not cost a frame each. At most
+/// this much of the window is held back after Dart acked all, so the
+/// client never stalls on it.
+const ACK_BATCH: u64 = STREAM_WINDOW as u64 / 2;
+/// The content-type of a request whose body streams (any case, and
+/// `+proto` etc. may follow)
+const GRPC: &[u8] = b"application/grpc";
 
 // SETTINGS ids (RFC 9113 6.5.2)
 const ENABLE_PUSH: u16 = 2;
@@ -229,6 +242,12 @@ pub(crate) struct H2 {
     /// streamed answers whose stream ended before Dart's end: Dart gets
     /// STREAM_GONE for each
     pub(crate) gone_streams: Vec<u64>,
+    /// streamed request bodies: records for Dart (request seq, kind
+    /// BODY_PART or BODY_END, status, bytes), in order
+    pub(crate) to_dart: Vec<(u32, u32, u16, Vec<u8>)>,
+    /// streamed body bytes Dart has not acked yet, all streams. Their
+    /// connection window is not given back before (see `settle`).
+    unacked: i64,
     /// flood counters, see the `MAX_*` limits
     reset_bucket: Bucket,
     reset_burst: f64,
@@ -299,6 +318,8 @@ impl H2 {
             held: None,
             gone: Vec::new(),
             gone_streams: Vec::new(),
+            to_dart: Vec::new(),
+            unacked: 0,
             reset_bucket: Bucket::new(now, burst),
             reset_burst: burst,
             settings_rate: Rate::new(now),
@@ -328,9 +349,18 @@ impl H2 {
     pub(crate) fn unanswered(&self) -> impl Iterator<Item = u32> + '_ {
         self.streams
             .values()
-            .filter(|s| !s.answered && s.recv.is_none())
+            .filter(|s| !s.answered && s.known())
             .map(|s| s.seq)
             .chain(self.gone.iter().copied())
+    }
+
+    /// The seqs of requests whose body still streams to Dart (for
+    /// BODY_END when the connection dies).
+    pub(crate) fn streaming(&self) -> impl Iterator<Item = u32> + '_ {
+        self.streams
+            .values()
+            .filter(|s| s.streaming())
+            .map(|s| s.seq)
     }
 
     /// The ids of Dart's streamed answers that are not over (for
@@ -342,15 +372,16 @@ impl H2 {
             .chain(self.gone_streams.iter().copied())
     }
 
-    /// When the oldest wait for request body bytes started, if a body
-    /// comes (for the body timeout).
+    /// When the oldest wait for request body bytes started, if a buffered
+    /// body comes (for the body timeout). A streamed body has no timeout:
+    /// a gRPC stream may be quiet for long.
     pub(crate) fn body_since(&self) -> Option<Instant> {
         if self.dead {
             return None; // `expire` does nothing then: no timer must wait
         }
         self.streams
             .values()
-            .filter_map(|s| s.recv.as_ref().map(|r| r.last))
+            .filter_map(|s| s.recv.as_ref().filter(|r| !r.streamed).map(|r| r.last))
             .min()
     }
 
@@ -409,13 +440,18 @@ impl H2 {
         let late: Vec<u32> = self
             .streams
             .iter()
-            .filter(|(_, s)| s.recv.as_ref().is_some_and(|r| r.last + timeout <= now))
+            .filter(|(_, s)| {
+                s.recv
+                    .as_ref()
+                    .is_some_and(|r| !r.streamed && r.last + timeout <= now)
+            })
             .map(|(&id, _)| id)
             .collect();
         for id in late {
             self.reply(out, id, 408, false, date);
             self.drop_stream(id);
         }
+        self.settle(out);
     }
 
     /// True when the connection can close once the write buffer is out.
@@ -472,7 +508,29 @@ impl H2 {
                 self.fail(out, e.code);
             }
         }
+        self.settle(out);
         true
+    }
+
+    /// Gives connection window back to the client: what it sent and is
+    /// not held for Dart (`unacked`). Only once enough is due, or the
+    /// client is nearly stuck, so a mix of buffered and streamed bodies
+    /// never stalls. The streamed bytes of Dart keep CONN_WINDOW as their
+    /// cap: `recv + unacked <= CONN_WINDOW`.
+    fn settle(&mut self, out: &mut Vec<u8>) {
+        if self.dead {
+            return;
+        }
+        let due = CONN_WINDOW - self.unacked - self.recv;
+        if due > 0 && (due >= CONN_WINDOW / 2 || self.recv < ACK_BATCH as i64) {
+            frame::write_window(out, 0, due as u32);
+            self.recv += due;
+        }
+    }
+
+    /// True when `buf` holds no whole frame: more bytes are needed.
+    pub(crate) fn partial(buf: &[u8]) -> bool {
+        frame::read_head(buf).is_none_or(|h| buf.len() < frame::HEAD + h.len)
     }
 
     /// One frame. A frame that counts (see `counts`) and did no work adds
@@ -680,12 +738,7 @@ impl H2 {
             return Err(conn_err(frame::FLOW_CONTROL_ERROR));
         }
         self.recv -= flow as i64;
-        // give the window back once half of it is used, so the
-        // connection never stalls
-        if self.recv < CONN_WINDOW / 2 {
-            frame::write_window(out, 0, (CONN_WINDOW - self.recv) as u32);
-            self.recv = CONN_WINDOW;
-        }
+        // the window comes back in `settle`, after each frame
         if state == State::Closed {
             // After its own RST_STREAM the client may not send DATA: a
             // stream error (RFC 9113 5.1). DATA of a stream we reset may
@@ -709,10 +762,41 @@ impl H2 {
         }
         r.window -= flow as i64;
         r.last = self.now;
-        let got = (r.data.len() + data.len()) as u64;
+        let got = r.taken + (r.data.len() + data.len()) as u64;
         // the body must have the length the request said (RFC 9113 8.1.1)
         if r.length.is_some_and(|l| got > l || (end && got < l)) {
             return Err(stream_err(frame::PROTOCOL_ERROR));
+        }
+        if r.streamed {
+            // to Dart at once. The window comes back on Dart's ack, the
+            // padding now (Dart never sees it). The connection window of
+            // the data also waits for the ack (`unacked`).
+            r.taken = got;
+            r.acked += (flow - data.len()) as u64;
+            give_back(out, id, r);
+            if !data.is_empty() || end {
+                self.worked = true;
+            }
+            if !data.is_empty() {
+                s.owed += data.len() as u64;
+                self.unacked += data.len() as i64;
+                // Join it to a part of this stream that waits for Dart:
+                // 1M frames of 1 byte must not be 1M records.
+                let last = self
+                    .to_dart
+                    .iter_mut()
+                    .rev()
+                    .find(|p| p.0 == s.seq && p.1 == BODY_PART);
+                match last {
+                    Some(p) => p.3.extend_from_slice(data),
+                    None => self.to_dart.push((s.seq, BODY_PART, 0, data.to_vec())),
+                }
+            }
+            if end {
+                s.recv = None;
+                self.to_dart.push((s.seq, BODY_END, 0, Vec::new()));
+            }
+            return Ok(());
         }
         if got > r.max as u64 {
             // only this stream ends, the connection goes on
@@ -896,27 +980,38 @@ impl H2 {
                     self.max_body
                 };
                 let length = req.length;
-                if length.is_some_and(|l| l > max as u64) {
+                // no body limit: dox_grpc limits each message
+                let streamed = req.grpc && !end_stream;
+                if !streamed && length.is_some_and(|l| l > max as u64) {
                     // too big: say no before the body comes
                     self.spend()?;
                     self.reply(out, id, 413, false, date);
                     return Ok(());
                 }
                 let head = req.method == b"HEAD";
-                let rec = req.record(self.base | u64::from(*seq), &self.peer);
-                let recv = if end_stream {
-                    self.held = Some((rec, Vec::new()));
-                    None
+                let flags = if streamed {
+                    FLAG_H2 | FLAG_STREAMED
                 } else {
-                    Some(Box::new(Recv {
+                    FLAG_H2
+                };
+                let mut rec = req.record(self.base | u64::from(*seq), &self.peer, flags);
+                // Dart gets the request now, or once the body is whole
+                if end_stream || streamed {
+                    self.held = Some((std::mem::take(&mut rec), Vec::new()));
+                }
+                let recv = (!end_stream).then(|| {
+                    Box::new(Recv {
                         rec,
                         data: Vec::new(),
                         max,
                         length,
                         window: STREAM_WINDOW,
                         last: self.now,
-                    }))
-                };
+                        streamed,
+                        taken: 0,
+                        acked: 0,
+                    })
+                });
                 let s = Stream::new(*seq, self.peer_window, head, recv);
                 self.streams.insert(id, s);
                 self.stirred = true;
@@ -973,15 +1068,76 @@ impl H2 {
                 self.turns.retain(|&t| t != id);
             }
             self.seqs.remove(&s.seq);
-            // Dart knows the request once its body is whole
-            if !s.answered && s.recv.is_none() {
+            // what Dart never acked will not be acked now
+            self.unacked -= s.owed as i64;
+            // Dart knows the request once its body is whole (or streams)
+            if !s.answered && s.known() {
                 self.gone.push(s.seq);
+            }
+            if s.streaming() {
+                self.to_dart.push((s.seq, BODY_END, 1, Vec::new()));
             }
             if let Some(r) = &s.recv {
                 self.buffered -= r.data.len();
             }
             if let Some(sid) = s.sid.filter(|_| !s.done) {
                 self.gone_streams.push(sid);
+            }
+        }
+    }
+
+    /// The answer of stream `id` is all out. A request body that still
+    /// comes (streamed) is not needed any more: RST_STREAM NO_ERROR tells
+    /// the client to stop (RFC 9113 8.1).
+    fn finish(&mut self, out: &mut Vec<u8>, id: u32) {
+        if let Some(s) = self.streams.get_mut(&id)
+            && s.recv.is_some()
+        {
+            // a streamed body ends for Dart with status 2: we answered
+            // first, nobody failed
+            if s.streaming() {
+                s.recv = None;
+                self.to_dart.push((s.seq, BODY_END, 2, Vec::new()));
+            }
+            frame::write_rst(out, id, frame::NO_ERROR);
+            self.remember(id);
+        }
+        self.drop_stream(id);
+        self.settle(out);
+    }
+
+    /// Dart consumed `n` bytes of the streamed body of request `seq`
+    /// (BODY_ACK): the client may send them again.
+    pub(crate) fn ack(&mut self, seq: u32, n: u64, out: &mut Vec<u8>) {
+        if self.dead {
+            return;
+        }
+        let Some(&id) = self.seqs.get(&seq) else {
+            return;
+        };
+        let Some(s) = self.streams.get_mut(&id) else {
+            return;
+        };
+        // the connection window of these bytes (never more than owed)
+        let free = n.min(s.owed);
+        s.owed -= free;
+        self.unacked -= free as i64;
+        if let Some(r) = s.recv.as_mut().filter(|r| r.streamed) {
+            // never more than the client used: the window stays <= ours
+            let used = (STREAM_WINDOW - r.window) as u64;
+            r.acked = r.acked.saturating_add(n).min(used);
+            give_back(out, id, r);
+        } // else: the body ended, no more DATA comes
+        self.settle(out);
+    }
+
+    /// No more frames come (the client closed its side): each body that
+    /// still streams ends with BODY_END 1. The answers may still go out.
+    pub(crate) fn cut_bodies(&mut self) {
+        for s in self.streams.values_mut() {
+            if s.streaming() {
+                s.recv = None;
+                self.to_dart.push((s.seq, BODY_END, 1, Vec::new()));
             }
         }
     }
@@ -1094,19 +1250,28 @@ impl H2 {
         let silent = no_body || s.head;
         frame::write_headers(out, id, &head_block(status, lines, left, date), silent, max);
         if silent {
-            self.drop_stream(id);
+            self.finish(out, id);
             return false;
         }
         s.sid = Some(sid);
         s.left = left;
-        self.part(seq, first, false, true, out);
+        self.part(seq, first, false, true, b"", out);
         true
     }
 
     /// A part (kind 7) or the end (kind 8, `ok` false when it failed) of
     /// the streamed answer of `seq`. The bytes wait in the stream until
-    /// the windows let them go (see [send]).
-    pub(crate) fn part(&mut self, seq: u32, data: &[u8], end: bool, ok: bool, out: &mut Vec<u8>) {
+    /// the windows let them go (see [send]). The end may have `trailers`
+    /// (header lines): they go out last, in HEADERS with END_STREAM.
+    pub(crate) fn part(
+        &mut self,
+        seq: u32,
+        data: &[u8],
+        end: bool,
+        ok: bool,
+        trailers: &[u8],
+        out: &mut Vec<u8>,
+    ) {
         if self.dead {
             return;
         }
@@ -1130,15 +1295,22 @@ impl H2 {
         }
         s.push(data);
         s.done = end;
+        if end {
+            push_lines(trailers, &mut s.trailers);
+        }
         if s.unsent() > 0 {
             if !s.turn {
                 s.turn = true;
                 self.turns.push_back(id);
             }
         } else if end {
-            // all bytes are out: an empty DATA ends the stream
-            frame::write(out, frame::DATA, frame::END_STREAM, id, &[]);
-            self.drop_stream(id);
+            // all bytes are out: the trailers, or an empty DATA, end it
+            if s.trailers.is_empty() {
+                frame::write(out, frame::DATA, frame::END_STREAM, id, &[]);
+            } else {
+                frame::write_headers(out, id, &s.trailers, true, self.peer_frame);
+            }
+            self.finish(out, id);
         }
     }
 
@@ -1164,7 +1336,7 @@ impl H2 {
         let block = head_block(status, lines, len, date);
         frame::write_headers(out, id, &block, silent, self.peer_frame);
         if silent {
-            self.drop_stream(id);
+            self.finish(out, id);
         } else {
             s.body = body.to_vec();
             s.done = true;
@@ -1207,7 +1379,12 @@ impl H2 {
             }
             misses = 0;
             let end = s.done && k == s.unsent();
-            let flags = if end { frame::END_STREAM } else { 0 };
+            // with trailers, their HEADERS ends the stream
+            let flags = if end && s.trailers.is_empty() {
+                frame::END_STREAM
+            } else {
+                0
+            };
             frame::write(out, frame::DATA, flags, id, &s.body[s.sent..s.sent + k]);
             s.sent += k;
             s.stalled = None; // bytes moved: the stall clock starts again
@@ -1221,7 +1398,10 @@ impl H2 {
             }
             if end {
                 s.turn = false;
-                self.drop_stream(id);
+                if !s.trailers.is_empty() {
+                    frame::write_headers(out, id, &s.trailers, true, self.peer_frame);
+                }
+                self.finish(out, id);
             } else if s.unsent() > 0 {
                 self.turns.push_back(id);
             } else {
@@ -1264,6 +1444,18 @@ fn final_status(status: u16) -> u16 {
 fn head_block(status: u16, lines: &[u8], len: Option<u64>, date: &[u8]) -> Vec<u8> {
     let mut block = Vec::with_capacity(64 + lines.len());
     status_field(status, &mut block);
+    push_lines(lines, &mut block);
+    if let Some(n) = len {
+        encode_field(b"content-length", n.to_string().as_bytes(), &mut block);
+    }
+    date_field(date, &mut block);
+    block
+}
+
+/// Encodes Dart's header lines into `block`: names lowercase, no
+/// connection-specific ones, no content-length (Rust sets it). A line with
+/// no name (eg. a pseudo header `:x`) is dropped.
+fn push_lines(lines: &[u8], block: &mut Vec<u8>) {
     for line in lines.split(|&c| c == b'\n') {
         let Some(at) = line.iter().position(|&c| c == b':') else {
             continue;
@@ -1271,7 +1463,7 @@ fn head_block(status: u16, lines: &[u8], len: Option<u64>, date: &[u8]) -> Vec<u
         let name = line[..at].trim_ascii().to_ascii_lowercase();
         if matches!(
             &name[..],
-            b"connection"
+            b"" | b"connection"
                 | b"keep-alive"
                 | b"proxy-connection"
                 | b"transfer-encoding"
@@ -1280,13 +1472,18 @@ fn head_block(status: u16, lines: &[u8], len: Option<u64>, date: &[u8]) -> Vec<u
         ) {
             continue;
         }
-        encode_field(&name, line[at + 1..].trim_ascii(), &mut block);
+        encode_field(&name, line[at + 1..].trim_ascii(), block);
     }
-    if let Some(n) = len {
-        encode_field(b"content-length", n.to_string().as_bytes(), &mut block);
+}
+
+/// Streamed body: gives the acked bytes back to the client (WINDOW_UPDATE)
+/// once they are [ACK_BATCH] or more.
+fn give_back(out: &mut Vec<u8>, id: u32, r: &mut Recv) {
+    if r.acked >= ACK_BATCH {
+        frame::write_window(out, id, r.acked as u32);
+        r.window += r.acked as i64;
+        r.acked = 0;
     }
-    date_field(date, &mut block);
-    block
 }
 
 fn status_field(status: u16, out: &mut Vec<u8>) {
@@ -1327,6 +1524,8 @@ struct Req {
     length: Option<u64>,
     /// a multipart form: the body gets `maxMultipartSize`
     form: bool,
+    /// a gRPC request: the body streams to Dart
+    grpc: bool,
     /// a regular header came: no pseudo header may follow
     regular: bool,
     bad: bool,
@@ -1406,6 +1605,12 @@ impl Req {
                 self.form = mime
                     .trim_ascii()
                     .eq_ignore_ascii_case(b"multipart/form-data");
+                // `application/grpc`, then the end, `+` or `;` (not
+                // `application/grpc-web` or `application/grpcfoo`)
+                self.grpc = value.get(..GRPC.len()).is_some_and(|p| {
+                    p.eq_ignore_ascii_case(GRPC)
+                        && matches!(value.get(GRPC.len()), None | Some(b'+' | b';'))
+                });
             }
             _ => {}
         }
@@ -1445,8 +1650,9 @@ impl Req {
         Check::Ok
     }
 
-    /// The request record for Dart (see lib.rs), with flag bit 3.
-    fn record(mut self, id: u64, peer: &[u8; 18]) -> Vec<u8> {
+    /// The request record for Dart (see lib.rs), with `flags` (bit 3 and
+    /// maybe bit 4).
+    fn record(mut self, id: u64, peer: &[u8; 18], flags: u32) -> Vec<u8> {
         if !self.cookie.is_empty() {
             let cookie = std::mem::take(&mut self.cookie);
             self.push(b"cookie", &cookie);
@@ -1469,7 +1675,7 @@ impl Req {
         write_head(
             &mut rec,
             id,
-            FLAG_H2,
+            flags,
             m.len(),
             t.len(),
             h.len(),

@@ -2061,7 +2061,7 @@ mod conn {
     /// Dart's kind 7 or 8 for `seq`, then what [H2::send] adds.
     fn part(c: &mut Client, seq: u32, data: &[u8], end: bool, ok: bool) -> Vec<(Head, Vec<u8>)> {
         let mut out = Vec::new();
-        c.h2.part(seq, data, end, ok, &mut out);
+        c.h2.part(seq, data, end, ok, b"", &mut out);
         c.send_into(&mut out, 0);
         frames(&out)
     }
@@ -2795,5 +2795,610 @@ mod conn {
         }
         assert_eq!(c.recs.len(), 600);
         assert_eq!(c.h2.open(), 0);
+    }
+
+    // ---- streamed request bodies and trailers ----
+
+    /// A gRPC POST header block (no END_STREAM).
+    fn grpc(ct: &str) -> Vec<u8> {
+        block(&[
+            (":method", "POST"),
+            (":scheme", "http"),
+            (":path", "/a.B/C"),
+            ("content-type", ct),
+            ("te", "trailers"),
+        ])
+    }
+
+    /// The body records for Dart so far: (seq, kind, status, bytes).
+    fn to_dart(c: &mut Client) -> Vec<(u32, u32, u16, Vec<u8>)> {
+        std::mem::take(&mut c.h2.to_dart)
+    }
+
+    fn ack(c: &mut Client, seq: u32, n: u64) -> Vec<(Head, Vec<u8>)> {
+        let mut out = Vec::new();
+        c.h2.ack(seq, n, &mut out);
+        frames(&out)
+    }
+
+    /// Dart's kind 8 with trailer lines, then what [H2::send] adds.
+    fn end_with(c: &mut Client, seq: u32, trailers: &[u8]) -> Vec<(Head, Vec<u8>)> {
+        let mut out = Vec::new();
+        c.h2.part(seq, b"", true, true, trailers, &mut out);
+        c.send_into(&mut out, 0);
+        frames(&out)
+    }
+
+    /// `content-type: application/grpc*` (any case) streams: the record
+    /// comes with the HEADERS, flag bit 4, no body. Others are buffered.
+    /// HEADERS with END_STREAM has no body: a normal record.
+    #[test]
+    fn grpc_content_type_streams_the_body() {
+        let mut c = Client::new(250);
+        for (id, ct) in [(1, "application/grpc"), (3, "Application/GRPC+proto")] {
+            assert!(
+                c.send(frame::HEADERS, frame::END_HEADERS, id, &grpc(ct))
+                    .is_empty()
+            );
+        }
+        assert_eq!(c.recs.len(), 2);
+        for r in &c.recs {
+            let (flags, m, t, _) = record(r);
+            assert_eq!((flags, m.as_str(), t.as_str()), (8 | 16, "POST", "/a.B/C"));
+        }
+        assert!(c.bodies.iter().all(|b| b.is_empty()));
+        // not gRPC: Dart waits for the whole body
+        for (id, ct) in [
+            (5, "application/json"),
+            (7, "application/gr"),
+            (11, "application/grpc-web"),
+            (13, "application/grpc-web+proto"),
+            (15, "application/grpcfoo"),
+        ] {
+            c.send(frame::HEADERS, frame::END_HEADERS, id, &grpc(ct));
+        }
+        assert_eq!(c.recs.len(), 2);
+        c.send(frame::DATA, frame::END_STREAM, 5, b"{}");
+        assert_eq!(record(&c.recs[2]).0, 8);
+        assert_eq!(c.bodies[2], b"{}");
+
+        // gRPC with END_STREAM on the HEADERS: no body, no bit 4
+        let flags = frame::END_HEADERS | frame::END_STREAM;
+        c.send(frame::HEADERS, flags, 19, &grpc("application/grpc"));
+        assert_eq!(record(&c.recs[3]).0, 8);
+        assert!(to_dart(&mut c).is_empty());
+        assert_eq!(c.h2.streaming().count(), 2);
+        // `;` and `+` after the type still count
+        let ct = "application/grpc; charset=utf-8";
+        c.send(frame::HEADERS, frame::END_HEADERS, 21, &grpc(ct));
+        assert_eq!(record(c.recs.last().unwrap()).0, 8 | 16);
+        assert_eq!(c.h2.streaming().count(), 3);
+    }
+
+    /// Parts go to Dart in order. The stream window comes back only after
+    /// BODY_ACK, in batches. The stream window bounds what waits for Dart.
+    #[test]
+    fn a_streamed_body_waits_for_acks() {
+        let mut c = Client::new(250);
+        c.send(
+            frame::HEADERS,
+            frame::END_HEADERS,
+            1,
+            &grpc("application/grpc"),
+        );
+        assert!(c.send(frame::DATA, 0, 1, b"ab").is_empty());
+        let p = padded(b"cde", 4);
+        assert!(c.send(frame::DATA, frame::PADDED, 1, &p).is_empty());
+        let got = to_dart(&mut c);
+        // the parts that wait for Dart are joined
+        assert_eq!(got, [(0, crate::BODY_PART, 0, b"abcde".to_vec())]);
+        // a whole window with no ack: no stream WINDOW_UPDATE at all
+        let big = vec![7u8; 16_384];
+        let mut sent = 2 + 3 + 5;
+        while sent + big.len() <= 1 << 20 {
+            let fs = c.send(frame::DATA, 0, 1, &big);
+            assert!(updates(&fs).iter().all(|u| u.0 == 0), "{:?}", updates(&fs));
+            sent += big.len();
+        }
+        let rest = (1 << 20) - sent;
+        c.send(frame::DATA, 0, 1, &big[..rest]);
+        let parts: usize = to_dart(&mut c).iter().map(|m| m.3.len()).sum();
+        // all but the padding went to Dart
+        assert_eq!(parts + 5 + 5, 1 << 20);
+        // one byte more is over the window
+        let fs = c.send(frame::DATA, 0, 1, b"x");
+        assert_eq!(code(&fs), frame::FLOW_CONTROL_ERROR);
+        assert!(!c.h2.over());
+
+        // acks: small ones wait, half the window sends one update
+        let mut c = Client::new(250);
+        c.send(
+            frame::HEADERS,
+            frame::END_HEADERS,
+            1,
+            &grpc("application/grpc"),
+        );
+        for _ in 0..40 {
+            c.send(frame::DATA, 0, 1, &big);
+        }
+        assert!(ack(&mut c, 0, 100).is_empty());
+        assert!(ack(&mut c, 0, (super::super::ACK_BATCH) - 101).is_empty());
+        assert_eq!(updates(&ack(&mut c, 0, 1)), [(1, (1 << 19) as u32)]);
+        // an ack over what came is cut to it: the window never grows past
+        // ours (and the rest is under a batch)
+        assert!(ack(&mut c, 0, u64::MAX).is_empty());
+        let r = c.h2.streams[&1].recv.as_ref().unwrap();
+        assert_eq!(r.acked, 40 * 16_384 - (1 << 19));
+        assert_eq!(r.window + r.acked as i64, 1 << 20);
+        // an unknown seq does nothing
+        assert!(ack(&mut c, 9, 1 << 20).is_empty());
+    }
+
+    /// Padding comes back without an ack: Dart never sees it.
+    #[test]
+    fn padding_of_a_streamed_body_comes_back() {
+        let mut c = Client::new(250);
+        c.send(
+            frame::HEADERS,
+            frame::END_HEADERS,
+            1,
+            &grpc("application/grpc"),
+        );
+        let p = padded(b"a", 255);
+        let mut back = Vec::new();
+        for _ in 0..3000 {
+            back.extend(updates(&c.send(frame::DATA, frame::PADDED, 1, &p)));
+        }
+        assert!(
+            back.iter().any(|u| u.0 == 1),
+            "the stream got its padding back"
+        );
+        assert!(!c.h2.over());
+    }
+
+    /// A client RST: BODY_END with a non-zero status, once, and the
+    /// request is gone (Dart has not answered).
+    #[test]
+    fn a_client_reset_ends_a_streamed_body_once() {
+        let mut c = Client::new(250);
+        c.send(
+            frame::HEADERS,
+            frame::END_HEADERS,
+            1,
+            &grpc("application/grpc"),
+        );
+        c.send(frame::DATA, 0, 1, b"ab");
+        c.send(frame::RST_STREAM, 0, 1, &8u32.to_be_bytes());
+        // a frame after the RST is a stream error: no second end
+        c.send(frame::DATA, 0, 1, b"cd");
+        c.send(frame::RST_STREAM, 0, 1, &8u32.to_be_bytes());
+        assert_eq!(
+            to_dart(&mut c),
+            [
+                (0, crate::BODY_PART, 0, b"ab".to_vec()),
+                (0, crate::BODY_END, 1, Vec::new()),
+            ]
+        );
+        assert_eq!(c.h2.gone, [0]);
+        assert_eq!(c.h2.streaming().count(), 0);
+        assert!(ack(&mut c, 0, 1 << 20).is_empty());
+        // Dart answered: only BODY_END, no REQUEST_GONE
+        c.send(
+            frame::HEADERS,
+            frame::END_HEADERS,
+            3,
+            &grpc("application/grpc"),
+        );
+        let (ok, _) = start(&mut c, 1, b"", b"");
+        assert!(ok);
+        c.h2.gone.clear();
+        c.send(frame::RST_STREAM, 0, 3, &8u32.to_be_bytes());
+        assert_eq!(to_dart(&mut c), [(1, crate::BODY_END, 1, Vec::new())]);
+        assert!(c.h2.gone.is_empty());
+        assert_eq!(c.h2.gone_streams, [SID]);
+    }
+
+    /// END_STREAM on DATA, or trailers (dropped): BODY_END 0. HPACK stays in
+    /// sync.
+    #[test]
+    fn a_streamed_body_ends_clean() {
+        let mut c = Client::new(250);
+        c.send(
+            frame::HEADERS,
+            frame::END_HEADERS,
+            1,
+            &grpc("application/grpc"),
+        );
+        c.send(frame::DATA, frame::END_STREAM, 1, b"ab");
+        assert_eq!(
+            to_dart(&mut c),
+            [
+                (0, crate::BODY_PART, 0, b"ab".to_vec()),
+                (0, crate::BODY_END, 0, Vec::new()),
+            ]
+        );
+        c.send(
+            frame::HEADERS,
+            frame::END_HEADERS,
+            3,
+            &grpc("application/grpc"),
+        );
+        c.send(frame::DATA, 0, 3, b"cd");
+        let flags = frame::END_STREAM | frame::END_HEADERS;
+        let t = block(&[("x-t", "1")]);
+        assert!(c.send(frame::HEADERS, flags, 3, &t).is_empty());
+        assert_eq!(
+            to_dart(&mut c),
+            [
+                (1, crate::BODY_PART, 0, b"cd".to_vec()),
+                (1, crate::BODY_END, 0, Vec::new()),
+            ]
+        );
+        // the answers go out as usual, the streams are not reset
+        let fs = c.answer(1, 200, b"", b"ok");
+        assert_eq!(data_frames(&fs), [(3, b"ok".to_vec())]);
+        assert!(!fs.iter().any(|f| f.0.kind == frame::RST_STREAM));
+        assert!(c.h2.gone.is_empty() && !c.h2.over());
+        // a pseudo header in trailers is still malformed
+        c.send(
+            frame::HEADERS,
+            frame::END_HEADERS,
+            5,
+            &grpc("application/grpc"),
+        );
+        let fs = c.send(frame::HEADERS, flags, 5, &block(&[(":path", "/")]));
+        assert_eq!(code(&fs), frame::PROTOCOL_ERROR);
+        assert_eq!(to_dart(&mut c), [(2, crate::BODY_END, 1, Vec::new())]);
+    }
+
+    /// A streamed body has no body timeout and no size limits: a gRPC
+    /// stream may be quiet for long and send much.
+    #[test]
+    fn a_streamed_body_has_no_timeout_and_no_limits() {
+        let mut c = Client::with_max(250, 100);
+        let t0 = c.now;
+        c.send(
+            frame::HEADERS,
+            frame::END_HEADERS,
+            1,
+            &grpc("application/grpc"),
+        );
+        assert_eq!(c.h2.body_since(), None);
+        let mut out = Vec::new();
+        let later = t0 + Duration::from_secs(3600);
+        c.h2.expire(later, Duration::from_secs(10), SEND_WAIT, DATE, &mut out);
+        assert!(out.is_empty());
+        assert_eq!(c.h2.open(), 1);
+        // more than the body limit and the connection cap (4 * 200)
+        for _ in 0..10 {
+            let fs = c.send(frame::DATA, 0, 1, &[1; 1000]);
+            assert!(updates(&fs).is_empty());
+        }
+        let parts: usize = to_dart(&mut c).iter().map(|m| m.3.len()).sum();
+        assert_eq!(parts, 10_000);
+        assert_eq!(c.h2.buffered, 0);
+        // a buffered upload next to it still fits under the cap
+        c.send(frame::HEADERS, frame::END_HEADERS, 3, &post(100));
+        c.send(frame::DATA, frame::END_STREAM, 3, &[2; 100]);
+        assert_eq!(c.bodies.last().unwrap().len(), 100);
+        // a content-length still must match
+        let mut fields = vec![("content-length", "3")];
+        fields.extend([(":method", "POST"), (":scheme", "http"), (":path", "/")]);
+        fields.rotate_left(1);
+        fields.push(("content-type", "application/grpc"));
+        c.send(frame::HEADERS, frame::END_HEADERS, 5, &block(&fields));
+        let fs = c.send(frame::DATA, 0, 5, b"abcd");
+        assert_eq!(code(&fs), frame::PROTOCOL_ERROR);
+    }
+
+    /// Dart answers while the body still comes (eg. a gRPC error): the
+    /// answer ends the stream, RST_STREAM NO_ERROR stops the client, and
+    /// its DATA on the way is ignored.
+    #[test]
+    fn an_answer_before_the_body_ends() {
+        let mut c = Client::new(250);
+        c.send(
+            frame::HEADERS,
+            frame::END_HEADERS,
+            1,
+            &grpc("application/grpc"),
+        );
+        c.send(frame::DATA, 0, 1, b"ab");
+        to_dart(&mut c);
+        let fs = c.answer(0, 200, b"grpc-status: 12\r\n", b"");
+        assert_eq!(
+            kinds(&fs),
+            [
+                (frame::HEADERS, frame::END_STREAM | frame::END_HEADERS, 1),
+                (frame::RST_STREAM, 0, 1)
+            ]
+        );
+        assert_eq!(code(&fs), frame::NO_ERROR);
+        // status 2: we answered first, not a failure
+        assert_eq!(to_dart(&mut c), [(0, crate::BODY_END, 2, Vec::new())]);
+        assert!(c.h2.gone.is_empty(), "it was answered");
+        assert!(c.send(frame::DATA, 0, 1, b"cd").is_empty());
+        assert!(!c.h2.over());
+    }
+
+    /// Trailers on kind 8: the last DATA has no END_STREAM, a HEADERS with
+    /// the trailers ends the stream. Names are lowercase, connection
+    /// headers and lines with no name are dropped. A failed end ignores them.
+    #[test]
+    fn trailers_after_the_data() {
+        let mut c = Client::new(250);
+        c.send(frame::SETTINGS, 0, 0, b"\0\x04\0\0\0\x04"); // window 4
+        c.get(1, GET);
+        start(&mut c, 0, b"content-type: application/grpc\r\n", b"abcdef");
+        let lines = b"Grpc-Status: 0\r\ngrpc-message: ok\r\nConnection: x\r\n:status: 1\r\n";
+        // two bytes wait: the trailers wait behind them
+        assert!(end_with(&mut c, 0, lines).is_empty());
+        c.send(frame::WINDOW_UPDATE, 0, 1, &100u32.to_be_bytes());
+        let fs = c.pump();
+        let flags = frame::END_STREAM | frame::END_HEADERS;
+        assert_eq!(
+            kinds(&fs),
+            [(frame::DATA, 0, 1), (frame::HEADERS, flags, 1)]
+        );
+        assert_eq!(fs[0].1, b"ef");
+        assert_eq!(
+            decode(&fs[1].1),
+            [
+                ("grpc-status".into(), "0".into()),
+                ("grpc-message".into(), "ok".into())
+            ]
+        );
+        assert_eq!(c.h2.open(), 0);
+        // all bytes out before the end: the trailers come at once
+        c.get(3, GET);
+        start(&mut c, 1, b"", b"ab");
+        let fs = end_with(&mut c, 1, b"grpc-status: 0\r\n");
+        assert_eq!(kinds(&fs), [(frame::HEADERS, flags, 3)]);
+        // lines that are all dropped: an empty DATA ends it, as before
+        c.get(5, GET);
+        start(&mut c, 2, b"", b"ab");
+        let fs = end_with(&mut c, 2, b"connection: close\r\n");
+        assert_eq!(kinds(&fs), [(frame::DATA, frame::END_STREAM, 5)]);
+        // a failed end: RST, no trailers
+        c.get(7, GET);
+        start(&mut c, 3, b"", b"ab");
+        let mut out = Vec::new();
+        c.h2.part(3, b"", true, false, b"grpc-status: 0\r\n", &mut out);
+        assert_eq!(kinds(&frames(&out)), rst(7, 0));
+    }
+
+    /// Trailers-only the streamed way: kind 6 with no parts, then kind 8
+    /// with trailers. HEADERS (no END_STREAM), then the trailers HEADERS
+    /// with END_STREAM: valid gRPC.
+    #[test]
+    fn a_stream_with_no_parts_and_trailers() {
+        let mut c = Client::new(250);
+        c.send(
+            frame::HEADERS,
+            frame::END_HEADERS,
+            1,
+            &grpc("application/grpc"),
+        );
+        c.send(frame::DATA, frame::END_STREAM, 1, b"x");
+        let (ok, fs) = start(&mut c, 0, b"content-type: application/grpc\r\n", b"");
+        assert!(ok);
+        assert_eq!(kinds(&fs), [(frame::HEADERS, frame::END_HEADERS, 1)]);
+        let fs = end_with(&mut c, 0, b"grpc-status: 5\r\n");
+        let flags = frame::END_STREAM | frame::END_HEADERS;
+        assert_eq!(kinds(&fs), [(frame::HEADERS, flags, 1)]);
+        assert_eq!(decode(&fs[0].1), [("grpc-status".into(), "5".into())]);
+        assert_eq!(c.h2.open(), 0);
+        assert!(c.h2.gone_streams.is_empty());
+    }
+
+    /// Many small DATA frames with acks in between are work, not a flood.
+    /// Empty DATA on a streamed body still counts as empty.
+    #[test]
+    fn a_chatty_streamed_body_is_not_cut() {
+        let mut c = Client::new(250);
+        c.send(
+            frame::HEADERS,
+            frame::END_HEADERS,
+            1,
+            &grpc("application/grpc"),
+        );
+        for i in 0..5000u32 {
+            assert!(!c.h2.over());
+            c.send(frame::DATA, 0, 1, &i.to_be_bytes());
+            ack(&mut c, 0, 4);
+        }
+        let parts = to_dart(&mut c);
+        assert_eq!(parts.len(), 1, "joined");
+        assert_eq!(parts[0].3.len(), 5000 * 4);
+        for _ in 0..200 {
+            c.send(frame::DATA, 0, 1, b"");
+        }
+        assert!(c.h2.over(), "empty DATA is still a flood");
+    }
+
+    /// One body byte per DATA frame, a million of them on two streams that
+    /// take turns: the parts are joined, so Dart gets few records and the
+    /// bytes stay in order.
+    #[test]
+    fn tiny_data_frames_are_joined() {
+        let mut c = Client::new(250);
+        for id in [1, 3] {
+            c.send(
+                frame::HEADERS,
+                frame::END_HEADERS,
+                id,
+                &grpc("application/grpc"),
+            );
+        }
+        let (mut want, mut have) = ([Vec::new(), Vec::new()], [Vec::new(), Vec::new()]);
+        let mut records = 0;
+        for i in 0..(1u32 << 19) {
+            for (n, id) in [1u32, 3].into_iter().enumerate() {
+                let b = (i % 251) as u8;
+                want[n].push(b);
+                c.send(frame::DATA, 0, id, &[b]);
+            }
+            // Rust drains `to_dart` once in a while
+            if i % 1000 == 999 {
+                assert!(c.h2.to_dart.len() <= 2, "{}", c.h2.to_dart.len());
+                for (seq, kind, _, data) in to_dart(&mut c) {
+                    assert_eq!(kind, crate::BODY_PART);
+                    have[seq as usize].extend_from_slice(&data);
+                    records += 1;
+                }
+            }
+        }
+        for (seq, _, _, data) in to_dart(&mut c) {
+            have[seq as usize].extend_from_slice(&data);
+        }
+        assert!(have == want, "the bytes are in order");
+        assert!(records <= 2 * 525, "{records}");
+    }
+
+    /// The connection window of streamed bytes comes back on the ack, not
+    /// on arrival: the unacked bytes never pass CONN_WINDOW. A mix with a
+    /// buffered upload does not stall.
+    #[test]
+    fn streamed_bytes_hold_the_connection_window_until_acked() {
+        let mut c = Client::new(250);
+        let big = vec![3u8; 16_384];
+        let mut conn_updates = 0;
+        // 16 streams fill the connection window, 1 MiB each, no acks
+        for k in 0..16u32 {
+            let id = 2 * k + 1;
+            c.send(
+                frame::HEADERS,
+                frame::END_HEADERS,
+                id,
+                &grpc("application/grpc"),
+            );
+            for _ in 0..64 {
+                let fs = c.send(frame::DATA, 0, id, &big);
+                conn_updates += updates(&fs).iter().filter(|u| u.0 == 0).count();
+            }
+        }
+        assert_eq!(conn_updates, 0, "nothing is given back before an ack");
+        assert_eq!(c.h2.unacked, CONN_WINDOW);
+        assert_eq!(c.h2.recv, 0);
+        // one byte more is over the connection window
+        let fs = c.send(frame::DATA, 0, 1, b"x");
+        goaway(&fs, frame::FLOW_CONTROL_ERROR);
+
+        // an ack gives connection credit back
+        let mut c = Client::new(250);
+        for k in 0..16u32 {
+            let id = 2 * k + 1;
+            c.send(
+                frame::HEADERS,
+                frame::END_HEADERS,
+                id,
+                &grpc("application/grpc"),
+            );
+            for _ in 0..64 {
+                c.send(frame::DATA, 0, id, &big);
+            }
+        }
+        let fs = ack(&mut c, 0, 1 << 20);
+        let conn: Vec<_> = updates(&fs).into_iter().filter(|u| u.0 == 0).collect();
+        assert_eq!(conn, [(0, 1 << 20)]);
+        assert_eq!(c.h2.unacked, CONN_WINDOW - (1 << 20));
+        // an over-ack gives back at most what is owed
+        let fs = ack(&mut c, 0, u64::MAX);
+        assert!(updates(&fs).is_empty());
+        assert_eq!(c.h2.unacked, CONN_WINDOW - (1 << 20));
+
+        // a dropped stream gives back what was never acked
+        let mut conn = Vec::new();
+        for k in 1..9u32 {
+            let fs = c.send(frame::RST_STREAM, 0, 2 * k + 1, &8u32.to_be_bytes());
+            conn.extend(updates(&fs).into_iter().filter(|u| u.0 == 0));
+        }
+        // given back in a batch once half the window is due
+        assert_eq!(conn, [(0, 8 << 20)]);
+        assert_eq!(c.h2.unacked, CONN_WINDOW - (9 << 20));
+        assert_eq!(c.h2.recv, 9 << 20);
+
+        // buffered bytes still come back on arrival, next to streamed ones
+        let mut c = Client::new(250);
+        for k in 0..15u32 {
+            let id = 2 * k + 1;
+            c.send(
+                frame::HEADERS,
+                frame::END_HEADERS,
+                id,
+                &grpc("application/grpc"),
+            );
+            for _ in 0..64 {
+                c.send(frame::DATA, 0, id, &big);
+            }
+        }
+        assert_eq!(c.h2.unacked, 15 << 20);
+        // 1 MiB left: buffered uploads of 64 KiB each, 40 of them (2.5 MiB
+        // in all) must go through, because their bytes come back
+        let mut seen = 0;
+        for k in 0..40u32 {
+            let id = 100 + 2 * k;
+            c.send(frame::HEADERS, frame::END_HEADERS, id, &post(65_536));
+            for i in 0..4 {
+                let end = if i == 3 { frame::END_STREAM } else { 0 };
+                let fs = c.send(frame::DATA, end, id, &big);
+                assert!(
+                    !fs.iter().any(|f| f.0.kind == frame::GOAWAY),
+                    "stalled at {k}"
+                );
+                seen += c.bodies.len();
+            }
+        }
+        assert!(seen > 0);
+        assert!(c.h2.recv + c.h2.unacked <= CONN_WINDOW);
+    }
+
+    /// An ack after the body ended (END_STREAM) still gives connection
+    /// credit back.
+    #[test]
+    fn an_ack_after_the_end_gives_credit() {
+        let mut c = Client::new(250);
+        c.send(
+            frame::HEADERS,
+            frame::END_HEADERS,
+            1,
+            &grpc("application/grpc"),
+        );
+        c.send(frame::DATA, frame::END_STREAM, 1, &[1u8; 1000]);
+        assert_eq!(c.h2.unacked, 1000);
+        ack(&mut c, 0, 1000);
+        assert_eq!(c.h2.unacked, 0);
+    }
+
+    /// An ack for a buffered stream does nothing.
+    #[test]
+    fn an_ack_for_a_buffered_stream_is_ignored() {
+        let mut c = Client::new(250);
+        c.send(frame::HEADERS, frame::END_HEADERS, 1, &post(1000));
+        c.send(frame::DATA, 0, 1, &[1u8; 100]);
+        assert!(ack(&mut c, 0, 1 << 20).is_empty());
+        let r = c.h2.streams[&1].recv.as_ref().unwrap();
+        assert_eq!(r.acked, 0);
+        assert_eq!(r.window, (1 << 20) - 100);
+    }
+
+    /// A client reset (not our answer) ends the body with status 1.
+    #[test]
+    fn a_streamed_body_end_without_answer_is_status_1() {
+        let mut c = Client::new(250);
+        c.send(
+            frame::HEADERS,
+            frame::END_HEADERS,
+            1,
+            &grpc("application/grpc"),
+        );
+        c.send(frame::DATA, 0, 1, b"ab");
+        c.send(frame::RST_STREAM, 0, 1, &8u32.to_be_bytes());
+        let ends: Vec<u16> = to_dart(&mut c)
+            .iter()
+            .filter(|m| m.1 == crate::BODY_END)
+            .map(|m| m.2)
+            .collect();
+        assert_eq!(ends, [1]);
     }
 }

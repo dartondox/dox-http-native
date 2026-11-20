@@ -7,10 +7,12 @@
 
 use std::time::Instant;
 
-/// A request body that comes in DATA frames. Dart gets the request once
-/// it is whole (buffered mode).
+/// A request body that comes in DATA frames. Buffered: Dart gets the
+/// request once it is whole. Streamed: Dart has the request and gets each
+/// DATA as a BODY_PART.
 pub(crate) struct Recv {
-    /// the record head, method, target and headers (id set, no body)
+    /// the record head, method, target and headers (id set, no body).
+    /// Empty when streamed: Dart has it.
     pub(crate) rec: Vec<u8>,
     pub(crate) data: Vec<u8>,
     /// most body bytes (`maxBodySize` or `maxMultipartSize`)
@@ -21,6 +23,14 @@ pub(crate) struct Recv {
     pub(crate) window: i64,
     /// when the last DATA came (for the body timeout)
     pub(crate) last: Instant,
+    /// the body goes to Dart in parts (BODY_PART), with no size limit and
+    /// no body timeout
+    pub(crate) streamed: bool,
+    /// streamed: body bytes given to Dart so far
+    pub(crate) taken: u64,
+    /// streamed: window bytes Dart acked (BODY_ACK) and padding, not
+    /// given back to the client yet
+    pub(crate) acked: u64,
 }
 
 pub(crate) struct Stream {
@@ -48,6 +58,12 @@ pub(crate) struct Stream {
     /// answer body bytes, `sent..` is not sent yet
     pub(crate) body: Vec<u8>,
     pub(crate) sent: usize,
+    /// streamed request body: bytes given to Dart that it has not acked.
+    /// Their connection window waits for the ack (`H2::unacked`).
+    pub(crate) owed: u64,
+    /// the trailers of a streamed answer (an HPACK block), sent after the
+    /// last DATA. Empty: none.
+    pub(crate) trailers: Vec<u8>,
     /// since when body bytes wait for a stream window of 0 or less
     pub(crate) stalled: Option<Instant>,
 }
@@ -67,8 +83,20 @@ impl Stream {
             turn: false,
             body: Vec::new(),
             sent: 0,
+            owed: 0,
+            trailers: Vec::new(),
             stalled: None,
         }
+    }
+
+    /// The request record went to Dart: it knows the request.
+    pub(crate) fn known(&self) -> bool {
+        self.recv.as_ref().is_none_or(|r| r.streamed)
+    }
+
+    /// The request body still streams to Dart.
+    pub(crate) fn streaming(&self) -> bool {
+        self.recv.as_ref().is_some_and(|r| r.streamed)
     }
 
     /// body bytes not sent yet

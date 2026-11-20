@@ -106,7 +106,7 @@ void handle(HttpRequest req) async {
       StreamController<List<int>> source = StreamController<List<int>>();
       Future<void> adding = res.addStream(source.stream);
       source.add(<int>[1]);
-      scheduleMicrotask((res as NativeResponse).gone);
+      scheduleMicrotask((res as NativeResponse).markGone);
       source.add(<int>[2]);
       await adding;
       res.add(<int>[3]); // dropped

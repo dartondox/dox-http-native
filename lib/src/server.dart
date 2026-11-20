@@ -213,6 +213,9 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
 
   /// responses that send their body in parts, by stream id
   final Map<int, NativeResponse> streams = <int, NativeResponse>{};
+
+  /// HTTP/2 requests whose body still comes in parts (gRPC), by request id
+  final Map<int, NativeRequest> bodies = <int, NativeRequest>{};
   int _nextStreamId = 1;
 
   /// open responses that are not streamed and whose `done` is awaited, by
@@ -325,9 +328,14 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
       }
       streams.clear();
       for (NativeResponse res in List<NativeResponse>.of(watched.values)) {
-        res.gone();
+        res.markGone();
       }
       watched.clear();
+      // and no request body part comes any more
+      for (NativeRequest req in List<NativeRequest>.of(bodies.values)) {
+        req.bodyEnd(1);
+      }
+      bodies.clear();
       goneIds.clear();
       _done();
     }
@@ -352,13 +360,13 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   /// Rust closed the connection of request [id] before it got an answer.
   void _requestGone(int id) {
     NativeResponse? res = watched[id];
-    if (res != null) return res.gone();
+    if (res != null) return res.markGone();
     // a request of this batch: its handler already ran. When it answered
     // (or started a stream) nothing waits, so no id is kept.
     for (NativeRequest req in _batch) {
       if (req.id != id) continue;
       NativeResponse res = req.response;
-      if (!res.isClosed && !res.headSent) res.gone();
+      if (!res.isClosed && !res.headSent) res.markGone();
       return;
     }
     // An open request of an earlier batch whose `done` is not read yet:
@@ -421,6 +429,18 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
           _requestGone(id);
           continue;
         }
+        if (kind == 7) {
+          // a part of a streamed request body. A copy: the request may
+          // keep it longer than this batch.
+          bodies[id]?.bodyPart(Uint8List.fromList(body));
+          continue;
+        }
+        if (kind == 8) {
+          // the end of a streamed request body: the port field is the
+          // status (0: a clean end)
+          bodies.remove(id)?.bodyEnd(remotePort);
+          continue;
+        }
         if (kind != 0) {
           // a WebSocket message or close. The port field is the close code.
           if (kind != 3) wsBytes += body.length;
@@ -439,8 +459,10 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
           remotePort,
           http10: flags & 1 == 1,
           http2: flags & 8 == 8,
+          isStreamed: flags & 16 == 16,
           isWebSocketUpgrade: flags & 2 == 2,
         );
+        if (flags & 16 == 16) bodies[id] = req;
         _batch.add(req);
         _requests.add(req);
       }
@@ -702,12 +724,28 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
     _endRecord(_startRecord(id, 0, 7), data);
   }
 
-  /// Ends the streamed body [id]. When not [ok], Rust cuts the connection,
-  /// so the client sees the body is not whole.
-  void endStream(int id, {bool ok = true}) {
+  /// Ends the streamed body [id]. When not [ok], Rust cuts the connection
+  /// (HTTP/2: the stream), so the client sees the body is not whole.
+  /// [trailers] go out after the body (HTTP/2 only).
+  void endStream(int id, {bool ok = true, NativeHeaders? trailers}) {
     streams.remove(id);
     if (_handle == 0) return;
-    _endRecord(_startRecord(id, ok ? 0 : 1, 8), const <int>[]);
+    int start = _startRecord(id, ok ? 0 : 1, 8);
+    if (ok && trailers != null) trailers.forEachLine(_line);
+    _endRecord(start, const <int>[]);
+  }
+
+  /// Tells Rust the app consumed [bytes] of the streamed body of request
+  /// [id] (kind 10). The client may then send that many bytes more.
+  void sendBodyAck(int id, int bytes) {
+    if (_handle == 0 || bytes <= 0) return;
+    int start = _startRecord(id, 0, 10);
+    _ensure(8);
+    _outData.setUint64(_len, bytes, Endian.little);
+    _len += 8;
+    _outData.setUint32(start + 12, 0, Endian.little);
+    _outData.setUint32(start + 16, 8, Endian.little);
+    _queueFlush();
   }
 
   /// Queue a WebSocket record for Rust: an accept of the request [id], or
