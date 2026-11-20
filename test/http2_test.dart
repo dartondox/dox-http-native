@@ -776,6 +776,30 @@ void main() {
     },
   );
 
+  test('http2ResetBurst and http2ResetRate are checked at bind', () async {
+    await expectLater(
+      NativeHttpServer.bind(0, http2: true, http2ResetBurst: 0),
+      throwsArgumentError,
+    );
+    await expectLater(
+      NativeHttpServer.bind(0, http2: true, http2ResetRate: -1),
+      throwsArgumentError,
+    );
+    // the smallest values are fine: one reset, no refill
+    NativeHttpServer tiny = await NativeHttpServer.bind(
+      0,
+      address: '127.0.0.1',
+      http2: true,
+      http2ResetBurst: 1,
+      http2ResetRate: 0,
+    );
+    tiny.listen((HttpRequest req) => req.response.close());
+    ClientTransportConnection t = await connect(tiny.port);
+    expect((await request(t, '/')).status, 200);
+    await t.finish();
+    await tiny.close();
+  });
+
   test('a 20 KB header block gets 431, the connection goes on', () async {
     ClientTransportConnection big = await connect(server.port);
     Answer a = await request(

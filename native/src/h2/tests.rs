@@ -612,8 +612,8 @@ mod conn {
     use super::super::frame::{self, Error, Frame, Head};
     use super::super::hpack::{Decoder, encode_field, write_int};
     use super::super::{
-        CONN_WINDOW, DEFAULT_WINDOW, H2, HOLD, MAX_BLOCK, RESET_RATE, State, UNSENT_CAP,
-        ZOMBIE_WAIT,
+        CONN_WINDOW, DEFAULT_WINDOW, H2, HOLD, MAX_BLOCK, RESET_RATE, State, UNACKED_CAP,
+        UNSENT_CAP, ZOMBIE_WAIT,
     };
     use crate::SEND_WAIT;
     use crate::run::MAX_HEADERS;
@@ -2598,6 +2598,34 @@ mod conn {
         calm(&c, &fs);
     }
 
+    /// The smallest bucket: `http2ResetBurst: 1`, `http2ResetRate: 0`. One
+    /// reset is free, the next drains, one more burst later it is cut.
+    #[test]
+    fn a_bucket_of_one_with_no_refill() {
+        let mut out = Vec::new();
+        let h2 = H2::new(1, [0; 18], 250, (MAX_BODY, MAX_BODY), (1, 0.0), &mut out);
+        let mut c = Client {
+            h2,
+            seq: 0,
+            recs: Vec::new(),
+            bodies: Vec::new(),
+            now: Instant::now(),
+            written: 0,
+            marks: VecDeque::new(),
+        };
+        c.send(frame::SETTINGS, 0, 0, b"");
+        c.get(1, GET); // a sibling that stays open
+        c.get(3, GET);
+        assert!(reset_late(&mut c, 3).is_empty());
+        c.now += Duration::from_secs(3600);
+        c.get(5, GET);
+        let fs = reset_late(&mut c, 5);
+        calm(&c, &fs);
+        // the burst after the drain is 1 too, and the RST that drained
+        // paid it: the next refusal cuts
+        goaway(&c.get(7, GET), frame::ENHANCE_YOUR_CALM);
+    }
+
     /// Answer bytes that wait for a client that does not read are capped
     /// per connection: over UNSENT_CAP new streams are refused until it
     /// reads.
@@ -3929,12 +3957,15 @@ mod conn {
     /// the stream window waits for Dart's ack. 16 unread 1 MiB gRPC bodies
     /// (eg. to a slow route that never reads) used to hold the whole
     /// connection window, and every other upload on the connection froze.
+    /// The unacked bytes stay capped (UNACKED_CAP): the DATA that would
+    /// pass it resets only its own stream.
     #[test]
     fn unread_streamed_bodies_do_not_hold_the_connection_window() {
         let mut c = Client::new(250);
         let big = vec![3u8; 16_384];
         let mut conn_back = 0u64;
-        for k in 0..16u32 {
+        let mut cut = Vec::new();
+        for k in 0..20u32 {
             let id = 2 * k + 1;
             c.send(
                 frame::HEADERS,
@@ -3948,12 +3979,28 @@ mod conn {
                 // no stream window comes back: Dart did not ack
                 assert!(updates(&fs).iter().all(|u| u.0 == 0));
                 conn_back += updates(&fs).iter().map(|u| u64::from(u.1)).sum::<u64>();
+                if let Some(f) = fs.iter().find(|f| f.0.kind == frame::RST_STREAM) {
+                    assert_eq!(f.0.id, id);
+                    assert_eq!(code(std::slice::from_ref(f)), frame::ENHANCE_YOUR_CALM);
+                    cut.push(id);
+                }
             }
-            // the stream window is used up: more is a stream error
-            assert_eq!(c.h2.streams[&id].recv.as_ref().unwrap().window, 0);
+            assert!(c.h2.unacked <= UNACKED_CAP);
         }
+        // the first 16 fill the cap exactly, each later one is reset at
+        // its first DATA; the 16 stay open
+        assert_eq!(cut, [33, 35, 37, 39]);
+        assert_eq!(c.h2.unacked, UNACKED_CAP);
+        assert_eq!(c.h2.open(), 16);
         assert!(conn_back >= 15 << 20, "{conn_back}");
         assert!(c.h2.recv >= CONN_WINDOW / 2);
+        // Dart hears the reset streams ended with an error
+        let ends: Vec<_> = to_dart(&mut c)
+            .into_iter()
+            .filter(|p| p.1 == crate::BODY_END)
+            .map(|p| (p.0, p.2))
+            .collect();
+        assert_eq!(ends, [(16, 1), (17, 1), (18, 1), (19, 1)]);
         // a JSON POST on the same connection still comes through
         let body = vec![b'{'; 300_000];
         c.send(frame::HEADERS, frame::END_HEADERS, 101, &post(body.len()));
@@ -3967,9 +4014,63 @@ mod conn {
             assert!(!fs.iter().any(|f| f.0.kind == frame::GOAWAY));
         }
         assert_eq!(c.bodies.last().map(|b| b.len()), Some(body.len()));
-        // an ack still gives the stream window back (gRPC backpressure)
+        // an ack gives the stream window back (gRPC backpressure) and
+        // frees room under the cap
         let fs = ack(&mut c, 0, 1 << 20);
         assert_eq!(updates(&fs), [(1, 1 << 20)]);
+        assert_eq!(c.h2.unacked, UNACKED_CAP - (1 << 20));
+        // an over-ack frees at most what is owed
+        ack(&mut c, 0, u64::MAX);
+        assert_eq!(c.h2.unacked, UNACKED_CAP - (1 << 20));
+        // a dropped stream frees what was never acked
+        c.send(frame::RST_STREAM, 0, 3, &8u32.to_be_bytes());
+        assert_eq!(c.h2.unacked, UNACKED_CAP - (2 << 20));
+    }
+
+    /// A gRPC client whose handlers read (ack) at once never comes near
+    /// the cap, with many streams at once and many MiB in all.
+    #[test]
+    fn read_streamed_bodies_never_hit_the_cap() {
+        let mut c = Client::new(250);
+        let big = vec![3u8; 16_384];
+        for round in 0..64u32 {
+            for k in 0..50u32 {
+                let id = 2 * k + 1;
+                if round == 0 {
+                    c.send(
+                        frame::HEADERS,
+                        frame::END_HEADERS,
+                        id,
+                        &grpc("application/grpc"),
+                    );
+                }
+                let fs = c.send(frame::DATA, 0, id, &big);
+                assert!(!fs.iter().any(|f| f.0.kind == frame::RST_STREAM));
+            }
+            for (seq, kind, _, data) in to_dart(&mut c) {
+                if kind == crate::BODY_PART {
+                    ack(&mut c, seq, data.len() as u64);
+                }
+            }
+            assert_eq!(c.h2.unacked, 0);
+        }
+        assert_eq!(c.h2.open(), 50);
+    }
+
+    /// An ack after the body ended (END_STREAM) still frees room.
+    #[test]
+    fn an_ack_after_the_end_frees_room() {
+        let mut c = Client::new(250);
+        c.send(
+            frame::HEADERS,
+            frame::END_HEADERS,
+            1,
+            &grpc("application/grpc"),
+        );
+        c.send(frame::DATA, frame::END_STREAM, 1, &[1u8; 1000]);
+        assert_eq!(c.h2.unacked, 1000);
+        ack(&mut c, 0, 1000);
+        assert_eq!(c.h2.unacked, 0);
     }
 
     /// An ack for a buffered stream does nothing.
