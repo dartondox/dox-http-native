@@ -2421,6 +2421,38 @@ mod conn {
         );
     }
 
+    /// A busy gRPC client: all calls on one connection, and some go over
+    /// their deadline (a reset). Each stream we answer in full gives a
+    /// token back, so it is not cut. Only time refilled the bucket before:
+    /// this cut it after 1000 resets.
+    #[test]
+    fn answered_streams_give_reset_tokens_back() {
+        let mut c = Client::new(250);
+        let rst = 8u32.to_be_bytes();
+        for i in 0..3000u32 {
+            let id = 1 + 4 * i;
+            c.get(id, GET);
+            c.answer(2 * i, 200, b"", b"ok");
+            c.get(id + 2, GET);
+            assert!(c.send(frame::RST_STREAM, 0, id + 2, &rst).is_empty());
+        }
+        assert!(!c.h2.over());
+        // the tokens do not pile up over the burst: a flood after many
+        // answers is still cut within one burst
+        let mut cut = None;
+        for i in 0..=1000u32 {
+            let id = 20001 + 2 * i;
+            c.get(id, GET);
+            let fs = c.send(frame::RST_STREAM, 0, id, &rst);
+            if !fs.is_empty() {
+                goaway(&fs, frame::ENHANCE_YOUR_CALM);
+                cut = Some(i);
+                break;
+            }
+        }
+        assert!(cut.is_some_and(|i| i >= 990), "{cut:?}");
+    }
+
     /// HEADERS on a stream we reset are decoded and dropped: each takes a
     /// token. Work in between (a new stream) does not stop the cost.
     #[test]
@@ -2562,8 +2594,9 @@ mod conn {
         c.get(3, GET);
         c.answer(0, 200, b"", b"");
         assert_eq!(c.h2.resets.len(), 1);
-        // the 413 took one token: 999 are left
-        for _ in 0..999 {
+        // the 413 took one token, the answer of stream 3 gave it back:
+        // 1000 are left
+        for _ in 0..1000 {
             assert!(
                 c.send(frame::RST_STREAM, 0, 3, &8u32.to_be_bytes())
                     .is_empty()

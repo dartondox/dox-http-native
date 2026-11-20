@@ -63,6 +63,11 @@ const MAX_FRAME_LIMIT: u32 = (1 << 24) - 1;
 /// The bucket holds a burst of `max(2 * max_streams, RESET_BURST_MIN)`, so
 /// a client or proxy that cancels all its calls at once is not cut. It
 /// refills `RESET_RATE` tokens a second: only a flood that goes on is cut.
+/// Each stream we answer in full gives one token back too. A gRPC client
+/// sends all its calls on one connection, and a call over its deadline is
+/// a reset: a busy client with some timeouts must not be cut. A flood
+/// that answers one stream per reset is no flood: each reset costs the
+/// client a whole request.
 const RESET_BURST_MIN: u32 = 1000;
 /// Tokens that come back each second (the sustained rate of resets).
 const RESET_RATE: f64 = 100.0;
@@ -130,6 +135,11 @@ impl Bucket {
         }
         self.tokens -= 1.0;
         true
+    }
+
+    /// Gives one token back: a stream was answered in full.
+    fn give(&mut self, burst: f64) {
+        self.tokens = (self.tokens + 1.0).min(burst);
     }
 }
 
@@ -1102,6 +1112,7 @@ impl H2 {
             frame::write_rst(out, id, frame::NO_ERROR);
             self.remember(id);
         }
+        self.reset_bucket.give(self.reset_burst);
         self.drop_stream(id);
         self.settle(out);
     }
