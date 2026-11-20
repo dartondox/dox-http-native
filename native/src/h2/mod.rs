@@ -8,9 +8,9 @@
 //! they come, in any order. Streams with body bytes take turns, one DATA
 //! frame each.
 //!
-//! 2a: a request must end with its HEADERS (END_STREAM). A request with a
-//! body gets 501 (marked `2b:`). Streamed answers (kind 6) get
-//! RST_STREAM. No flood limits yet (plan 4.10, PR 2c).
+//! A request body is read whole before Dart gets the request (buffered,
+//! like HTTP/1.1). Streamed answers (kind 6, 7, 8) go out as DATA frames
+//! under the send windows. No flood limits yet (plan 4.10, PR 2c).
 
 pub(crate) mod frame;
 pub(crate) mod hpack;
@@ -18,12 +18,13 @@ mod huffman;
 mod stream;
 
 use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
 
 use frame::{Error, Frame, Head};
 use hpack::{Decoded, Decoder, encode_field};
-use stream::Stream;
+use stream::{Recv, Stream};
 
-use crate::run::{MAX_HEADERS, escape_target, write_head};
+use crate::run::{MAX_HEADERS, escape_target, length_line, parse_len, write_head};
 use crate::{MAX_HEAD, REQ_HEAD};
 
 /// The client preface (RFC 9113 3.4).
@@ -33,7 +34,7 @@ pub(crate) const PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const MAX_FRAME: usize = 16 * 1024;
 /// Our SETTINGS_INITIAL_WINDOW_SIZE: bytes a client may send on one stream
 /// before our WINDOW_UPDATE.
-const STREAM_WINDOW: u32 = 1 << 20;
+const STREAM_WINDOW: i64 = 1 << 20;
 /// Our connection receive window, raised to this right after our SETTINGS.
 const CONN_WINDOW: i64 = 16 << 20;
 /// The window of a new connection or stream before any SETTINGS or
@@ -72,8 +73,8 @@ const fn stream_err(code: u32) -> Error {
 }
 
 /// Where a stream id is, as seen from the frames of the client (RFC 9113
-/// 5.1). 2a keeps a stream only while its answer is due, so "open" here
-/// is "half-closed (remote)".
+/// 5.1). "Open" is both "open" (the body comes) and "half-closed
+/// (remote)" (the answer is due): see `Stream::recv`.
 #[derive(Debug, PartialEq)]
 pub(crate) enum State {
     Idle,
@@ -89,6 +90,11 @@ pub(crate) struct H2 {
     dec: Decoder,
     /// our MAX_CONCURRENT_STREAMS
     max_streams: usize,
+    /// most request body bytes: `maxBodySize`, `maxMultipartSize`
+    max_body: usize,
+    max_multipart: usize,
+    /// the time of the current read (for the body timeout)
+    now: Instant,
     /// the client sent its first SETTINGS
     greeted: bool,
     /// the client's MAX_FRAME_SIZE and INITIAL_WINDOW_SIZE
@@ -122,11 +128,15 @@ pub(crate) struct H2 {
     seqs: HashMap<u32, u32>,
     /// streams with body bytes to send, in turn order
     turns: VecDeque<u32>,
-    /// the record of the last request, until it fits in Dart's buffer
-    pub(crate) held: Option<Vec<u8>>,
+    /// the last request (record head and body), until it fits in Dart's
+    /// buffer
+    pub(crate) held: Option<(Vec<u8>, Vec<u8>)>,
     /// requests whose stream ended before Dart answered: Dart gets
     /// REQUEST_GONE for each
     pub(crate) gone: Vec<u32>,
+    /// streamed answers whose stream ended before Dart's end: Dart gets
+    /// STREAM_GONE for each
+    pub(crate) gone_streams: Vec<u64>,
 }
 
 impl H2 {
@@ -136,13 +146,14 @@ impl H2 {
         idx: usize,
         peer: [u8; 18],
         max_streams: u32,
+        (max_body, max_multipart): (usize, usize),
         out: &mut Vec<u8>,
     ) -> Box<Self> {
         frame::write_settings(
             out,
             &[
                 (MAX_CONCURRENT_STREAMS, max_streams),
-                (INITIAL_WINDOW_SIZE, STREAM_WINDOW),
+                (INITIAL_WINDOW_SIZE, STREAM_WINDOW as u32),
                 (MAX_FRAME_SIZE, MAX_FRAME as u32),
                 (MAX_HEADER_LIST_SIZE, MAX_HEAD as u32),
                 (ENABLE_PUSH, 0),
@@ -154,6 +165,9 @@ impl H2 {
             peer,
             dec: Decoder::new(TABLE_SIZE),
             max_streams: max_streams as usize,
+            max_body,
+            max_multipart,
+            now: Instant::now(),
             greeted: false,
             peer_frame: MAX_FRAME,
             peer_window: DEFAULT_WINDOW,
@@ -172,6 +186,7 @@ impl H2 {
             turns: VecDeque::new(),
             held: None,
             gone: Vec::new(),
+            gone_streams: Vec::new(),
         })
     }
 
@@ -180,14 +195,56 @@ impl H2 {
         self.streams.len()
     }
 
-    /// The seqs of requests Dart has not answered (for REQUEST_GONE when
-    /// the connection dies).
+    /// The seqs of requests Dart has and did not answer (for REQUEST_GONE
+    /// when the connection dies).
     pub(crate) fn unanswered(&self) -> impl Iterator<Item = u32> + '_ {
         self.streams
             .values()
-            .filter(|s| !s.answered)
+            .filter(|s| !s.answered && s.recv.is_none())
             .map(|s| s.seq)
             .chain(self.gone.iter().copied())
+    }
+
+    /// The ids of Dart's streamed answers that are not over (for
+    /// STREAM_GONE when the connection dies).
+    pub(crate) fn streamed(&self) -> impl Iterator<Item = u64> + '_ {
+        self.streams
+            .values()
+            .filter_map(|s| s.sid)
+            .chain(self.gone_streams.iter().copied())
+    }
+
+    /// When the oldest wait for request body bytes started, if a body
+    /// comes (for the body timeout).
+    pub(crate) fn body_since(&self) -> Option<Instant> {
+        self.streams
+            .values()
+            .filter_map(|s| s.recv.as_ref().map(|r| r.last))
+            .min()
+    }
+
+    /// The body timeout: a stream whose body got no bytes for `timeout`
+    /// gets 408. Other streams go on.
+    pub(crate) fn expire(
+        &mut self,
+        now: Instant,
+        timeout: Duration,
+        date: &[u8],
+        out: &mut Vec<u8>,
+    ) {
+        if self.dead {
+            return; // no frame after a GOAWAY with an error
+        }
+        let late: Vec<u32> = self
+            .streams
+            .iter()
+            .filter(|(_, s)| s.recv.as_ref().is_some_and(|r| r.last + timeout <= now))
+            .map(|(&id, _)| id)
+            .collect();
+        for id in late {
+            self.reply(out, id, 408, false, date);
+            self.drop_stream(id);
+        }
     }
 
     /// True when the connection can close once the write buffer is out.
@@ -214,7 +271,9 @@ impl H2 {
         out: &mut Vec<u8>,
         seq: &mut u32,
         date: &[u8],
+        now: Instant,
     ) -> bool {
+        self.now = now;
         if self.dead {
             *pos = buf.len(); // the connection closes: drop the rest
             return false;
@@ -265,7 +324,7 @@ impl H2 {
             return Err(conn_err(frame::PROTOCOL_ERROR));
         }
         match frame::parse(h, p)? {
-            Frame::Data { flow, .. } => self.data(h.id, flow, out),
+            Frame::Data { end, data, flow } => self.data(h.id, data, flow, end, out, date),
             Frame::Headers {
                 end_stream,
                 end_headers,
@@ -282,9 +341,8 @@ impl H2 {
                     // a stream we reset: ignored after the decode
                     State::Closed if self.resets.contains(&h.id) => {}
                     State::Closed => return Err(conn_err(frame::STREAM_CLOSED)),
-                    // trailers come in 2b; on a stream whose request is
-                    // whole this is a STREAM_CLOSED stream error, after
-                    // the decode (the table must stay in sync)
+                    // trailers, or an error after the decode (the table
+                    // must stay in sync): see `request`
                     State::Open | State::Idle => {}
                 }
                 if end_headers {
@@ -343,13 +401,24 @@ impl H2 {
         }
     }
 
-    /// DATA. 2b: request bodies. Here only the connection window counts
-    /// it, and the bytes are dropped.
-    fn data(&mut self, id: u32, flow: usize, out: &mut Vec<u8>) -> Result<(), Error> {
+    /// DATA: request body bytes. `flow` (with the padding) counts against
+    /// the receive windows. With `end` the request is whole and goes to
+    /// `held`.
+    fn data(
+        &mut self,
+        id: u32,
+        data: &[u8],
+        flow: usize,
+        end: bool,
+        out: &mut Vec<u8>,
+        date: &[u8],
+    ) -> Result<(), Error> {
         let state = self.state(id);
         if state == State::Idle {
             return Err(conn_err(frame::PROTOCOL_ERROR));
         }
+        // the connection window counts all DATA, also of streams that are
+        // gone
         if flow as i64 > self.recv {
             return Err(conn_err(frame::FLOW_CONTROL_ERROR));
         }
@@ -360,12 +429,45 @@ impl H2 {
             frame::write_window(out, 0, (CONN_WINDOW - self.recv) as u32);
             self.recv = CONN_WINDOW;
         }
-        if state == State::Open {
+        if state == State::Closed {
+            // DATA of a stream we reset may still be on its way: ignored.
+            // On a stream that ended it is an error (RFC 9113 5.1).
+            if self.resets.contains(&id) {
+                return Ok(());
+            }
+            return Err(conn_err(frame::STREAM_CLOSED));
+        }
+        let s = self.streams.get_mut(&id).expect("an open stream");
+        let Some(r) = s.recv.as_mut() else {
             // the request is whole: no more DATA (RFC 9113 5.1)
             return Err(stream_err(frame::STREAM_CLOSED));
+        };
+        if flow as i64 > r.window {
+            return Err(stream_err(frame::FLOW_CONTROL_ERROR));
         }
-        // ponytail: DATA on a closed stream is ignored. It may be a stream
-        // we reset (its DATA was in flight); we keep no list of those.
+        r.window -= flow as i64;
+        r.last = self.now;
+        let got = (r.data.len() + data.len()) as u64;
+        // the body must have the length the request said (RFC 9113 8.1.1)
+        if r.length.is_some_and(|l| got > l || (end && got < l)) {
+            return Err(stream_err(frame::PROTOCOL_ERROR));
+        }
+        if got > r.max as u64 {
+            // only this stream ends, the connection goes on
+            self.reply(out, id, 413, false, date);
+            self.drop_stream(id);
+            return Ok(());
+        }
+        r.data.extend_from_slice(data);
+        if end {
+            let r = s.recv.take().unwrap();
+            self.held = Some((r.rec, r.data));
+        } else if r.window < STREAM_WINDOW / 2 {
+            // give the window back once half of it is used. Not after
+            // END_STREAM: no more DATA comes.
+            frame::write_window(out, id, (STREAM_WINDOW - r.window) as u32);
+            r.window = STREAM_WINDOW;
+        }
         Ok(())
     }
 
@@ -440,9 +542,15 @@ impl H2 {
         seq: &mut u32,
         date: &[u8],
     ) -> Result<(), Error> {
-        let known = self.streams.contains_key(&id);
-        let closed = !known && self.state(id) == State::Closed;
-        let mut req = Req::default();
+        // Some(true): the body comes, so these are trailers.
+        // Some(false): the request is whole.
+        let known = self.streams.get(&id).map(|s| s.recv.is_some());
+        let closed = known.is_none() && self.state(id) == State::Closed;
+        // trailers: a pseudo header is malformed (RFC 9113 8.1)
+        let mut req = Req {
+            regular: known == Some(true),
+            ..Req::default()
+        };
         // any HPACK error leaves our table out of sync with the client's:
         // the connection must close
         let list = self
@@ -452,8 +560,15 @@ impl H2 {
         if closed {
             return Ok(()); // a stream we reset (see `frame`)
         }
-        if known {
-            return Err(stream_err(frame::STREAM_CLOSED));
+        match known {
+            Some(false) => return Err(stream_err(frame::STREAM_CLOSED)),
+            // trailers end the body. Dart has no request trailers: they
+            // are dropped.
+            Some(true) if end_stream && !req.bad => {
+                return self.data(id, b"", 0, true, out, date);
+            }
+            Some(true) => return Err(stream_err(frame::PROTOCOL_ERROR)),
+            None => {}
         }
         self.seen = id;
         if self.away || self.peer_away {
@@ -477,17 +592,35 @@ impl H2 {
                 self.reply(out, id, status, end_stream, date);
                 Ok(())
             }
-            // 2b: request bodies. Until then: 501, and the client stops.
-            Check::Ok if !end_stream => {
-                self.reply(out, id, 501, false, date);
-                Ok(())
-            }
             Check::Ok => {
+                let max = if req.form {
+                    self.max_multipart
+                } else {
+                    self.max_body
+                };
+                let length = req.length;
+                if length.is_some_and(|l| l > max as u64) {
+                    // too big: say no before the body comes
+                    self.reply(out, id, 413, false, date);
+                    return Ok(());
+                }
                 let head = req.method == b"HEAD";
                 let rec = req.record(self.base | u64::from(*seq), &self.peer);
-                self.held = Some(rec);
-                self.streams
-                    .insert(id, Stream::new(*seq, self.peer_window, head));
+                let recv = if end_stream {
+                    self.held = Some((rec, Vec::new()));
+                    None
+                } else {
+                    Some(Box::new(Recv {
+                        rec,
+                        data: Vec::new(),
+                        max,
+                        length,
+                        window: STREAM_WINDOW,
+                        last: self.now,
+                    }))
+                };
+                let s = Stream::new(*seq, self.peer_window, head, recv);
+                self.streams.insert(id, s);
                 self.seqs.insert(*seq, id);
                 *seq = seq.wrapping_add(1);
                 Ok(())
@@ -526,11 +659,17 @@ impl H2 {
     }
 
     fn drop_stream(&mut self, id: u32) {
-        self.turns.retain(|&t| t != id);
         if let Some(s) = self.streams.remove(&id) {
+            if s.turn {
+                self.turns.retain(|&t| t != id);
+            }
             self.seqs.remove(&s.seq);
-            if !s.answered {
+            // Dart knows the request once its body is whole
+            if !s.answered && s.recv.is_none() {
                 self.gone.push(s.seq);
+            }
+            if let Some(sid) = s.sid.filter(|_| !s.done) {
+                self.gone_streams.push(sid);
             }
         }
     }
@@ -604,12 +743,90 @@ impl H2 {
         self.send_answer(id, status, lines, body, date, out);
     }
 
-    /// 2b: streamed answers (kind 6) and WebSocket accepts (kind 1) on
-    /// HTTP/2. For now the stream gets RST_STREAM INTERNAL_ERROR.
+    /// A WebSocket accept (kind 1) can not come on HTTP/2 (no request has
+    /// flag bit 1), nor can a broken kind 6: the stream gets RST_STREAM
+    /// INTERNAL_ERROR.
     pub(crate) fn refuse(&mut self, seq: u32, out: &mut Vec<u8>) {
         if let Some((id, s)) = self.due(seq) {
             s.answered = true;
             self.reset(out, id, frame::INTERNAL_ERROR);
+        }
+    }
+
+    /// A streamed answer (kind 6) of Dart's stream `sid`: HEADERS, then
+    /// the first part. False when it has no stream (the client reset it,
+    /// or the answer has no body): Dart must stop.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start(
+        &mut self,
+        seq: u32,
+        status: u16,
+        lines: &[u8],
+        sid: u64,
+        first: &[u8],
+        date: &[u8],
+        out: &mut Vec<u8>,
+    ) -> bool {
+        let max = self.peer_frame;
+        let Some((id, s)) = self.due(seq) else {
+            return false;
+        };
+        s.answered = true;
+        let status = final_status(status);
+        let no_body = status == 204 || status == 304;
+        // Dart's content-length, when it set one: the parts must match it
+        let left = match length_line(lines) {
+            Some(Some(n)) if !no_body => Some(n),
+            _ => None,
+        };
+        let silent = no_body || s.head;
+        frame::write_headers(out, id, &head_block(status, lines, left, date), silent, max);
+        if silent {
+            self.drop_stream(id);
+            return false;
+        }
+        s.sid = Some(sid);
+        s.left = left;
+        self.part(seq, first, false, true, out);
+        true
+    }
+
+    /// A part (kind 7) or the end (kind 8, `ok` false when it failed) of
+    /// the streamed answer of `seq`. The bytes wait in the stream until
+    /// the windows let them go (see [send]).
+    pub(crate) fn part(&mut self, seq: u32, data: &[u8], end: bool, ok: bool, out: &mut Vec<u8>) {
+        if self.dead {
+            return;
+        }
+        let Some(&id) = self.seqs.get(&seq) else {
+            return;
+        };
+        let Some(s) = self.streams.get_mut(&id) else {
+            return;
+        };
+        if s.sid.is_none() || s.done {
+            return;
+        }
+        let n = data.len() as u64;
+        if !ok || s.left.is_some_and(|l| n > l || (end && n < l)) {
+            // the body is not whole: the client must see it is cut
+            self.reset(out, id, frame::INTERNAL_ERROR);
+            return;
+        }
+        if let Some(l) = s.left.as_mut() {
+            *l -= n;
+        }
+        s.push(data);
+        s.done = end;
+        if s.unsent() > 0 {
+            if !s.turn {
+                s.turn = true;
+                self.turns.push_back(id);
+            }
+        } else if end {
+            // all bytes are out: an empty DATA ends the stream
+            frame::write(out, frame::DATA, frame::END_STREAM, id, &[]);
+            self.drop_stream(id);
         }
     }
 
@@ -628,55 +845,33 @@ impl H2 {
         let Some(s) = self.streams.get_mut(&id) else {
             return;
         };
-        // ponytail: a 1xx as the final answer is not valid in HTTP/2, and
-        // a status out of range is not either: both go out as 500
-        let status = if (200..=999).contains(&status) {
-            status
-        } else {
-            500
-        };
+        let status = final_status(status);
         let no_body = status == 204 || status == 304;
-        let mut block = Vec::with_capacity(64 + lines.len());
-        status_field(status, &mut block);
-        for line in lines.split(|&c| c == b'\n') {
-            let Some(at) = line.iter().position(|&c| c == b':') else {
-                continue;
-            };
-            let name = line[..at].trim_ascii().to_ascii_lowercase();
-            if matches!(
-                &name[..],
-                b"connection"
-                    | b"keep-alive"
-                    | b"proxy-connection"
-                    | b"transfer-encoding"
-                    | b"upgrade"
-                    | b"content-length"
-            ) {
-                continue;
-            }
-            encode_field(&name, line[at + 1..].trim_ascii(), &mut block);
-        }
-        if !no_body {
-            encode_field(
-                b"content-length",
-                body.len().to_string().as_bytes(),
-                &mut block,
-            );
-        }
-        date_field(date, &mut block);
+        let len = (!no_body).then_some(body.len() as u64);
         let silent = no_body || s.head || body.is_empty();
+        let block = head_block(status, lines, len, date);
         frame::write_headers(out, id, &block, silent, self.peer_frame);
         if silent {
             self.drop_stream(id);
         } else {
             s.body = body.to_vec();
+            s.done = true;
+            s.turn = true;
             self.turns.push_back(id);
         }
     }
 
     /// Adds DATA frames to `out` while less than [HOLD] waits there and
-    /// the windows allow. Streams take turns, one frame each.
-    pub(crate) fn send(&mut self, out: &mut Vec<u8>, wpos: usize) {
+    /// the windows allow. Streams take turns, one frame each. The bytes of
+    /// a streamed answer get a mark: Dart hears of them (STREAM_SENT) once
+    /// `written` passes it, as for HTTP/1.1.
+    pub(crate) fn send(
+        &mut self,
+        out: &mut Vec<u8>,
+        wpos: usize,
+        written: u64,
+        marks: &mut VecDeque<(u64, u64, u64)>,
+    ) {
         if self.dead {
             return; // no frame after a GOAWAY with an error
         }
@@ -687,7 +882,7 @@ impl H2 {
                 continue; // reset by the client
             };
             let k = s
-                .left()
+                .unsent()
                 // a big peer frame size must not break [HOLD]
                 .min(self.peer_frame.min(MAX_FRAME))
                 .min(self.window as usize)
@@ -699,17 +894,24 @@ impl H2 {
                 continue;
             }
             misses = 0;
-            let end = k == s.left();
+            let end = s.done && k == s.unsent();
             let flags = if end { frame::END_STREAM } else { 0 };
             frame::write(out, frame::DATA, flags, id, &s.body[s.sent..s.sent + k]);
             s.sent += k;
             self.data_sent += k as u64;
             s.window -= k as i64;
             self.window -= k as i64;
+            if let Some(sid) = s.sid {
+                let at = written + (out.len() - wpos) as u64;
+                marks.push_back((at, sid, k as u64));
+            }
             if end {
+                s.turn = false;
                 self.drop_stream(id);
-            } else {
+            } else if s.unsent() > 0 {
                 self.turns.push_back(id);
+            } else {
+                s.turn = false; // a streamed answer waits for Dart
             }
         }
     }
@@ -730,6 +932,47 @@ impl H2 {
     pub(crate) fn blocked(&self) -> bool {
         !self.dead && !self.turns.is_empty() && !self.can_send()
     }
+}
+
+/// A 1xx as the final answer is not valid in HTTP/2, and a status out of
+/// range is not either: both go out as 500.
+fn final_status(status: u16) -> u16 {
+    if (200..=999).contains(&status) {
+        status
+    } else {
+        500
+    }
+}
+
+/// The header block of an answer: `:status`, Dart's lines (lowercase, no
+/// connection-specific ones), `content-length` when `len` is known, and
+/// `date`.
+fn head_block(status: u16, lines: &[u8], len: Option<u64>, date: &[u8]) -> Vec<u8> {
+    let mut block = Vec::with_capacity(64 + lines.len());
+    status_field(status, &mut block);
+    for line in lines.split(|&c| c == b'\n') {
+        let Some(at) = line.iter().position(|&c| c == b':') else {
+            continue;
+        };
+        let name = line[..at].trim_ascii().to_ascii_lowercase();
+        if matches!(
+            &name[..],
+            b"connection"
+                | b"keep-alive"
+                | b"proxy-connection"
+                | b"transfer-encoding"
+                | b"upgrade"
+                | b"content-length"
+        ) {
+            continue;
+        }
+        encode_field(&name, line[at + 1..].trim_ascii(), &mut block);
+    }
+    if let Some(n) = len {
+        encode_field(b"content-length", n.to_string().as_bytes(), &mut block);
+    }
+    date_field(date, &mut block);
+    block
 }
 
 fn status_field(status: u16, out: &mut Vec<u8>) {
@@ -766,8 +1009,10 @@ struct Req {
     count: usize,
     host: bool,
     cookie: Vec<u8>,
-    /// a content-length that is not 0 (or not a number)
-    length: bool,
+    /// the content-length
+    length: Option<u64>,
+    /// a multipart form: the body gets `maxMultipartSize`
+    form: bool,
     /// a regular header came: no pseudo header may follow
     regular: bool,
     bad: bool,
@@ -833,7 +1078,21 @@ impl Req {
                 return;
             }
             b"host" => self.host = true,
-            b"content-length" => self.length = value != b"0",
+            // a number, and the same in each copy (RFC 9110 8.6)
+            b"content-length" => match parse_len(value) {
+                Some(n) if self.length.is_none_or(|l| l == n) => self.length = Some(n),
+                _ => {
+                    self.bad = true;
+                    return;
+                }
+            },
+            // the last content-type counts, as on HTTP/1.1
+            b"content-type" => {
+                let mime = value.split(|&c| c == b';').next().unwrap_or(b"");
+                self.form = mime
+                    .trim_ascii()
+                    .eq_ignore_ascii_case(b"multipart/form-data");
+            }
             _ => {}
         }
         self.push(name, value);
@@ -862,8 +1121,8 @@ impl Req {
         if !self.method.iter().all(|c| c.is_ascii_graphic()) {
             return Check::Bad;
         }
-        // a body length but no body (2a: END_STREAM is on HEADERS)
-        if end_stream && self.length {
+        // a body length but no body
+        if end_stream && self.length.is_some_and(|l| l > 0) {
             return Check::Bad;
         }
         if self.count + usize::from(!self.cookie.is_empty()) > MAX_HEADERS {

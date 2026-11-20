@@ -606,6 +606,9 @@ fn name_from_entry_evicted_by_same_insert() {
 // ---- frames and the connection --------------------------------------
 
 mod conn {
+    use std::collections::VecDeque;
+    use std::time::{Duration, Instant};
+
     use super::super::frame::{self, Error, Frame, Head};
     use super::super::hpack::{Decoder, encode_field, write_int};
     use super::super::{CONN_WINDOW, DEFAULT_WINDOW, H2, HOLD, State};
@@ -817,15 +820,28 @@ mod conn {
     struct Client {
         h2: Box<H2>,
         seq: u32,
-        /// records Dart got
+        /// records Dart got (no body), and their bodies
         recs: Vec<Vec<u8>>,
+        bodies: Vec<Vec<u8>>,
+        /// the time of the reads
+        now: Instant,
+        /// bytes "written" so far, and the STREAM_SENT marks
+        written: u64,
+        marks: VecDeque<(u64, u64, u64)>,
     }
+
+    /// The body limit of [Client::new] (and twice it for a multipart form).
+    const MAX_BODY: usize = 10 << 20;
 
     impl Client {
         /// A connection after the preface and the client SETTINGS.
         fn new(max_streams: u32) -> Self {
+            Self::with_max(max_streams, MAX_BODY)
+        }
+
+        fn with_max(max_streams: u32, max_body: usize) -> Self {
             let mut out = Vec::new();
-            let h2 = H2::new(1, [0; 18], max_streams, &mut out);
+            let h2 = H2::new(1, [0; 18], max_streams, (max_body, 2 * max_body), &mut out);
             let fs = frames(&out);
             assert_eq!(fs[0].0.kind, frame::SETTINGS);
             let ours: Vec<_> = frame::settings(&fs[0].1).collect();
@@ -848,6 +864,10 @@ mod conn {
                 h2,
                 seq: 0,
                 recs: Vec::new(),
+                bodies: Vec::new(),
+                now: Instant::now(),
+                written: 0,
+                marks: VecDeque::new(),
             };
             let acks = c.send(frame::SETTINGS, 0, 0, b"");
             assert_eq!(kinds(&acks), vec![(frame::SETTINGS, frame::ACK, 0)]);
@@ -858,10 +878,37 @@ mod conn {
         fn feed(&mut self, b: &[u8]) -> Vec<(Head, Vec<u8>)> {
             let mut out = Vec::new();
             let mut pos = 0;
-            while self.h2.step(b, &mut pos, &mut out, &mut self.seq, DATE) {
-                self.recs.extend(self.h2.held.take());
+            while self
+                .h2
+                .step(b, &mut pos, &mut out, &mut self.seq, DATE, self.now)
+            {
+                if let Some((rec, body)) = self.h2.held.take() {
+                    self.recs.push(rec);
+                    self.bodies.push(body);
+                }
             }
             frames(&out)
+        }
+
+        /// [H2::send] into `out`. `written` counts the bytes before
+        /// `out[wpos..]`; after the call all of `out` counts as written.
+        fn send_into(&mut self, out: &mut Vec<u8>, wpos: usize) {
+            self.h2.send(out, wpos, self.written, &mut self.marks);
+            self.written += (out.len() - wpos) as u64;
+        }
+
+        /// The STREAM_SENT bytes of `sid` that are written by now.
+        fn sent(&mut self, sid: u64) -> u64 {
+            let mut n = 0;
+            while let Some(&(at, s, k)) = self.marks.front() {
+                if at > self.written {
+                    break;
+                }
+                self.marks.pop_front();
+                assert_eq!(s, sid);
+                n += k;
+            }
+            n
         }
 
         fn send(&mut self, kind: u8, flags: u8, id: u32, p: &[u8]) -> Vec<(Head, Vec<u8>)> {
@@ -889,13 +936,13 @@ mod conn {
         ) -> Vec<(Head, Vec<u8>)> {
             let mut out = Vec::new();
             self.h2.answer(seq, status, lines, body, DATE, &mut out);
-            self.h2.send(&mut out, 0);
+            self.send_into(&mut out, 0);
             frames(&out)
         }
 
         fn pump(&mut self) -> Vec<(Head, Vec<u8>)> {
             let mut out = Vec::new();
-            self.h2.send(&mut out, 0);
+            self.send_into(&mut out, 0);
             frames(&out)
         }
     }
@@ -906,6 +953,17 @@ mod conn {
         (":path", "/a?b"),
         (":authority", "example.test"),
     ];
+
+    /// A POST header block with this content-length.
+    fn post(len: usize) -> Vec<u8> {
+        let len = len.to_string();
+        block(&[
+            (":method", "POST"),
+            (":scheme", "http"),
+            (":path", "/"),
+            ("content-length", &len),
+        ])
+    }
 
     fn block(fields: &[(&str, &str)]) -> Vec<u8> {
         let mut b = Vec::new();
@@ -981,12 +1039,12 @@ mod conn {
     #[test]
     fn the_first_frame_must_be_settings() {
         let mut out = Vec::new();
-        let mut h2 = H2::new(0, [0; 18], 250, &mut out);
+        let mut h2 = H2::new(0, [0; 18], 250, (1, 1), &mut out);
         out.clear();
         let mut b = Vec::new();
         frame::write(&mut b, frame::PING, 0, 0, b"12345678");
         let (mut pos, mut seq) = (0, 0);
-        h2.step(&b, &mut pos, &mut out, &mut seq, DATE);
+        h2.step(&b, &mut pos, &mut out, &mut seq, DATE, Instant::now());
         goaway(&frames(&out), frame::PROTOCOL_ERROR);
         assert!(h2.over());
     }
@@ -1425,10 +1483,10 @@ mod conn {
         c.h2.answer(0, 200, b"", &[1; 40_000], DATE, &mut out);
         c.h2.answer(1, 200, b"", &[2; 40_000], DATE, &mut out);
         c.h2.answer(2, 200, b"", b"small", DATE, &mut out);
-        c.h2.send(&mut out, 0);
+        c.send_into(&mut out, 0);
         // HOLD is full after 4 frames; once written, the rest goes
         let written = out.len();
-        c.h2.send(&mut out, written);
+        c.send_into(&mut out, written);
         let ids: Vec<_> = frames(&out)
             .iter()
             .filter(|f| f.0.kind == frame::DATA)
@@ -1484,31 +1542,6 @@ mod conn {
         assert!(!c.h2.over());
         c.answer(0, 200, b"", b"");
         assert!(c.h2.over());
-    }
-
-    /// 2b: a request with a body gets 501 and RST_STREAM NO_ERROR. Its
-    /// DATA still counts against the connection window, which goes back
-    /// to the client with WINDOW_UPDATE.
-    #[test]
-    fn a_body_gets_501_and_the_window_goes_back() {
-        let mut c = Client::new(250);
-        let fs = c.send(frame::HEADERS, frame::END_HEADERS, 1, &block(GET));
-        assert_eq!(
-            kinds(&fs),
-            vec![(frame::HEADERS, 5, 1), (frame::RST_STREAM, 0, 1)]
-        );
-        assert_eq!(decode(&fs[0].1)[0], (":status".into(), "501".into()));
-        assert_eq!(code(&fs), frame::NO_ERROR);
-        assert!(c.recs.is_empty());
-        let mut updates = 0u64;
-        for _ in 0..1100 {
-            for (h, p) in c.send(frame::DATA, 0, 1, &[0; 16_384]) {
-                assert_eq!((h.kind, h.id), (frame::WINDOW_UPDATE, 0));
-                updates += u64::from(u32::from_be_bytes(p[..4].try_into().unwrap()));
-            }
-        }
-        assert!(updates >= 8 << 20, "{updates}");
-        assert!(!c.h2.over(), "no flow control error");
     }
 
     /// A big peer MAX_FRAME_SIZE must not let one frame break HOLD.
@@ -1603,16 +1636,16 @@ mod conn {
             frame::PROTOCOL_ERROR,
         );
         assert!(!c.h2.can_send() && !c.h2.blocked());
-        c.h2.send(&mut out, 0);
+        c.send_into(&mut out, 0);
         assert!(out.is_empty());
     }
 
-    /// A body request gets 501 and RST_STREAM. Trailers that were already
-    /// on their way are ignored, and the connection goes on.
+    /// A body over the limit gets 413 and RST_STREAM. Trailers that were
+    /// already on their way are ignored, and the connection goes on.
     #[test]
     fn frames_after_our_reset_are_ignored() {
-        let mut c = Client::new(250);
-        let fs = c.send(frame::HEADERS, frame::END_HEADERS, 1, &block(GET));
+        let mut c = Client::with_max(250, 1);
+        let fs = c.send(frame::HEADERS, frame::END_HEADERS, 1, &post(5));
         assert_eq!(code(&fs), frame::NO_ERROR);
         let trailers = block(&[("x-t", "1")]);
         let flags = frame::END_STREAM | frame::END_HEADERS;
@@ -1646,10 +1679,11 @@ mod conn {
     /// Only the last RESETS ids are remembered.
     #[test]
     fn the_reset_memory_is_bounded() {
-        let mut c = Client::new(250);
+        let mut c = Client::with_max(250, 1);
         for i in 0..500u32 {
-            c.send(frame::HEADERS, frame::END_HEADERS, 1 + 2 * i, &block(GET));
+            c.send(frame::HEADERS, frame::END_HEADERS, 1 + 2 * i, &post(5));
         }
+        assert_eq!(c.h2.open(), 0);
         assert!(c.h2.resets.len() <= 64);
     }
 
@@ -1677,5 +1711,441 @@ mod conn {
         b.push(0xbe);
         assert!(c.get_block(5, &b).is_empty());
         assert_eq!(c.recs.len(), 2);
+    }
+
+    // ---- request bodies, receive windows, streamed answers ----
+
+    /// DATA frames: (stream id, payload).
+    fn data_frames(fs: &[(Head, Vec<u8>)]) -> Vec<(u32, Vec<u8>)> {
+        fs.iter()
+            .filter(|f| f.0.kind == frame::DATA)
+            .map(|f| (f.0.id, f.1.clone()))
+            .collect()
+    }
+
+    /// The increments of the WINDOW_UPDATE frames: (stream id, increment).
+    fn updates(fs: &[(Head, Vec<u8>)]) -> Vec<(u32, u32)> {
+        fs.iter()
+            .filter(|f| f.0.kind == frame::WINDOW_UPDATE)
+            .map(|f| (f.0.id, u32::from_be_bytes(f.1[..4].try_into().unwrap())))
+            .collect()
+    }
+
+    /// A DATA payload with PADDED: `data`, then `pad` zero bytes.
+    fn padded(data: &[u8], pad: u8) -> Vec<u8> {
+        let mut p = vec![pad];
+        p.extend_from_slice(data);
+        p.extend(vec![0; usize::from(pad)]);
+        p
+    }
+
+    #[test]
+    fn a_post_body_becomes_the_record() {
+        let mut c = Client::new(250);
+        let mut fields = GET.to_vec();
+        fields[0] = (":method", "POST");
+        assert!(
+            c.send(frame::HEADERS, frame::END_HEADERS, 1, &block(&fields))
+                .is_empty()
+        );
+        assert!(c.recs.is_empty(), "Dart waits for the whole body");
+        assert!(c.send(frame::DATA, 0, 1, b"hel").is_empty());
+        let p = padded(b"lo", 3);
+        let flags = frame::END_STREAM | frame::PADDED;
+        assert!(c.send(frame::DATA, flags, 1, &p).is_empty());
+        let (flags, m, t, _) = record(&c.recs[0]);
+        assert_eq!((flags, m.as_str(), t.as_str()), (8, "POST", "/a?b"));
+        assert_eq!(c.bodies[0], b"hello");
+        // an empty DATA with END_STREAM ends a body too
+        c.send(frame::HEADERS, frame::END_HEADERS, 3, &block(&fields));
+        c.send(frame::DATA, frame::END_STREAM, 3, b"");
+        assert_eq!(c.bodies[1], b"");
+        // the answer works as for a GET
+        let fs = c.answer(0, 200, b"", b"ok");
+        assert_eq!(data_frames(&fs), [(1, b"ok".to_vec())]);
+    }
+
+    /// WINDOW_UPDATE once half of a window is used, padding included.
+    /// None for a stream after END_STREAM.
+    #[test]
+    fn receive_windows_go_back_at_half() {
+        let mut c = Client::new(250);
+        c.send(frame::HEADERS, frame::END_HEADERS, 1, &post(10 << 20));
+        // 15 bytes of body + 1 pad length byte + 240 padding: 256 of flow
+        let p = padded(&[1; 15], 240);
+        let (mut flow, mut sent) = (0i64, Vec::new());
+        while sent.is_empty() {
+            flow += 256;
+            sent = updates(&c.send(frame::DATA, frame::PADDED, 1, &p));
+        }
+        // the stream window went under half: all of it comes back
+        assert!(
+            flow > (1 << 20) / 2 && flow - 256 <= (1 << 20) / 2,
+            "{flow}"
+        );
+        assert_eq!(sent, [(1, flow as u32)]);
+        // the connection window (16 MiB) goes back at half too
+        let big = vec![0u8; 16_384];
+        let mut conn = Vec::new();
+        while conn.is_empty() {
+            flow += big.len() as i64;
+            let fs = c.send(frame::DATA, 0, 1, &big);
+            conn = updates(&fs).into_iter().filter(|u| u.0 == 0).collect();
+        }
+        assert!(flow > CONN_WINDOW / 2, "{flow}");
+        assert_eq!(conn, [(0, flow as u32)]);
+        // the last DATA goes past half: no stream update after END_STREAM
+        let mut c = Client::new(250);
+        c.send(frame::HEADERS, frame::END_HEADERS, 1, &post(33 * 16_384));
+        let mut fs = Vec::new();
+        for i in 0..33 {
+            let end = if i == 32 { frame::END_STREAM } else { 0 };
+            fs.extend(c.send(frame::DATA, end, 1, &big));
+        }
+        assert!(updates(&fs).is_empty(), "{:?}", updates(&fs));
+        assert_eq!(c.bodies[0].len(), 33 * 16_384);
+    }
+
+    /// DATA over a window: RST_STREAM for the stream window, GOAWAY for
+    /// the connection window. Padding counts.
+    #[test]
+    fn data_over_a_window_is_a_flow_control_error() {
+        let mut c = Client::new(250);
+        c.send(frame::HEADERS, frame::END_HEADERS, 1, &post(100));
+        c.h2.streams
+            .get_mut(&1)
+            .unwrap()
+            .recv
+            .as_mut()
+            .unwrap()
+            .window = 10;
+        // all of it may come; then the window goes back
+        assert_eq!(
+            updates(&c.send(frame::DATA, 0, 1, &[1; 10])),
+            [(1, 1 << 20)]
+        );
+        c.h2.streams
+            .get_mut(&1)
+            .unwrap()
+            .recv
+            .as_mut()
+            .unwrap()
+            .window = 10;
+        let fs = c.send(frame::DATA, frame::PADDED, 1, &padded(&[1; 5], 5));
+        assert_eq!(kinds(&fs), rst(1, 0));
+        assert_eq!(code(&fs), frame::FLOW_CONTROL_ERROR);
+        assert!(!c.h2.over());
+        // the connection window
+        c.send(frame::HEADERS, frame::END_HEADERS, 3, &post(100));
+        c.h2.recv = 10;
+        let fs = c.send(frame::DATA, frame::PADDED, 3, &padded(&[1; 5], 5));
+        goaway(&fs, frame::FLOW_CONTROL_ERROR);
+        assert!(c.h2.over());
+    }
+
+    /// A body over the limit gets 413 on its stream. Other streams and the
+    /// connection go on. A multipart form gets the bigger limit.
+    #[test]
+    fn a_body_over_the_limit_gets_413_on_its_stream() {
+        let mut c = Client::with_max(250, 100);
+        c.send(frame::HEADERS, frame::END_HEADERS, 1, &block(GET));
+        c.get(3, GET);
+        // content-length over the limit: 413 before the body comes
+        let fs = c.send(frame::HEADERS, frame::END_HEADERS, 5, &post(101));
+        assert_eq!(
+            kinds(&fs),
+            vec![(frame::HEADERS, 5, 5), (frame::RST_STREAM, 0, 5)]
+        );
+        assert_eq!(decode(&fs[0].1)[0], (":status".into(), "413".into()));
+        assert_eq!(code(&fs), frame::NO_ERROR, "the client keeps the 413");
+        // no content-length: 413 once the bytes go over
+        assert!(c.send(frame::DATA, 0, 1, &[1; 60]).is_empty());
+        let fs = c.send(frame::DATA, 0, 1, &[1; 41]);
+        assert_eq!(decode(&fs[0].1)[0], (":status".into(), "413".into()));
+        assert_eq!(code(&fs), frame::NO_ERROR);
+        // its DATA on the way is ignored; stream 3 still gets its answer
+        assert!(
+            c.send(frame::DATA, frame::END_STREAM, 1, &[1; 60])
+                .is_empty()
+        );
+        assert_eq!(c.recs.len(), 1);
+        assert_eq!(c.h2.open(), 1);
+        assert_eq!(
+            data_frames(&c.answer(1, 200, b"", b"x")),
+            [(3, b"x".to_vec())]
+        );
+        assert!(c.h2.gone.is_empty(), "Dart never knew stream 1 or 5");
+        // a multipart form may have 200
+        let form = block(&[
+            (":method", "POST"),
+            (":scheme", "http"),
+            (":path", "/"),
+            ("content-type", "Multipart/Form-Data; boundary=x"),
+            ("content-length", "150"),
+        ]);
+        c.send(frame::HEADERS, frame::END_HEADERS, 7, &form);
+        assert!(
+            c.send(frame::DATA, frame::END_STREAM, 7, &[2; 150])
+                .is_empty()
+        );
+        assert_eq!(c.bodies[1].len(), 150);
+        assert!(!c.h2.over());
+    }
+
+    /// The body timeout: 408 on the late stream only.
+    #[test]
+    fn a_slow_body_gets_408_on_its_stream() {
+        let mut c = Client::new(250);
+        let t0 = c.now;
+        c.send(frame::HEADERS, frame::END_HEADERS, 1, &post(10));
+        c.get(3, GET);
+        assert_eq!(c.h2.body_since(), Some(t0));
+        // bytes move the wait
+        c.now = t0 + Duration::from_secs(5);
+        c.send(frame::DATA, 0, 1, b"abc");
+        assert_eq!(c.h2.body_since(), Some(c.now));
+        let timeout = Duration::from_secs(10);
+        let mut out = Vec::new();
+        c.h2.expire(t0 + Duration::from_secs(14), timeout, DATE, &mut out);
+        assert!(out.is_empty());
+        c.h2.expire(t0 + Duration::from_secs(15), timeout, DATE, &mut out);
+        let fs = frames(&out);
+        assert_eq!(decode(&fs[0].1)[0], (":status".into(), "408".into()));
+        assert_eq!(kinds(&fs)[1], (frame::RST_STREAM, 0, 1));
+        assert_eq!(c.h2.body_since(), None);
+        assert_eq!(c.h2.open(), 1, "stream 3 goes on");
+        assert!(c.h2.gone.is_empty());
+    }
+
+    /// content-length must match the DATA bytes (RFC 9113 8.1.1).
+    #[test]
+    fn content_length_must_match_the_data() {
+        let cases: &[&[(u8, &[u8])]] = &[
+            // more than declared
+            &[(0, b"abcdef")],
+            // fewer, then END_STREAM
+            &[(0, b"ab"), (frame::END_STREAM, b"c")],
+        ];
+        for datas in cases {
+            let mut c = Client::new(250);
+            c.send(frame::HEADERS, frame::END_HEADERS, 1, &post(5));
+            let mut fs = Vec::new();
+            for (flags, d) in *datas {
+                fs = c.send(frame::DATA, *flags, 1, d);
+            }
+            assert_eq!(code(&fs), frame::PROTOCOL_ERROR);
+            assert!(c.recs.is_empty() && !c.h2.over());
+        }
+        // fewer, then trailers
+        let mut c = Client::new(250);
+        c.send(frame::HEADERS, frame::END_HEADERS, 1, &post(5));
+        c.send(frame::DATA, 0, 1, b"ab");
+        let flags = frame::END_STREAM | frame::END_HEADERS;
+        let fs = c.send(frame::HEADERS, flags, 1, &block(&[("x-t", "1")]));
+        assert_eq!(code(&fs), frame::PROTOCOL_ERROR);
+        // two different lengths, or not a number
+        for cl in [
+            &[("content-length", "5"), ("content-length", "6")][..],
+            &[("content-length", "5x")],
+        ] {
+            let mut c = Client::new(250);
+            let fields = [
+                &[(":method", "POST"), (":scheme", "http"), (":path", "/")][..],
+                cl,
+            ]
+            .concat();
+            let fs = c.send(frame::HEADERS, frame::END_HEADERS, 1, &block(&fields));
+            assert_eq!(code(&fs), frame::PROTOCOL_ERROR, "{cl:?}");
+        }
+    }
+
+    /// Request trailers end the body and are dropped. HPACK stays in sync.
+    #[test]
+    fn request_trailers() {
+        let mut c = Client::new(250);
+        c.send(frame::HEADERS, frame::END_HEADERS, 1, &post(3));
+        c.send(frame::DATA, 0, 1, b"abc");
+        // x-t: 1, added to the HPACK table (index 62)
+        let mut t = vec![0x40, 3];
+        t.extend(b"x-t");
+        t.extend([1, b'1']);
+        let flags = frame::END_STREAM | frame::END_HEADERS;
+        assert!(c.send(frame::HEADERS, flags, 1, &t).is_empty());
+        let (_, _, _, hs) = record(&c.recs[0]);
+        assert!(!hs.iter().any(|(n, _)| n == "x-t"), "trailers are dropped");
+        assert_eq!(c.bodies[0], b"abc");
+        // the table has the trailer
+        let mut b = block(GET);
+        b.push(0xbe);
+        c.get_block(3, &b);
+        let (_, _, _, hs) = record(&c.recs[1]);
+        assert!(hs.contains(&("x-t".into(), "1".into())));
+        // a pseudo header in trailers; trailers in two frames
+        let mut c = Client::new(250);
+        c.send(frame::HEADERS, frame::END_HEADERS, 1, &block(GET));
+        let fs = c.send(frame::HEADERS, flags, 1, &block(&[(":path", "/")]));
+        assert_eq!(code(&fs), frame::PROTOCOL_ERROR);
+        c.send(frame::HEADERS, frame::END_HEADERS, 3, &block(GET));
+        let tr = block(&[("x-t", "1")]);
+        assert!(
+            c.send(frame::HEADERS, frame::END_STREAM, 3, &tr[..2])
+                .is_empty()
+        );
+        assert!(c.recs.is_empty());
+        let fs = c.send(frame::CONTINUATION, frame::END_HEADERS, 3, &tr[2..]);
+        assert!(fs.is_empty());
+        assert_eq!(c.recs.len(), 1);
+        // HEADERS with no END_STREAM after DATA: malformed
+        let mut c = Client::new(250);
+        c.send(frame::HEADERS, frame::END_HEADERS, 1, &block(GET));
+        c.send(frame::DATA, 0, 1, b"abc");
+        let fs = c.send(frame::HEADERS, frame::END_HEADERS, 1, &tr);
+        assert_eq!(code(&fs), frame::PROTOCOL_ERROR);
+        assert!(!c.h2.over());
+    }
+
+    /// DATA on a stream we reset: ignored, but it counts against the
+    /// connection window. On a stream that ended: STREAM_CLOSED. On an
+    /// idle one: PROTOCOL_ERROR.
+    #[test]
+    fn data_on_reset_closed_and_idle_streams() {
+        let mut c = Client::with_max(250, 1);
+        c.send(frame::HEADERS, frame::END_HEADERS, 1, &post(5));
+        let big = vec![0u8; 16_384];
+        let mut back = 0u64;
+        for _ in 0..600 {
+            for (id, n) in updates(&c.send(frame::DATA, 0, 1, &big)) {
+                assert_eq!(id, 0);
+                back += u64::from(n);
+            }
+        }
+        assert!(back >= 8 << 20, "{back}");
+        assert!(!c.h2.over());
+        // a stream that ended normally
+        let mut c = Client::new(250);
+        c.get(1, GET);
+        c.answer(0, 200, b"", b"");
+        goaway(&c.send(frame::DATA, 0, 1, b"x"), frame::STREAM_CLOSED);
+        // an idle stream
+        let mut c = Client::new(250);
+        goaway(&c.send(frame::DATA, 0, 1, b"x"), frame::PROTOCOL_ERROR);
+    }
+
+    /// Writes Dart's kind 6 for `seq`, then what [H2::send] adds.
+    fn start(c: &mut Client, seq: u32, lines: &[u8], first: &[u8]) -> (bool, Vec<(Head, Vec<u8>)>) {
+        let mut out = Vec::new();
+        let ok = c.h2.start(seq, 200, lines, SID, first, DATE, &mut out);
+        c.send_into(&mut out, 0);
+        (ok, frames(&out))
+    }
+
+    /// Dart's kind 7 or 8 for `seq`, then what [H2::send] adds.
+    fn part(c: &mut Client, seq: u32, data: &[u8], end: bool, ok: bool) -> Vec<(Head, Vec<u8>)> {
+        let mut out = Vec::new();
+        c.h2.part(seq, data, end, ok, &mut out);
+        c.send_into(&mut out, 0);
+        frames(&out)
+    }
+
+    const SID: u64 = 77;
+
+    /// A streamed answer under a small window: the bytes wait, STREAM_SENT
+    /// counts only what went out, END_STREAM comes after the last byte.
+    #[test]
+    fn a_streamed_answer_under_a_small_window() {
+        let mut c = Client::new(250);
+        c.send(frame::SETTINGS, 0, 0, b"\0\x04\0\0\0\x0a"); // window 10
+        c.get(1, GET);
+        let (ok, fs) = start(&mut c, 0, b"content-type: text/plain\r\n", b"abcdef");
+        assert!(ok);
+        assert_eq!(kinds(&fs)[0], (frame::HEADERS, frame::END_HEADERS, 1));
+        assert!(!decode(&fs[0].1).iter().any(|(n, _)| n == "content-length"));
+        assert_eq!(data_frames(&fs), [(1, b"abcdef".to_vec())]);
+        assert_eq!(c.sent(SID), 6);
+        assert!(!c.h2.blocked(), "nothing waits");
+        let fs = part(&mut c, 0, b"ghijkl", false, true);
+        assert_eq!(data_frames(&fs), [(1, b"ghij".to_vec())]);
+        assert_eq!(c.sent(SID), 4);
+        assert!(c.h2.blocked(), "two bytes wait for the window");
+        // the end waits behind them
+        assert!(part(&mut c, 0, b"", true, true).is_empty());
+        c.send(frame::WINDOW_UPDATE, 0, 1, &100u32.to_be_bytes());
+        let fs = c.pump();
+        assert_eq!(kinds(&fs), [(frame::DATA, frame::END_STREAM, 1)]);
+        assert_eq!(fs[0].1, b"kl");
+        assert_eq!(c.sent(SID), 2);
+        assert_eq!(c.h2.open(), 0);
+        assert!(c.h2.gone_streams.is_empty(), "it ended well");
+        // all sent before the end: an empty DATA ends it
+        c.get(3, GET);
+        let (_, fs) = start(&mut c, 1, b"", b"ab");
+        assert_eq!(data_frames(&fs), [(3, b"ab".to_vec())]);
+        let fs = part(&mut c, 1, b"", true, true);
+        assert_eq!(kinds(&fs), [(frame::DATA, frame::END_STREAM, 3)]);
+        assert!(fs[0].1.is_empty());
+    }
+
+    /// Dart's content-length goes out and must match the parts.
+    #[test]
+    fn a_streamed_answer_with_a_length() {
+        let mut c = Client::new(250);
+        c.get(1, GET);
+        let (_, fs) = start(&mut c, 0, b"Content-Length: 4\r\n", b"ab");
+        assert!(decode(&fs[0].1).contains(&("content-length".into(), "4".into())));
+        let fs = part(&mut c, 0, b"cd", true, true);
+        assert_eq!(kinds(&fs), [(frame::DATA, frame::END_STREAM, 1)]);
+        // more bytes than said, or fewer at the end: RST
+        for (first, more, end) in [(&b"abc"[..], &b"de"[..], false), (b"ab", b"", true)] {
+            let mut c = Client::new(250);
+            c.get(1, GET);
+            start(&mut c, 0, b"content-length: 4\r\n", first);
+            let fs = part(&mut c, 0, more, end, true);
+            assert_eq!(kinds(&fs), rst(1, 0));
+            assert_eq!(code(&fs), frame::INTERNAL_ERROR);
+            assert_eq!(c.h2.gone_streams, [SID]);
+        }
+    }
+
+    /// A failed kind 8 resets the stream; the connection goes on.
+    #[test]
+    fn a_failed_end_resets_the_stream() {
+        let mut c = Client::new(250);
+        c.send(frame::SETTINGS, 0, 0, b"\0\x04\0\0\0\x00"); // window 0
+        c.get(1, GET);
+        start(&mut c, 0, b"", b"waits");
+        let fs = part(&mut c, 0, b"", true, false);
+        assert_eq!(kinds(&fs), rst(1, 0));
+        assert_eq!(code(&fs), frame::INTERNAL_ERROR);
+        assert_eq!(c.h2.open(), 0);
+        assert!(!c.h2.blocked() && !c.h2.over());
+        assert!(c.get(3, GET).is_empty());
+    }
+
+    /// A client RST during a streamed answer: the stream is gone once,
+    /// later parts go nowhere.
+    #[test]
+    fn a_client_reset_ends_a_streamed_answer() {
+        let mut c = Client::new(250);
+        c.get(1, GET);
+        start(&mut c, 0, b"", b"abc");
+        c.send(frame::RST_STREAM, 0, 1, &8u32.to_be_bytes());
+        assert_eq!(c.h2.gone_streams, [SID]);
+        assert!(c.h2.gone.is_empty(), "Dart answered it");
+        assert!(part(&mut c, 0, b"more", false, true).is_empty());
+        assert!(part(&mut c, 0, b"", true, true).is_empty());
+        assert_eq!(c.h2.streamed().collect::<Vec<_>>(), [SID]);
+        // HEAD, or a stream that is gone: no stream, Dart stops
+        let (ok, fs) = start(&mut c, 0, b"", b"x");
+        assert!(!ok && fs.is_empty());
+        c.get(
+            3,
+            &[(":method", "HEAD"), (":scheme", "http"), (":path", "/")],
+        );
+        let (ok, fs) = start(&mut c, 1, b"", b"x");
+        assert!(!ok);
+        assert_eq!(
+            kinds(&fs),
+            [(frame::HEADERS, frame::END_STREAM | frame::END_HEADERS, 3)]
+        );
     }
 }

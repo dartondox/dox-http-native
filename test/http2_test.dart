@@ -10,7 +10,17 @@ import 'package:test/test.dart';
 /// needs WINDOW_UPDATE frames.
 const int bigSize = 3 << 20;
 
+/// Body limits of the test server: a 5 MiB upload fits, 7 MiB does not
+/// (unless it is a multipart form).
+const int maxBody = 6 << 20;
+const int maxMultipart = 8 << 20;
+
+/// A streamed answer: 48 parts of 64 KiB, more than the 1 MiB window of
+/// Dart and of the client.
+const int parts = 48;
+
 Completer<void> resetSeen = Completer<void>();
+Completer<void> streamGone = Completer<void>();
 
 void handle(HttpRequest req) async {
   HttpResponse res = req.response;
@@ -30,9 +40,36 @@ void handle(HttpRequest req) async {
       unawaited(res.done.then((_) => resetSeen.complete()));
       await resetSeen.future.timeout(const Duration(seconds: 5));
       res.write('late');
+    case '/echo':
+      // the length and a sum of the body bytes
+      int length = 0;
+      int sum = 0;
+      await for (List<int> part in req) {
+        length += part.length;
+        for (int b in part) {
+          sum = (sum + b) & 0xffffffff;
+        }
+      }
+      res.write('$length $sum');
     case '/stream':
-      // 2b: a streamed answer is not there yet on HTTP/2
-      await res.addStream(Stream<List<int>>.value(List<int>.filled(100000, 1)));
+      await res.addStream(
+        Stream<List<int>>.fromIterable(<List<int>>[
+          for (int i = 0; i < parts; i++) List<int>.filled(64 * 1024, i),
+        ]),
+      );
+    case '/forever':
+      // writes until the client resets the stream
+      bool over = false;
+      unawaited(
+        res.done.then((_) {
+          over = true;
+          streamGone.complete();
+        }),
+      );
+      while (!over) {
+        res.add(List<int>.filled(64 * 1024, 2));
+        await res.flush();
+      }
     default:
       res.statusCode = HttpStatus.notFound;
   }
@@ -88,7 +125,13 @@ void main() {
 
   setUpAll(() async {
     expect(NativeHttpServer.loadError, isNull);
-    server = await NativeHttpServer.bind(0, address: '127.0.0.1', http2: true);
+    server = await NativeHttpServer.bind(
+      0,
+      address: '127.0.0.1',
+      http2: true,
+      maxBodySize: maxBody,
+      maxMultipartSize: maxMultipart,
+    );
     server.listen(handle);
     c = await connect(server.port);
   });
@@ -170,14 +213,91 @@ void main() {
     expect((await request(c, '/')).status, 200);
   });
 
-  test('a request with a body gets 501 for now', () async {
-    Answer a = await request(c, '/', method: 'POST', body: utf8.encode('hi'));
-    expect(a.status, 501);
+  /// `length sum` of the bytes, as `/echo` answers.
+  String echoOf(List<int> body) {
+    int sum = 0;
+    for (int b in body) {
+      sum = (sum + b) & 0xffffffff;
+    }
+    return '${body.length} $sum';
+  }
+
+  List<int> bytes(int n) => List<int>.generate(n, (int i) => i * 7 & 0xff);
+
+  test('a POST with a small body', () async {
+    Answer a = await request(
+      c,
+      '/echo',
+      method: 'POST',
+      body: utf8.encode('hello'),
+      extra: <Header>[Header.ascii('content-length', '5')],
+    );
+    expect(a.status, 200);
+    expect(utf8.decode(a.body), echoOf(utf8.encode('hello')));
+  });
+
+  test('a 5 MiB upload needs window updates', () async {
+    List<int> body = bytes(5 << 20);
+    Answer a = await request(c, '/echo', method: 'POST', body: body);
+    expect(utf8.decode(a.body), echoOf(body));
+  });
+
+  test('a body over the limit gets 413, other streams go on', () async {
+    List<Answer> all = await Future.wait(<Future<Answer>>[
+      request(c, '/echo', method: 'POST', body: bytes(7 << 20)),
+      request(c, '/'),
+      request(c, '/echo', method: 'POST', body: bytes(1000)),
+    ]);
+    expect(all[0].status, 413);
+    expect(utf8.decode(all[1].body), 'Hello World');
+    expect(utf8.decode(all[2].body), echoOf(bytes(1000)));
     expect((await request(c, '/')).status, 200);
   });
 
-  test('a streamed answer resets the stream for now', () async {
-    await expectLater(request(c, '/stream'), throwsA(anything));
+  test('a multipart upload gets the multipart limit', () async {
+    List<int> body = bytes(7 << 20);
+    Answer a = await request(
+      c,
+      '/echo',
+      method: 'POST',
+      body: body,
+      extra: <Header>[
+        Header.ascii('content-type', 'multipart/form-data; boundary=x'),
+      ],
+    );
+    expect(a.status, 200);
+    expect(utf8.decode(a.body), echoOf(body));
+  });
+
+  test('a streamed answer', () async {
+    List<Answer> all = await Future.wait(<Future<Answer>>[
+      request(c, '/stream'),
+      request(c, '/stream'),
+      request(c, '/'),
+    ]);
+    for (Answer a in all.take(2)) {
+      expect(a.status, 200);
+      expect(a.headers.containsKey('content-length'), isFalse);
+      expect(a.body.length, parts * 64 * 1024);
+      for (int i = 0; i < parts; i++) {
+        expect(a.body[i * 64 * 1024], i);
+      }
+    }
+    expect(utf8.decode(all[2].body), 'Hello World');
+  });
+
+  test('a client RST during a streamed answer stops the handler', () async {
+    ClientTransportStream s = c.makeRequest(<Header>[
+      Header.ascii(':method', 'GET'),
+      Header.ascii(':scheme', 'http'),
+      Header.ascii(':path', '/forever'),
+    ], endStream: true);
+    // the handler writes until its window is full: then reset
+    await s.incomingMessages.firstWhere(
+      (StreamMessage m) => m is DataStreamMessage,
+    );
+    s.terminate();
+    await streamGone.future.timeout(const Duration(seconds: 5));
     expect((await request(c, '/')).status, 200);
   });
 

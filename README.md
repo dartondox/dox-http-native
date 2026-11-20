@@ -109,7 +109,7 @@ How it works:
 - On a graceful `close()`, every open WebSocket gets close code `1001` (going away).
 - `autoCompress`: Rust gzips the body on a helper thread, not on the isolate.
 - Streaming: a small body is sent in one piece on `close`. When `addStream` passes 64 KB, the answer starts and the rest of the body goes out in parts. A big file never sits in memory. `flush()` also starts the answer: the head and the bytes so far go out, and later writes follow at once (eg. server-sent events written from a timer). Once the head is out (a flush, or `addStream` past 64 KB), a header or status change is ignored and a warning is logged once.
-- HTTP/2 (in progress, off by default): `bind(port, http2: true)` also speaks HTTP/2 over plain TCP on the same port (h2c with prior knowledge, no TLS, eg. `curl --http2-prior-knowledge`). A connection that starts with the HTTP/2 preface is HTTP/2, any other is HTTP/1.1. Handlers do not change; `request.protocolVersion` is `2.0`. One connection has at most `maxConcurrentStreams` (default 250) open requests. Not yet: request bodies (they get `501`), streamed answers and trailers.
+- HTTP/2 (in progress, off by default): `bind(port, http2: true)` also speaks HTTP/2 over plain TCP on the same port (h2c with prior knowledge, no TLS, eg. `curl --http2-prior-knowledge`). A connection that starts with the HTTP/2 preface is HTTP/2, any other is HTTP/1.1. Handlers do not change; `request.protocolVersion` is `2.0`. One connection has at most `maxConcurrentStreams` (default 250) open requests. Request bodies have the same limits and timeout as on HTTP/1.1; a body over the limit gets `413` on its stream only. Streamed answers (`addStream`, `flush`) work. Not yet: trailers.
 - `response.done` completes (with no error) when the client is gone, also when the handler never closes the response. A handler that writes from its own timer (eg. server-sent events) stops it there: `response.done.then((_) => timer.cancel())`. Writes after that are dropped.
 
 ## AES-GCM
@@ -147,7 +147,7 @@ Fuzz targets are in `native/fuzz/`. CI runs each one for 60 seconds when `native
 - `conn`: many requests on one connection (pipelined, bodies, keep-alive, close, upgrade). All at once and in random pieces, with a big and a small Dart buffer: Dart must get the same records each time. Nothing may be parsed after a close or a bad request.
 - `aead_open`: the cookie decryption on random data. It must never panic, a sealed value must open again, and one changed byte must make it fail.
 - `hpack`: random HTTP/2 header blocks (HPACK) on one decoder. It must never panic, the decoded list must stay under the size cap, and the table size must stay right. Each decoded block is encoded again and must decode to the same fields.
-- `h2_conn`: random bytes after the HTTP/2 preface, fed to one connection with cuts like `conn`. When Dart does not answer, all at once or in pieces must give the same records and the same bytes back. With answers, every frame the server writes must be whole and valid, nothing may follow a GOAWAY with an error, and no stream may end twice.
+- `h2_conn`: random bytes after the HTTP/2 preface, fed to one connection with cuts like `conn`. When Dart does not answer, all at once or in pieces must give the same records and the same bytes back. With answers (whole or streamed), every frame the server writes must be whole and valid, nothing may follow a GOAWAY with an error, no stream may end twice, and `STREAM_SENT` never counts more bytes than the answers have.
 
 To run one locally:
 
