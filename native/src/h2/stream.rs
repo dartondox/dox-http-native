@@ -48,6 +48,8 @@ pub(crate) struct Stream {
     /// answer body bytes, `sent..` is not sent yet
     pub(crate) body: Vec<u8>,
     pub(crate) sent: usize,
+    /// since when body bytes wait for a stream window of 0 or less
+    pub(crate) stalled: Option<Instant>,
 }
 
 impl Stream {
@@ -65,6 +67,7 @@ impl Stream {
             turn: false,
             body: Vec::new(),
             sent: 0,
+            stalled: None,
         }
     }
 

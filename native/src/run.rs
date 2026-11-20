@@ -1701,7 +1701,7 @@ impl Core {
                     }
                     Due::H2Body => {
                         let h2 = c.h2.as_mut().unwrap();
-                        h2.expire(now, limits.timeout, &self.date.1, &mut c.wbuf);
+                        h2.expire(now, limits.timeout, SEND_WAIT, &self.date.1, &mut c.wbuf);
                         self.service(idx);
                     }
                     Due::Ping => {
@@ -1924,6 +1924,7 @@ impl Core {
             }
         }
         if let Some(h2) = c.h2.as_mut() {
+            h2.stall_mark(now);
             for seq in h2.gone.drain(..) {
                 let id = ((idx as u64) << 32) | u64::from(seq);
                 self.msgs.push(id, REQUEST_GONE, 0, b"");
@@ -2735,11 +2736,15 @@ impl Conn {
         }
         // HTTP/2: the body timeout of the stream that waits longest, unless
         // the send stall comes first
-        if let Some(t) = self.h2.as_ref().and_then(|h| h.body_since()) {
-            let t = t + limits.timeout;
-            if self.stuck.is_none_or(|s| t <= s + SEND_WAIT) {
-                return Some((t, Due::H2Body));
-            }
+        let h2_due = self.h2.as_ref().and_then(|h| {
+            let body = h.body_since().map(|t| t + limits.timeout);
+            let stall = h.stall_since().map(|t| t + SEND_WAIT);
+            body.into_iter().chain(stall).min()
+        });
+        if let Some(t) = h2_due
+            && self.stuck.is_none_or(|s| t <= s + SEND_WAIT)
+        {
+            return Some((t, Due::H2Body));
         }
         // a write makes no progress: the client does not read
         if let Some(t) = self.stuck {

@@ -612,6 +612,7 @@ mod conn {
     use super::super::frame::{self, Error, Frame, Head};
     use super::super::hpack::{Decoder, encode_field, write_int};
     use super::super::{CONN_WINDOW, DEFAULT_WINDOW, H2, HOLD, State};
+    use crate::SEND_WAIT;
     use crate::run::MAX_HEADERS;
 
     fn head(len: usize, kind: u8, flags: u8, id: u32) -> Head {
@@ -1676,7 +1677,7 @@ mod conn {
         );
     }
 
-    /// Only the last RESETS ids are remembered.
+    /// The ids of up to `max_streams` resets are remembered.
     #[test]
     fn the_reset_memory_is_bounded() {
         let mut c = Client::with_max(250, 1);
@@ -1684,7 +1685,7 @@ mod conn {
             c.send(frame::HEADERS, frame::END_HEADERS, 1 + 2 * i, &post(5));
         }
         assert_eq!(c.h2.open(), 0);
-        assert!(c.h2.resets.len() <= 64);
+        assert_eq!(c.h2.resets.len(), 250);
     }
 
     /// A header list over the cap is a 431 for that stream only. The
@@ -1906,9 +1907,21 @@ mod conn {
         assert_eq!(c.h2.body_since(), Some(c.now));
         let timeout = Duration::from_secs(10);
         let mut out = Vec::new();
-        c.h2.expire(t0 + Duration::from_secs(14), timeout, DATE, &mut out);
+        c.h2.expire(
+            t0 + Duration::from_secs(14),
+            timeout,
+            SEND_WAIT,
+            DATE,
+            &mut out,
+        );
         assert!(out.is_empty());
-        c.h2.expire(t0 + Duration::from_secs(15), timeout, DATE, &mut out);
+        c.h2.expire(
+            t0 + Duration::from_secs(15),
+            timeout,
+            SEND_WAIT,
+            DATE,
+            &mut out,
+        );
         let fs = frames(&out);
         assert_eq!(decode(&fs[0].1)[0], (":status".into(), "408".into()));
         assert_eq!(kinds(&fs)[1], (frame::RST_STREAM, 0, 1));
@@ -2147,5 +2160,101 @@ mod conn {
             kinds(&fs),
             [(frame::HEADERS, frame::END_STREAM | frame::END_HEADERS, 3)]
         );
+    }
+
+    /// More resets than 64 in one round trip: the DATA that was already
+    /// on its way for the oldest one is ignored.
+    #[test]
+    fn late_data_after_many_resets_is_ignored() {
+        let mut c = Client::with_max(250, 1);
+        for i in 0..200u32 {
+            c.send(frame::HEADERS, frame::END_HEADERS, 1 + 2 * i, &post(5));
+        }
+        assert!(c.send(frame::DATA, 0, 1, b"x").is_empty());
+        assert!(!c.h2.over());
+    }
+
+    /// A stream the client reset: its late DATA is ignored, but counts in
+    /// the connection window.
+    #[test]
+    fn late_data_after_a_client_reset_is_ignored() {
+        let mut c = Client::new(250);
+        c.send(frame::HEADERS, frame::END_HEADERS, 1, &post(5));
+        c.send(frame::RST_STREAM, 0, 1, &8u32.to_be_bytes());
+        let before = c.h2.recv;
+        assert!(c.send(frame::DATA, 0, 1, b"abc").is_empty());
+        assert_eq!(c.h2.recv, before - 3);
+        assert!(!c.h2.over());
+    }
+
+    /// All bodies of one connection together stay under the bound: the
+    /// stream that goes over it is refused (RST_STREAM REFUSED_STREAM, no
+    /// 413), and the bytes are given back when a stream goes.
+    #[test]
+    fn the_bodies_of_a_connection_have_a_bound() {
+        let mut c = Client::with_max(250, 1000); // the bound is 2000
+        for id in [1, 3, 5] {
+            c.send(frame::HEADERS, frame::END_HEADERS, id, &post(1000));
+        }
+        assert!(c.send(frame::DATA, 0, 1, &[0; 900]).is_empty());
+        assert!(c.send(frame::DATA, 0, 3, &[0; 900]).is_empty());
+        let fs = c.send(frame::DATA, 0, 5, &[0; 900]);
+        assert_eq!(kinds(&fs), [(frame::RST_STREAM, 0, 5)]);
+        assert_eq!(code(&fs), frame::REFUSED_STREAM);
+        assert_eq!(c.h2.buffered, 1800);
+        assert!(!c.h2.over());
+        // late DATA of the refused stream is ignored
+        assert!(c.send(frame::DATA, 0, 5, &[0; 10]).is_empty());
+        // a stream that ends hands its body over: the bytes are free
+        assert!(
+            c.send(frame::DATA, frame::END_STREAM, 1, &[0; 100])
+                .is_empty()
+        );
+        assert_eq!(c.h2.buffered, 900);
+        c.send(frame::RST_STREAM, 0, 3, &8u32.to_be_bytes());
+        assert_eq!(c.h2.buffered, 0);
+        // a retry fits now
+        c.send(frame::HEADERS, frame::END_HEADERS, 7, &post(1000));
+        assert!(c.send(frame::DATA, 0, 7, &[0; 900]).is_empty());
+    }
+
+    /// A streamed answer whose stream window stays 0 for SEND_WAIT is
+    /// cancelled, while other streams go on. A WINDOW_UPDATE ends the wait.
+    #[test]
+    fn a_stream_window_of_0_cancels_the_stream() {
+        let mut c = Client::new(250);
+        let t0 = c.now;
+        c.get(1, GET);
+        c.get(3, GET);
+        start(&mut c, 0, b"", &vec![1u8; 100_000]);
+        c.h2.stall_mark(t0);
+        assert_eq!(c.h2.stall_since(), Some(t0));
+        let mut out = Vec::new();
+        let wait = SEND_WAIT;
+        c.h2.expire(
+            t0 + wait - Duration::from_secs(1),
+            wait,
+            wait,
+            DATE,
+            &mut out,
+        );
+        assert!(out.is_empty());
+        c.h2.expire(t0 + wait, wait, wait, DATE, &mut out);
+        let fs = frames(&out);
+        assert_eq!(kinds(&fs), [(frame::RST_STREAM, 0, 1)]);
+        assert_eq!(code(&fs), frame::CANCEL);
+        assert_eq!(c.h2.gone_streams, [SID]);
+        assert_eq!(c.h2.stall_since(), None);
+        assert_eq!(c.h2.open(), 1, "stream 3 goes on");
+        // a WINDOW_UPDATE before the time: no cancel, and no timer left
+        let mut c = Client::new(250);
+        c.get(1, GET);
+        start(&mut c, 0, b"", &vec![1u8; 100_000]);
+        c.h2.stall_mark(t0);
+        c.send(frame::WINDOW_UPDATE, 0, 1, &1000u32.to_be_bytes());
+        let mut out = Vec::new();
+        c.h2.expire(t0 + wait, wait, wait, DATE, &mut out);
+        assert!(out.is_empty());
+        assert_eq!(c.h2.stall_since(), None);
     }
 }

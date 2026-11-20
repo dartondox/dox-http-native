@@ -116,7 +116,11 @@ pub(crate) struct H2 {
     last: u32,
     /// the last streams we reset or refused: frames of the client that
     /// were already on their way are ignored (RFC 9113 5.1)
+    /// (also the streams the client reset). Up to `max_streams` (at least
+    /// [RESETS]), so one round trip of resets fits.
     resets: VecDeque<u32>,
+    /// request body bytes buffered in all streams (see `data`)
+    buffered: usize,
     /// we sent GOAWAY NO_ERROR: no new streams
     away: bool,
     /// the client sent GOAWAY
@@ -178,6 +182,7 @@ impl H2 {
             seen: 0,
             last: 0,
             resets: VecDeque::new(),
+            buffered: 0,
             away: false,
             peer_away: false,
             dead: false,
@@ -217,23 +222,66 @@ impl H2 {
     /// When the oldest wait for request body bytes started, if a body
     /// comes (for the body timeout).
     pub(crate) fn body_since(&self) -> Option<Instant> {
+        if self.dead {
+            return None; // `expire` does nothing then: no timer must wait
+        }
         self.streams
             .values()
             .filter_map(|s| s.recv.as_ref().map(|r| r.last))
             .min()
     }
 
+    /// When the oldest stream with answer bytes began to wait for a window
+    /// of 0 (for the stall timer, see `stall_mark`).
+    pub(crate) fn stall_since(&self) -> Option<Instant> {
+        if self.dead {
+            return None;
+        }
+        self.streams.values().filter_map(|s| s.stalled).min()
+    }
+
+    /// Notes which streams wait for their window (`now` is when they began
+    /// to). Called after each write round.
+    pub(crate) fn stall_mark(&mut self, now: Instant) {
+        for id in &self.turns {
+            if let Some(s) = self.streams.get_mut(id) {
+                if s.window <= 0 && s.unsent() > 0 {
+                    s.stalled.get_or_insert(now);
+                } else {
+                    s.stalled = None;
+                }
+            }
+        }
+    }
+
     /// The body timeout: a stream whose body got no bytes for `timeout`
-    /// gets 408. Other streams go on.
+    /// gets 408. Other streams go on. A streamed answer whose stream
+    /// window stayed 0 for `wait` is cancelled (RST_STREAM CANCEL).
     pub(crate) fn expire(
         &mut self,
         now: Instant,
         timeout: Duration,
+        wait: Duration,
         date: &[u8],
         out: &mut Vec<u8>,
     ) {
         if self.dead {
             return; // no frame after a GOAWAY with an error
+        }
+        // each timer source must change its state here, or the timer
+        // would run again at once
+        let mut dull = Vec::new();
+        for (&id, s) in self.streams.iter_mut() {
+            if let Some(t) = s.stalled {
+                if s.window > 0 || s.unsent() == 0 {
+                    s.stalled = None;
+                } else if t + wait <= now {
+                    dull.push(id);
+                }
+            }
+        }
+        for id in dull {
+            self.reset(out, id, frame::CANCEL);
         }
         let late: Vec<u32> = self
             .streams
@@ -375,6 +423,8 @@ impl H2 {
                 if self.state(h.id) == State::Idle {
                     return Err(conn_err(frame::PROTOCOL_ERROR));
                 }
+                // its DATA may still be on its way: ignored (RFC 9113 5.1)
+                self.remember(h.id);
                 self.drop_stream(h.id);
                 Ok(())
             }
@@ -458,9 +508,18 @@ impl H2 {
             self.drop_stream(id);
             return Ok(());
         }
+        // all bodies of the connection together: the same bound as one
+        // HTTP/1.1 connection. Dart has not seen this request, so the
+        // client may retry it.
+        if self.buffered + data.len() > self.max_body.max(self.max_multipart) {
+            self.reset(out, id, frame::REFUSED_STREAM);
+            return Ok(());
+        }
+        self.buffered += data.len();
         r.data.extend_from_slice(data);
         if end {
             let r = s.recv.take().unwrap();
+            self.buffered -= r.data.len();
             self.held = Some((r.rec, r.data));
         } else if r.window < STREAM_WINDOW / 2 {
             // give the window back once half of it is used. Not after
@@ -645,7 +704,7 @@ impl H2 {
 
     /// Notes that we reset stream `id`. Only the last [RESETS] are kept.
     fn remember(&mut self, id: u32) {
-        if self.resets.len() >= RESETS {
+        if self.resets.len() >= self.max_streams.max(RESETS) {
             self.resets.pop_front();
         }
         self.resets.push_back(id);
@@ -667,6 +726,9 @@ impl H2 {
             // Dart knows the request once its body is whole
             if !s.answered && s.recv.is_none() {
                 self.gone.push(s.seq);
+            }
+            if let Some(r) = &s.recv {
+                self.buffered -= r.data.len();
             }
             if let Some(sid) = s.sid.filter(|_| !s.done) {
                 self.gone_streams.push(sid);
