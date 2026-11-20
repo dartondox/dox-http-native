@@ -620,20 +620,20 @@ impl H2 {
         }
     }
 
-    /// True for a frame that counts toward `MAX_EMPTY`: HEADERS, DATA,
+    /// True for a frame that counts toward `MAX_EMPTY`: HEADERS, empty DATA,
     /// empty CONTINUATION, PRIORITY, an unknown type. The count starts
     /// again only when real work is done: a HEADERS that opens a stream,
     /// DATA with bytes or END_STREAM on an open stream (see `request` and
     /// `data`). The rest have their own limits or are normal in a row.
     /// WINDOW_UPDATE is one: package:http2 sends one for each DATA it got,
-    /// also after the stream ended.
+    /// also after the stream ended. DATA with bytes is one too: it is
+    /// bounded by the receive window, and after we reset an upload (413)
+    /// a whole window of it may still be in flight.
     fn counts(f: &Frame) -> bool {
         match f {
             Frame::Continuation { block, .. } => block.is_empty(),
-            Frame::Data { .. }
-            | Frame::Headers { .. }
-            | Frame::Priority { .. }
-            | Frame::Unknown => true,
+            Frame::Data { data, .. } => data.is_empty(),
+            Frame::Headers { .. } | Frame::Priority { .. } | Frame::Unknown => true,
             _ => false,
         }
     }

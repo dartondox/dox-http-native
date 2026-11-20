@@ -2170,6 +2170,23 @@ mod conn {
 
     /// More resets than 64 in one round trip: the DATA that was already
     /// on its way for the oldest one is ignored.
+    /// After a 413 in the middle of an upload, a whole window of small
+    /// DATA frames may still be in flight. They are not "empty" frames,
+    /// so the connection is not cut.
+    #[test]
+    fn in_flight_data_after_a_413_does_not_cut() {
+        let mut c = Client::with_max(250, 100);
+        c.send(frame::HEADERS, frame::END_HEADERS, 1, &block(GET));
+        let fs = c.send(frame::DATA, 0, 1, &[1; 101]);
+        assert_eq!(decode(&fs[0].1)[0], (":status".into(), "413".into()));
+        for _ in 0..500 {
+            assert!(c.send(frame::DATA, 0, 1, &[1; 4]).is_empty());
+        }
+        assert!(!c.h2.over());
+        assert!(c.get(3, GET).is_empty());
+        assert_eq!(c.recs.len(), 1);
+    }
+
     #[test]
     fn late_data_after_many_resets_is_ignored() {
         let mut c = Client::with_max(250, 1);
