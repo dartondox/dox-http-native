@@ -583,7 +583,7 @@ impl H2 {
                 // an open stream is remembered: a later frame on it is
                 // STREAM_CLOSED (RFC 9113 5.1). A closed id is not, so
                 // RSTs on closed ids fill nothing.
-                if self.streams.contains_key(&h.id) {
+                if self.streams.contains_key(&h.id) && !self.client_resets_set.contains(&h.id) {
                     if self.client_resets.len() >= self.max_streams.max(RESETS)
                         && let Some(old) = self.client_resets.pop_front()
                     {
@@ -945,6 +945,11 @@ impl H2 {
 
     /// Notes that we reset stream `id`. Only the last [RESETS] are kept.
     fn remember(&mut self, id: u32) {
+        // already kept: a second copy would leave the set short when the
+        // first one is evicted
+        if self.resets_set.contains(&id) {
+            return;
+        }
         if self.resets.len() >= self.max_streams.max(RESETS)
             && let Some(old) = self.resets.pop_front()
         {
