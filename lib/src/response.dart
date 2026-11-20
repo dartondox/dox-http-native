@@ -398,6 +398,15 @@ class NativeResponse implements HttpResponse {
   /// there), so a fast writer that awaits it keeps memory small. After
   /// [close], when the client is gone, or while [addStream] runs it does
   /// nothing. A response that never calls flush is sent as before.
+  /// true when [flush] would complete at once and do nothing: a streamed
+  /// answer started and Rust has room for more (at most [window] bytes
+  /// wait there). false before the stream starts, because [flush] starts it.
+  /// Use it to skip a [flush] that would only wait for nothing.
+  bool get hasRoom {
+    if (_closed || _gone || _source != null) return true;
+    return _stream != null && _unsent <= window;
+  }
+
   @override
   Future<void> flush() {
     if (_closed || _gone || _source != null) return Future<void>.value();

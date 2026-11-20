@@ -721,10 +721,21 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   }
 
   /// Queue one part of the streamed body [id].
+  ///
+  /// A handler that makes parts (an `async*` generator, `addStream`) makes
+  /// its next part only after the current microtask. If each part got a
+  /// microtask pump, each part would cost its own poll and socket write.
+  /// So a part asks for the pump in the next event-loop turn. All parts
+  /// made in this microtask burst then go out in one write.
   void sendPart(int id, List<int> data) {
     if (_handle == 0 || data.isEmpty) return;
+    _partsWaiting = true;
     _endRecord(_startRecord(id, 0, 7), data);
+    _partsWaiting = false;
   }
+
+  /// true only while [sendPart] queues a record, see [_schedulePump].
+  bool _partsWaiting = false;
 
   /// Ends the streamed body [id]. When not [ok], Rust cuts the connection
   /// (HTTP/2: the stream), so the client sees the body is not whole.
@@ -773,9 +784,12 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   void _schedulePump() {
     if (_pumpQueued || _handle == 0) return;
     _pumpQueued = true;
-    // now and then through the event loop, so timers and other ports
-    // (eg. a database) get a turn under load
-    if (++_chain & 15 == 0) {
+    // A streamed part, and now and then any other answer, goes through
+    // the event loop: timers and other ports (eg. a database) get a turn
+    // under load, and more parts can join this write. A whole answer that
+    // comes while such a pump waits also waits one event-loop turn. That
+    // is short, and a microtask pump that is already queued is not delayed.
+    if (_partsWaiting || ++_chain & 15 == 0) {
       Timer.run(_pump);
     } else {
       scheduleMicrotask(_pump);

@@ -132,6 +132,22 @@ void handle(HttpRequest req) async {
       res.write('hello');
       await res.flush();
       res.write('world');
+    case '/room':
+      // hasRoom: before the stream, after a small flush, with a full
+      // window, and after Rust sent the data
+      NativeResponse nr = res as NativeResponse;
+      List<bool> room = <bool>[nr.hasRoom];
+      res.write('a');
+      await res.flush();
+      room.add(nr.hasRoom);
+      res.add(Uint8List(NativeResponse.window + 10));
+      room.add(nr.hasRoom);
+      await res.flush();
+      room.add(nr.hasRoom);
+      res.write(room.join(','));
+    case '/many-parts':
+      // 300 parts from a generator: all go out, in order
+      await res.addStream(manyParts());
     case '/flush-then-stream':
       res.write('a');
       await res.flush();
@@ -370,6 +386,17 @@ void dies(SendPort ready) async {
   });
   ready.send(server.port);
 }
+
+/// 300 small numbered parts, each made after a microtask
+Stream<List<int>> manyParts() async* {
+  for (int i = 0; i < 300; i++) {
+    yield utf8.encode('$i,');
+  }
+}
+
+/// what [manyParts] adds up to
+String manyPartsText() =>
+    '${<int>[for (int i = 0; i < 300; i++) i].join(',')},';
 
 void main() {
   late NativeHttpServer server;
@@ -618,6 +645,20 @@ void main() {
       'GET / HTTP/1.1\r\nHost: a\r\nX-Big: $big\r\n\r\n',
     );
     expect(out, startsWith('HTTP/1.1 431'));
+  });
+
+  group('streamed answers', () {
+    test('hasRoom follows the stream and the window', () async {
+      HttpClientRequest req = await client.get('127.0.0.1', port, '/room');
+      HttpClientResponse res = await req.close();
+      List<int> body = <int>[for (List<int> c in await res.toList()) ...c];
+      String tail = utf8.decode(body.sublist(body.length - 21));
+      expect(tail, 'false,true,false,true');
+    });
+
+    test('many parts made together arrive whole and in order', () async {
+      expect(await get('/many-parts'), (200, manyPartsText()));
+    });
   });
 
   group('HTTP edge cases', () {
