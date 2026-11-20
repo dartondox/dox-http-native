@@ -22,6 +22,22 @@ class NativeResponse implements HttpResponse {
   @override
   final NativeHeaders headers;
 
+  NativeHeaders? _trailers;
+
+  /// Headers sent after the body, eg. `grpc-status` for gRPC. HTTP/2 only:
+  /// on HTTP/1.1 they are dropped. Set them before [close]. `HttpResponse`
+  /// has no trailers, so cast to [NativeResponse] to use them.
+  NativeHeaders get trailers => _trailers ??= NativeHeaders.empty();
+
+  /// the trailers to send: set, and HTTP/2
+  NativeHeaders? get _sendTrailers {
+    NativeHeaders? trailers = _trailers;
+    if (trailers == null || _request.protocolVersion != '2.0') return null;
+    bool any = false;
+    trailers.forEachLine((String name, String value) => any = true);
+    return any ? trailers : null;
+  }
+
   int _statusCode = HttpStatus.ok;
   String _reasonPhrase = '';
 
@@ -381,6 +397,13 @@ class NativeResponse implements HttpResponse {
       // tells no more sent bytes once the stream ended)
       _unsent = 0;
       _wake();
+      NativeHeaders? trailers = _sendTrailers;
+      if (stream == null && trailers != null) {
+        // only the end of a streamed answer (kind 8) carries trailers: the
+        // whole body goes as its first part
+        stream = _stream = server.startStream(_request, this, takeBody());
+        headers.sent = true;
+      }
       if (stream == null) {
         _request.server.send(_request, this);
       } else if (_length >= 0 && _left > 0 && !_gone) {
@@ -395,7 +418,7 @@ class NativeResponse implements HttpResponse {
         addError(error);
         return;
       } else {
-        _request.server.endStream(stream);
+        _request.server.endStream(stream, trailers: trailers);
       }
       _complete();
     }

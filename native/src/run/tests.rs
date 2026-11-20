@@ -89,7 +89,8 @@ fn ans(out: &mut Vec<u8>, id: u64, status: u16, kind: u16, lines: &[u8], body: &
 /// 16 MiB). `/bye` then
 /// closes with 4000, `/flood` sends 2 MB at once, `/big` 8 MiB. Messages
 /// are echoed. `/stream` sends "ab", "cde" as a streamed body. `/exact`,
-/// `/liar` and `/short` do the same with `content-length` 5, 3 and 9.
+/// `/liar` and `/short` do the same with `content-length` 5, 3 and 9,
+/// `/trailers` with trailers on the end.
 /// `/zip` gzips. Anything else: the target and the body.
 fn app(r: &Rec, out: &mut Vec<u8>) {
     match r.kind() {
@@ -119,7 +120,7 @@ fn app(r: &Rec, out: &mut Vec<u8>) {
                     _ => {}
                 }
             }
-            t @ ("/stream" | "/exact" | "/liar" | "/short") => {
+            t @ ("/stream" | "/exact" | "/liar" | "/short" | "/trailers") => {
                 let lines: &[u8] = match t {
                     "/exact" => b"content-length: 5\r\n",
                     "/liar" => b"content-length: 3\r\n",
@@ -135,7 +136,12 @@ fn app(r: &Rec, out: &mut Vec<u8>) {
                     &[&r.id.to_le_bytes()[..], b"ab"].concat(),
                 );
                 ans(out, r.id, 0, 7, b"", b"cde");
-                ans(out, r.id, 0, 8, b"", b"");
+                let trailers: &[u8] = if t == "/trailers" {
+                    b"grpc-status: 0\r\n"
+                } else {
+                    b""
+                };
+                ans(out, r.id, 0, 8, trailers, b"");
             }
             "/zip" => ans(
                 out,
@@ -790,6 +796,19 @@ fn streamed_body_sends_parts_and_counts_them() {
         "{head:?}"
     );
     wait_for(&log, |r| r.kind() == STREAM_GONE);
+}
+
+/// HTTP/1.1 drops the trailers of a streamed body: the chunked end is
+/// the same as with none.
+#[test]
+fn trailers_are_ignored_on_http1() {
+    let (port, _) = serve(limits());
+    let r = send(port, b"GET /trailers HTTP/1.1\r\nConnection: close\r\n\r\n");
+    assert!(
+        r.ends_with("\r\n\r\n2\r\nab\r\n3\r\ncde\r\n0\r\n\r\n"),
+        "{r:?}"
+    );
+    assert!(!r.contains("grpc-status"), "{r:?}");
 }
 
 #[test]
@@ -1739,4 +1758,112 @@ fn http2_idle_connection_gets_goaway() {
     );
     // closed: only the lingering close is left
     assert!(core.conns.iter().all(|(_, c)| c.linger.is_some()));
+}
+
+/// A gRPC request over a real socket: its body parts reach Dart, a
+/// BODY_ACK gives the window back (WINDOW_UPDATE on the wire), and when
+/// the connection dies the body ends with a non-zero status, once, before
+/// REQUEST_GONE.
+#[test]
+fn http2_streamed_body_acks_and_connection_death() {
+    use crate::h2::frame;
+    use crate::h2::hpack::encode_field;
+    let (mut core, port) = new_core(limits());
+    let mut inb = vec![0u8; 1 << 18];
+    let mut req = PREFACE.to_vec();
+    frame::write(&mut req, frame::SETTINGS, 0, 0, b"");
+    let mut block = Vec::new();
+    for (n, v) in [
+        (":method", "POST"),
+        (":scheme", "http"),
+        (":path", "/a.B/C"),
+        ("content-type", "application/grpc"),
+    ] {
+        encode_field(n.as_bytes(), v.as_bytes(), &mut block);
+    }
+    frame::write_headers(&mut req, 1, &block, false, 16 * 1024);
+    // 600 KiB: over half the stream window (more than the body limit too)
+    let part = vec![5u8; 16 * 1024];
+    for _ in 0..(600 / 16) {
+        frame::write(&mut req, frame::DATA, 0, 1, &part);
+    }
+    let mut s = connect(port);
+    s.write_all(&req).unwrap();
+    let mut recs = Vec::new();
+    let end = Instant::now() + Duration::from_secs(5);
+    let want = 600 / 16 * part.len();
+    let body = |recs: &[Rec]| -> usize {
+        recs.iter()
+            .filter(|r| r.kind() == crate::BODY_PART)
+            .map(|r| r.body.len())
+            .sum()
+    };
+    while body(&recs) < want && Instant::now() < end {
+        let n = core.run(&[], &mut inb, 1000).unwrap();
+        recs.extend(records(&inb[..n]));
+    }
+    assert_eq!(recs[0].flags, 8 | 16, "the request comes first, bit 4");
+    assert!(recs[0].body.is_empty());
+    assert_eq!(body(&recs), want);
+    let id = recs[0].id;
+    assert!(
+        recs[1..]
+            .iter()
+            .all(|r| r.id == id && r.kind() == crate::BODY_PART)
+    );
+    // Dart acks it all: one WINDOW_UPDATE for stream 1
+    let mut out = Vec::new();
+    ans(&mut out, id, 0, 10, b"", &(want as u64).to_le_bytes());
+    core.run(&out, &mut inb, 0).unwrap();
+    let mut got = Vec::new();
+    s.set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let mut buf = [0u8; 4096];
+    while let Ok(k @ 1..) = s.read(&mut buf) {
+        got.extend_from_slice(&buf[..k]);
+    }
+    let mut p = 0;
+    let mut update = None;
+    while let Some(h) = frame::read_head(&got[p..]) {
+        if h.kind == frame::WINDOW_UPDATE && h.id == 1 {
+            let at = p + frame::HEAD;
+            update = Some(u32::from_be_bytes(got[at..at + 4].try_into().unwrap()));
+        }
+        p += frame::HEAD + h.len;
+    }
+    assert_eq!(update, Some(want as u32));
+    // the connection dies (eg. a read error): the body ends with a
+    // non-zero status, once, then the request is gone
+    let idx = (id >> 32) as usize;
+    core.kill(idx);
+    let n = core.run(&[], &mut inb, 0).unwrap();
+    let ends: Vec<(u64, u32, u16)> = records(&inb[..n])
+        .iter()
+        .map(|r| (r.id, r.kind(), r.code))
+        .collect();
+    assert_eq!(ends, [(id, BODY_END, 1), (id, REQUEST_GONE, 0)]);
+    drop(s);
+
+    // the client closes its side: the body ends at once, the answer may
+    // still go out. No second end when the connection closes.
+    let mut s = connect(port);
+    s.write_all(&req[..req.len() - 10 * (frame::HEAD + part.len())])
+        .unwrap();
+    s.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut recs = Vec::new();
+    let end = Instant::now() + Duration::from_secs(5);
+    while !recs.iter().any(|r: &Rec| r.kind() == BODY_END) && Instant::now() < end {
+        let n = core.run(&[], &mut inb, 1000).unwrap();
+        recs.extend(records(&inb[..n]));
+    }
+    let last = recs.last().unwrap();
+    assert_eq!((last.kind(), last.code), (BODY_END, 1));
+    let id = recs[0].id;
+    core.kill((id >> 32) as usize);
+    let n = core.run(&[], &mut inb, 0).unwrap();
+    let ends: Vec<(u32, u16)> = records(&inb[..n])
+        .iter()
+        .map(|r| (r.kind(), r.code))
+        .collect();
+    assert_eq!(ends, [(REQUEST_GONE, 0)]);
 }

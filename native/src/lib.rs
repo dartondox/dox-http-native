@@ -18,8 +18,8 @@
 //!
 //! Request record (little endian, 44 byte head): u64 id, u32 flags
 //! (bit 0: HTTP/1.0, bit 1: can upgrade to a WebSocket, bit 2: the body is
-//! external, see below, bit 3: HTTP/2. Bits 8 to 15: a message kind, see
-//! below), u16
+//! external, see below, bit 3: HTTP/2, bit 4: the body comes in parts, see
+//! below. Bits 8 to 15: a message kind, see below), u16
 //! method_len, u16 target_len, u32 headers_len, u32 body_len, u16
 //! remote_port, u16 reserved, 16 bytes remote ip (IPv6, IPv4 is mapped).
 //! Then method, target, headers, body. Each header is u16 name_len, u16
@@ -48,6 +48,19 @@
 //! Kind 5 ([STREAM_GONE]): the client is gone, stop sending. Kind 6
 //! ([REQUEST_GONE]): the connection closed while this request (the id) had
 //! no answer yet. Dart then completes `done` of its response.
+//!
+//! Streamed request body (HTTP/2 only, `content-type: application/grpc*`):
+//! the request record comes as soon as the HEADERS do, with flag bit 4 and
+//! no body. Then records of kind 7 ([BODY_PART], id: the request id, body:
+//! the bytes) and one of kind 8 ([BODY_END], the remote_port field is the
+//! status: 0 a clean end, else the stream was reset or the connection
+//! died). A request whose HEADERS end the stream has no body: it comes as a
+//! normal record, without bit 4. Dart answers bytes it consumed with
+//! response kind 10 (id: the request id, body: u64 bytes). Only then does
+//! the client get them back in its stream window (WINDOW_UPDATE), so the
+//! stream window (1 MiB) bounds the bytes that wait for Dart.
+//! The header lines of a kind 8 are trailers (HTTP/2 only): they go out in
+//! a last HEADERS frame.
 //!
 //! WebSocket: a request that can upgrade (GET, HTTP/1.1, `Connection:
 //! upgrade`, `Upgrade: websocket`, version 13, a key) gets flag bit 1. Dart
@@ -126,6 +139,10 @@ const STREAM_GONE: u32 = 5;
 /// The connection of a request that has no answer yet is gone (id: the
 /// request id). Dart completes `response.done`.
 const REQUEST_GONE: u32 = 6;
+/// HTTP/2 streamed request body to Dart (flags bits 8 to 15): a part of
+/// the body, and its end (see "Streamed request body" above)
+const BODY_PART: u32 = 7;
+const BODY_END: u32 = 8;
 /// A body this big or bigger goes to Dart without a copy (external typed
 /// data). A smaller one is copied: for a few bytes a copy is cheaper than
 /// a finalizer.

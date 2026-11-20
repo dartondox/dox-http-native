@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -8,6 +9,12 @@ import 'package:dox_http_native/src/server.dart';
 
 /// [HttpRequest] for the native server. The whole body is already read
 /// (Rust stops at the size limit with 413), so the stream gives it at once.
+///
+/// An HTTP/2 request with `content-type: application/grpc*` is different:
+/// its body comes in parts while the handler runs ([isStreamed]). The
+/// client may send more only after the listener took the parts, so a
+/// paused listener (or none) holds the client back. When the client
+/// resets the stream, the body stream ends with an [HttpException].
 class NativeRequest extends Stream<Uint8List> implements HttpRequest {
   NativeRequest(
     this.server,
@@ -20,6 +27,7 @@ class NativeRequest extends Stream<Uint8List> implements HttpRequest {
     this._remotePort, {
     required this._http10,
     this._http2 = false,
+    this.isStreamed = false,
     this.isWebSocketUpgrade = false,
   });
 
@@ -41,6 +49,11 @@ class NativeRequest extends Stream<Uint8List> implements HttpRequest {
 
   /// the request came over HTTP/2
   final bool _http2;
+
+  /// true when the body comes in parts as the handler runs (HTTP/2,
+  /// `content-type: application/grpc*`). Then [body] is empty: listen to
+  /// the request instead. It has no size limit and no body timeout.
+  final bool isStreamed;
 
   /// true when Rust found a valid WebSocket upgrade request (GET,
   /// HTTP/1.1, `Upgrade: websocket`, version 13, a key).
@@ -93,11 +106,13 @@ class NativeRequest extends Stream<Uint8List> implements HttpRequest {
 
   static final Uint8List _none = Uint8List(0);
 
-  /// the body bytes. Same bytes the stream gives.
+  /// the body bytes. Same bytes the stream gives. Empty when [isStreamed].
   Uint8List get body => _body;
 
   @override
-  int get contentLength => headers.chunkedTransferEncoding ? -1 : _body.length;
+  int get contentLength => isStreamed
+      ? headers.contentLength
+      : (headers.chunkedTransferEncoding ? -1 : _body.length);
 
   @override
   Uri get requestedUri {
@@ -154,7 +169,9 @@ class NativeRequest extends Stream<Uint8List> implements HttpRequest {
     void Function()? onDone,
     bool? cancelOnError,
   }) {
-    Stream<Uint8List> stream = _body.isEmpty
+    Stream<Uint8List> stream = isStreamed
+        ? _parts.stream
+        : _body.isEmpty
         ? Stream<Uint8List>.empty()
         : Stream<Uint8List>.value(_body);
     return stream.listen(
@@ -163,6 +180,82 @@ class NativeRequest extends Stream<Uint8List> implements HttpRequest {
       onDone: onDone,
       cancelOnError: cancelOnError,
     );
+  }
+
+  // ---- a body in parts ([isStreamed]) ----
+
+  /// parts from Rust the listener did not take yet. At most the stream
+  /// window of Rust (1 MiB): the client waits for our acks.
+  late final Queue<Uint8List> _waiting = Queue<Uint8List>();
+
+  /// sync: a part counts as taken once `add` returns (the listener's
+  /// `onData` ran). A paused listener gets no part, so none is acked.
+  late final StreamController<Uint8List> _parts = StreamController<Uint8List>(
+    sync: true,
+    onListen: _drainSoon,
+    onResume: _drainSoon,
+    onCancel: _dropAll,
+  );
+  bool _ended = false;
+  bool _cancelled = false;
+  bool _drainQueued = false;
+
+  /// For the server: a part of the body came (BODY_PART).
+  void bodyPart(Uint8List part) {
+    if (_cancelled) {
+      // nobody reads any more: drop it, but let the client go on
+      server.sendBodyAck(id, part.length);
+      return;
+    }
+    _waiting.add(part);
+    _drainSoon();
+  }
+
+  /// For the server: the body ended (BODY_END). [status] 0 is a clean end.
+  /// Else the stream was reset (or the connection died): the parts not
+  /// taken yet are dropped and the body stream ends with an error.
+  void bodyEnd(int status) {
+    if (_ended) return;
+    _ended = true;
+    if (status == 0) return _drainSoon();
+    _waiting.clear();
+    if (_cancelled) return;
+    _parts.addError(HttpException('stream reset', uri: uri));
+    _parts.close();
+  }
+
+  /// In a microtask: the listener's code does not run inside `listen` or
+  /// inside the message loop of the server.
+  void _drainSoon() {
+    if (_drainQueued) return;
+    _drainQueued = true;
+    scheduleMicrotask(_drain);
+  }
+
+  void _drain() {
+    _drainQueued = false;
+    StreamController<Uint8List> parts = _parts;
+    if (parts.isClosed) return;
+    int taken = 0;
+    while (_waiting.isNotEmpty && parts.hasListener && !parts.isPaused) {
+      Uint8List part = _waiting.removeFirst();
+      taken += part.length;
+      parts.add(part);
+    }
+    server.sendBodyAck(id, taken);
+    if (_ended && _waiting.isEmpty) parts.close();
+  }
+
+  /// The listener cancelled: drop what waits, and ack it and all later
+  /// parts, so the client is not stuck.
+  void _dropAll() {
+    _cancelled = true;
+    int dropped = 0;
+    for (Uint8List part in _waiting) {
+      dropped += part.length;
+    }
+    _waiting.clear();
+    server.sendBodyAck(id, dropped);
   }
 }
 

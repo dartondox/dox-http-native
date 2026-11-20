@@ -78,9 +78,9 @@ use tungstenite::{Error as WsError, Message, Utf8Bytes};
 
 use crate::h2::{H2, PREFACE};
 use crate::{
-    CLOSE_WAIT, DRAIN_MAX, EXTERNAL_MIN, Key, MAX_HEAD, MAX_RESERVE, MIN_QUEUE, POST, REQ_HEAD,
-    REQUEST_GONE, RES_HEAD, SEND_WAIT, STREAM_GONE, STREAM_SENT, WS_BINARY, WS_CLOSED, WS_TEXT,
-    WS_UNACKED, bind, gzip, peer_bytes, post, rd16, rd32, unbind,
+    BODY_END, CLOSE_WAIT, DRAIN_MAX, EXTERNAL_MIN, Key, MAX_HEAD, MAX_RESERVE, MIN_QUEUE, POST,
+    REQ_HEAD, REQUEST_GONE, RES_HEAD, SEND_WAIT, STREAM_GONE, STREAM_SENT, WS_BINARY, WS_CLOSED,
+    WS_TEXT, WS_UNACKED, bind, gzip, peer_bytes, post, rd16, rd32, unbind,
 };
 
 const LISTENER: Token = Token(0);
@@ -1092,6 +1092,11 @@ impl Conn {
                     break;
                 }
             }
+            // the client closed its side and all its frames are read: a
+            // streamed body can not end well any more
+            if self.eof && self.rpos == self.rlen && h2.held.is_none() {
+                h2.cut_bodies();
+            }
             return Ok(());
         }
         loop {
@@ -1634,7 +1639,15 @@ impl Core {
                 self.msgs.push(id, REQUEST_GONE, 0, b"");
             }
         }
-        if let Some(h2) = &c.h2 {
+        if let Some(h2) = &mut c.h2 {
+            let base = (idx as u64) << 32;
+            // the body parts first, then the end of the bodies that were cut
+            for (seq, kind, code, data) in h2.to_dart.drain(..) {
+                self.msgs.push(base | u64::from(seq), kind, code, &data);
+            }
+            for seq in h2.streaming() {
+                self.msgs.push(base | u64::from(seq), BODY_END, 1, b"");
+            }
             for seq in h2.unanswered() {
                 let id = ((idx as u64) << 32) | u64::from(seq);
                 self.msgs.push(id, REQUEST_GONE, 0, b"");
@@ -1933,6 +1946,10 @@ impl Core {
         }
         if let Some(h2) = c.h2.as_mut() {
             h2.stall_mark(now);
+            for (seq, kind, code, data) in h2.to_dart.drain(..) {
+                let id = ((idx as u64) << 32) | u64::from(seq);
+                self.msgs.push(id, kind, code, &data);
+            }
             for seq in h2.gone.drain(..) {
                 let id = ((idx as u64) << 32) | u64::from(seq);
                 self.msgs.push(id, REQUEST_GONE, 0, b"");
@@ -2170,9 +2187,14 @@ impl Core {
                         }
                     }
                 }
-                7 => self.part(id, body, false, true),
-                8 => self.part(id, b"", true, status == 0),
+                7 => self.part(id, body, false, true, b""),
+                // the header lines are trailers
+                8 => self.part(id, b"", true, status == 0, lines),
                 9 => self.ws_ping(id, body),
+                10 if body.len() >= 8 => {
+                    let n = u64::from_le_bytes(body[..8].try_into().unwrap());
+                    self.body_ack(id, n);
+                }
                 _ => {}
             }
         }
@@ -2353,7 +2375,7 @@ impl Core {
                     c.put(i, &out, 0);
                     self.streams.insert(sid, (idx, seq));
                     self.touch(idx);
-                    self.part(sid, first, false, true);
+                    self.part(sid, first, false, true, b"");
                 }
             }
         }
@@ -2376,8 +2398,21 @@ impl Core {
         }
     }
 
-    /// A part (or the end) of the streamed body `sid`.
-    fn part(&mut self, sid: u64, data: &[u8], end: bool, ok: bool) {
+    /// HTTP/2: Dart consumed `n` bytes of the streamed body of request `id`
+    /// (BODY_ACK).
+    fn body_ack(&mut self, id: u64, n: u64) {
+        let idx = (id >> 32) as usize;
+        if let Some(c) = self.conns.get_mut(idx)
+            && let Some(h2) = c.h2.as_mut()
+        {
+            h2.ack(id as u32, n, &mut c.wbuf);
+            self.touch(idx);
+        }
+    }
+
+    /// A part (or the end) of the streamed body `sid`. The end may have
+    /// trailers (HTTP/2 only).
+    fn part(&mut self, sid: u64, data: &[u8], end: bool, ok: bool, trailers: &[u8]) {
         let Some(&(idx, seq)) = self.streams.get(&sid) else {
             return;
         };
@@ -2388,10 +2423,12 @@ impl Core {
             if end {
                 self.streams.remove(&sid);
             }
-            h2.part(seq, data, end, ok, &mut c.wbuf);
+            h2.part(seq, data, end, ok, trailers, &mut c.wbuf);
             self.touch(idx);
             return;
         }
+        // ponytail: trailers are dropped on HTTP/1.1. Chunked trailers need
+        // `TE: trailers` from the client; add them when someone asks.
         let Some(i) = c.slots.iter().position(|s| s.seq == seq) else {
             return;
         };
@@ -3930,12 +3967,16 @@ pub mod fuzz {
         recs: Vec<Rec>,
         /// all bytes the server wrote
         out: Vec<u8>,
+        /// the streamed body records: (seq, kind, status, bytes)
+        body: Vec<(u32, u32, u16, Vec<u8>)>,
     }
 
     /// Feeds `stream` (after the preface) to one `Conn` with HTTP/2 on,
     /// cut at `cuts`. Request bodies may have `max` bytes. With `answer`,
-    /// Dart answers each request at once with a body of that many bytes:
-    /// whole (kind 0) or streamed in 3 parts (kind 6, 7, 8), in turn.
+    /// Dart answers each request with a body of that many bytes: whole
+    /// (kind 0) or streamed in 3 parts (kind 6, 7, 8, some with trailers),
+    /// in turn. A streamed request body gets each part acked at once
+    /// (BODY_ACK), and its answer at its BODY_END.
     fn drive_h2(
         stream: &[u8],
         cuts: &[usize],
@@ -3954,11 +3995,32 @@ pub mod fuzz {
         let mut c = Conn::new(sock(), PEER, now);
         c.sniff = true;
         let (mut seq, mut fed, mut need, mut streamed) = (0u32, 0, 0, 0u64);
+        let date = b"date: Thu, 01 Jan 2026 00:00:00 GMT\r\n";
         let mut seen = H2Seen {
             recs: Vec::new(),
             out: Vec::new(),
+            body: Vec::new(),
         };
-        let date = b"date: Thu, 01 Jan 2026 00:00:00 GMT\r\n";
+        // seqs whose body streams (flag bit 4), and those that ended
+        let (mut open, mut ended) = (
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+        );
+        let answer_one = |h2: &mut H2, seq: u32, w: &mut Vec<u8>| {
+            let size = answer.unwrap();
+            let body = vec![b'x'; size];
+            if seq.is_multiple_of(2) {
+                h2.answer(seq, 200, b"X-A: 1\r\n", &body, date, w);
+            } else if h2.start(seq, 200, b"", u64::from(seq), &body[..size / 3], date, w) {
+                let trailers: &[u8] = if seq % 4 == 3 {
+                    b"Grpc-Status: 0\r\n:bad: 1\r\nconnection: x\r\n"
+                } else {
+                    b""
+                };
+                h2.part(seq, &body[size / 3..], false, true, b"", w);
+                h2.part(seq, b"", true, seq % 4 != 1, trailers, w);
+            }
+        };
         for &end in cuts {
             c.rbuf.drain(..c.rpos);
             c.rlen -= c.rpos;
@@ -3977,24 +4039,21 @@ pub mod fuzz {
                 let mut p = 0;
                 while p < n {
                     let (rec, len) = decode(&inb[p..n]);
-                    // flag bit 3, and bit 2 for a big body
-                    assert_eq!(rec.flags & !4, 8, "flags {}", rec.flags);
+                    // flag bit 3, and bit 2 for a big body or bit 4 for
+                    // a streamed one (no body in the record then)
+                    assert_eq!(rec.flags & !(4 | 16), 8, "flags {}", rec.flags);
+                    assert!(rec.flags & 16 == 0 || rec.body.is_empty());
                     assert!(!rec.method.is_empty() && !rec.target.is_empty());
                     assert!(rec.target.is_ascii() && rec.body.len() <= 2 * max);
                     for (name, value) in &rec.headers {
                         assert!(!name.iter().any(u8::is_ascii_uppercase), "{name:?}");
                         assert!(!value.iter().any(|&b| b == 0 || b == b'\r' || b == b'\n'));
                     }
-                    let id = u64::from_le_bytes(inb[p..p + 8].try_into().unwrap());
-                    if let (Some(size), Some(h2)) = (answer, c.h2.as_mut()) {
-                        let body = vec![b'x'; size];
-                        let (seq, w) = (id as u32, &mut c.wbuf);
-                        if seq % 2 == 0 {
-                            h2.answer(seq, 200, b"X-A: 1\r\n", &body, date, w);
-                        } else if h2.start(seq, 200, b"", id, &body[..size / 3], date, w) {
-                            h2.part(seq, &body[size / 3..], false, true, w);
-                            h2.part(seq, b"", true, seq % 4 == 1, w);
-                        }
+                    let seq = u64::from_le_bytes(inb[p..p + 8].try_into().unwrap()) as u32;
+                    if rec.flags & 16 != 0 {
+                        open.insert(seq);
+                    } else if let (Some(_), Some(h2)) = (answer, c.h2.as_mut()) {
+                        answer_one(h2, seq, &mut c.wbuf);
                     }
                     seen.recs.push(rec);
                     p += len;
@@ -4006,6 +4065,23 @@ pub mod fuzz {
                 }
                 // write all that may go: the client reads everything
                 if let Some(h2) = c.h2.as_mut() {
+                    // streamed bodies: only after their record, nothing
+                    // after the end, one end each
+                    for (seq, kind, code, data) in std::mem::take(&mut h2.to_dart) {
+                        assert!(open.contains(&seq) && !ended.contains(&seq));
+                        if kind == BODY_END {
+                            ended.insert(seq);
+                            if answer.is_some() && code == 0 {
+                                answer_one(h2, seq, &mut c.wbuf);
+                            }
+                        } else {
+                            assert!(kind == crate::BODY_PART && !data.is_empty() && code == 0);
+                            if answer.is_some() {
+                                h2.ack(seq, data.len() as u64, &mut c.wbuf);
+                            }
+                        }
+                        seen.body.push((seq, kind, code, data));
+                    }
                     loop {
                         h2.send(&mut c.wbuf, c.wpos, c.written, &mut c.marks);
                         c.written += c.wbuf.len() as u64;
@@ -4027,6 +4103,13 @@ pub mod fuzz {
             }
         }
         assert!(c.h2.as_ref().is_none_or(|h| h.held.is_none()));
+        // a body that still streams gets its end when the connection dies
+        if let Some(h2) = c.h2.as_ref() {
+            for seq in h2.streaming() {
+                assert!(open.contains(&seq) && ended.insert(seq));
+            }
+        }
+        assert_eq!(open, ended, "each streamed body ends once");
         seen
     }
 
@@ -4072,6 +4155,26 @@ pub mod fuzz {
         };
         let mut stream = crate::h2::PREFACE.to_vec();
         crate::h2::frame::write(&mut stream, crate::h2::frame::SETTINGS, 0, 0, b"");
+        if seed & 1 == 1 {
+            // gRPC requests on streams 1 and 3: their bodies stream to Dart
+            for (id, ct) in [
+                (1, &b"application/grpc"[..]),
+                (3, b"Application/GRPC+proto"),
+            ] {
+                let mut block = Vec::new();
+                for (n, v) in [
+                    (&b":method"[..], &b"POST"[..]),
+                    (b":scheme", b"http"),
+                    (b":path", b"/a.B/C"),
+                    (b"content-type", ct),
+                    (b"te", b"trailers"),
+                ] {
+                    crate::h2::hpack::encode_field(n, v, &mut block);
+                }
+                let flags = crate::h2::frame::END_HEADERS;
+                crate::h2::frame::write(&mut stream, crate::h2::frame::HEADERS, flags, id, &block);
+            }
+        }
         stream.extend_from_slice(rest);
         let big = REQ_HEAD + 4 * stream.len() + MAX_HEAD;
         let max = usize::from(*size) * 256;
