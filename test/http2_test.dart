@@ -130,6 +130,23 @@ void handle(HttpRequest req) async {
       res.write('Hello World');
     case '/big':
       res.add(List<int>.filled(bigSize, 7));
+    case '/room':
+      // hasRoom: before the stream, after a small flush, with a full
+      // window, and after Rust sent the data
+      List<bool> room = <bool>[res.hasRoom];
+      res.write('a');
+      await res.flush();
+      room.add(res.hasRoom);
+      res.add(Uint8List(NativeResponse.window + 10));
+      room.add(res.hasRoom);
+      await res.flush();
+      room.add(res.hasRoom);
+      res.write(room.join(','));
+    case '/many-parts':
+      // flush first: the stream starts, so every part goes through sendPart
+      res.write('start,');
+      await res.flush();
+      await res.addStream(manyParts());
     case '/proto':
       res.write('${req.protocolVersion} ${req.persistentConnection}');
     case '/empty':
@@ -236,6 +253,17 @@ Future<Answer> request(
   return Answer(headers, data);
 }
 
+/// 300 small numbered parts, each made after a microtask
+Stream<List<int>> manyParts() async* {
+  for (int i = 0; i < 300; i++) {
+    yield utf8.encode('$i,');
+  }
+}
+
+/// what [manyParts] adds up to
+String manyPartsText() =>
+    'start,${<int>[for (int i = 0; i < 300; i++) i].join(',')},';
+
 void main() {
   late NativeHttpServer server;
   late ClientTransportConnection c;
@@ -293,6 +321,18 @@ void main() {
       expect(a.body.every((int b) => b == 7), isTrue);
     }
     expect(utf8.decode(all[2].body), 'Hello World');
+  });
+
+  test('many parts made together arrive whole and in order', () async {
+    Answer a = await request(c, '/many-parts');
+    expect(a.status, 200);
+    expect(utf8.decode(a.body), manyPartsText());
+  });
+
+  test('hasRoom follows the stream and the window', () async {
+    Answer a = await request(c, '/room');
+    String tail = utf8.decode(a.body.sublist(a.body.length - 21));
+    expect(tail, 'false,true,false,true');
   });
 
   test('HEAD and 204 send no body', () async {
