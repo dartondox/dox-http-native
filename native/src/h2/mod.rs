@@ -297,6 +297,9 @@ pub(crate) struct H2 {
     /// streamed answers whose stream ended before Dart's end: Dart gets
     /// STREAM_GONE for each
     pub(crate) gone_streams: Vec<u64>,
+    /// Streamed answers whose zombie ran out of time (ZOMBIE_WAIT). Dart got
+    /// STREAM_GONE before: the run loop only forgets the stream id.
+    pub(crate) expired_streams: Vec<u64>,
     /// streamed request bodies: records for Dart (request seq, kind
     /// BODY_PART or BODY_END, status, bytes), in order
     pub(crate) to_dart: Vec<(u32, u32, u16, Vec<u8>)>,
@@ -374,6 +377,7 @@ impl H2 {
             held: None,
             gone: Vec::new(),
             gone_streams: Vec::new(),
+            expired_streams: Vec::new(),
             to_dart: Vec::new(),
             unacked: 0,
             reset_bucket: Bucket::new(now, burst),
@@ -426,6 +430,7 @@ impl H2 {
             .values()
             .filter_map(|s| s.sid)
             .chain(self.gone_streams.iter().copied())
+            .chain(self.expired_streams.iter().copied())
             .chain(self.zombies.values().filter_map(|z| z.1))
     }
 
@@ -1108,8 +1113,14 @@ impl H2 {
         // only when full, so at most `max_streams` entries, and each refusal
         // takes a token: the old ones go now, no timer is needed
         let now = self.now;
-        self.zombies
-            .retain(|_, (at, _)| now.saturating_duration_since(*at) < ZOMBIE_WAIT);
+        let expired = &mut self.expired_streams;
+        self.zombies.retain(|_, (at, sid)| {
+            let keep = now.saturating_duration_since(*at) < ZOMBIE_WAIT;
+            if let Some(sid) = sid.filter(|_| !keep) {
+                expired.push(sid);
+            }
+            keep
+        });
         self.streams.len() + self.zombies.len() >= self.max_streams
     }
 
@@ -1398,7 +1409,9 @@ impl H2 {
         }
         let n = data.len() as u64;
         if !ok || s.left.is_some_and(|l| n > l || (end && n < l)) {
-            // the body is not whole: the client must see it is cut
+            // the body is not whole: the client must see it is cut. The
+            // handler is over when this is the end: no zombie for it.
+            s.done |= end;
             self.reset(out, id, frame::INTERNAL_ERROR);
             return;
         }

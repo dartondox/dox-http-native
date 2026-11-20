@@ -2121,7 +2121,8 @@ mod conn {
             let fs = part(&mut c, 0, more, end, true);
             assert_eq!(kinds(&fs), rst(1, 0));
             assert_eq!(code(&fs), frame::INTERNAL_ERROR);
-            assert_eq!(c.h2.gone_streams, [SID]);
+            // an end part already ended the handler: no STREAM_GONE
+            assert_eq!(c.h2.gone_streams, if end { vec![] } else { vec![SID] });
         }
     }
 
@@ -2976,8 +2977,56 @@ mod conn {
         // takes 1 for the reset of the refused id and 0.25 for the refusal
         // itself (the zombies fill the slots, see ZOMBIE_REFUSAL_COST):
         // 1.25 per round, so the cut comes after about 600 rounds.
-        assert!(cut.is_some_and(|i| i < 1100), "{cut:?}");
+        assert!(
+            cut.is_some_and(|i| (800..900).contains(&i)),
+            "cut at {cut:?}"
+        );
         assert_eq!(c.recs.len(), 250);
+    }
+
+    /// A streamed answer that ends with an error (or with too few bytes for
+    /// its content-length) is over: it must not leave a zombie. 250 such
+    /// failures must not block the connection.
+    #[test]
+    fn a_failed_end_part_leaves_no_zombie() {
+        let mut c = Client::new(2);
+        let mut id = 1;
+        for (lines, data, ok) in [
+            (&b""[..], &b"x"[..], false),
+            (&b"content-length: 5\r\n"[..], &b"abc"[..], true),
+        ] {
+            for _ in 0..5 {
+                let seq = c.seq;
+                c.get(id, GET);
+                assert!(start(&mut c, seq, lines, b"x").0);
+                part(&mut c, seq, data, true, ok);
+                assert!(c.h2.zombies.is_empty());
+                assert!(c.h2.gone_streams.is_empty());
+                id += 2;
+            }
+        }
+        assert!(c.get(id, GET).is_empty(), "a new stream is accepted");
+        assert!(!c.h2.over());
+    }
+
+    /// A zombie of a streamed answer that runs out of time reports its
+    /// stream id (the run loop forgets it). A late end part does nothing.
+    #[test]
+    fn an_expired_streamed_zombie_reports_its_stream() {
+        let mut c = Client::new(1);
+        let t0 = c.now;
+        c.get(1, GET);
+        assert!(start(&mut c, 0, b"", b"x").0);
+        c.send(frame::RST_STREAM, 0, 1, &8u32.to_be_bytes());
+        c.h2.gone_streams.clear();
+        assert!(c.h2.expired_streams.is_empty());
+        c.now = t0 + ZOMBIE_WAIT;
+        assert!(c.get(3, GET).is_empty(), "room again");
+        assert_eq!(c.h2.expired_streams.len(), 1);
+        assert_eq!(c.h2.streamed().count(), 1, "kill still tells Dart");
+        assert!(part(&mut c, 0, b"late", true, true).is_empty());
+        assert!(!c.h2.over());
+        assert_eq!(c.h2.open(), 1, "the new stream is not touched");
     }
 
     /// A streamed answer that started is not over when the client resets:
@@ -3034,7 +3083,7 @@ mod conn {
             next_second(&mut c);
             let first = id;
             for _ in 0..250 {
-                assert!(c.get(id, GET).is_empty(), "refused");
+                assert!(c.get(id, GET).is_empty(), "call {id} was refused");
                 id += 2;
             }
             for i in 0..250 {
@@ -3045,11 +3094,17 @@ mod conn {
                 assert_eq!(code(&c.get(id, GET)), frame::REFUSED_STREAM);
                 id += 2;
             }
-            assert!(!c.h2.over());
+            assert!(
+                !c.h2.over(),
+                "the client was cut by its own refused retries"
+            );
             dart_ends(&mut c);
         }
-        assert!(c.get(id, GET).is_empty(), "accepted");
-        assert!(!c.h2.over());
+        assert!(
+            c.get(id, GET).is_empty(),
+            "no room after Dart ended the handlers"
+        );
+        assert!(!c.h2.over(), "the client was cut at the end");
     }
 
     /// A late answer of Dart frees the slot of a request the client reset:
@@ -3195,7 +3250,7 @@ mod conn {
             let first = c.seq;
             let mut reset = Vec::new();
             for i in 0..200u32 {
-                assert!(c.get(id, GET).is_empty(), "refused");
+                assert!(c.get(id, GET).is_empty(), "call {id} was refused");
                 if i % 4 == 0 {
                     c.send(frame::RST_STREAM, 0, id, &8u32.to_be_bytes());
                     reset.push(c.seq - 1);
@@ -3211,7 +3266,7 @@ mod conn {
             for seq in reset {
                 assert!(c.answer(seq, 200, b"", b"late").is_empty());
             }
-            assert!(!c.h2.over());
+            assert!(!c.h2.over(), "a client with some timeouts was cut");
         }
         assert_eq!(c.recs.len(), 4000);
         assert!(c.h2.zombies.is_empty());

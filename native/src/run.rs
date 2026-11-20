@@ -1965,6 +1965,10 @@ impl Core {
                     self.msgs.push(sid, STREAM_GONE, 0, b"");
                 }
             }
+            // zombies that ran out of time: Dart knows, forget the entry
+            for sid in h2.expired_streams.drain(..) {
+                self.streams.remove(&sid);
+            }
             c.shut |= h2.over();
             if c.written > before {
                 h2.flushed(); // our ACKs are on their way
@@ -4101,6 +4105,7 @@ pub mod fuzz {
                     assert!(streamed <= (answer.unwrap_or(0) * seen.recs.len()) as u64);
                     h2.gone.clear();
                     h2.gone_streams.clear();
+                    h2.expired_streams.clear();
                 }
                 c.paused = false;
                 if need == 0 && (seen.recs.len(), c.rpos) == before {
