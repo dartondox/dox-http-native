@@ -1891,6 +1891,82 @@ fn http2_streamed_body_acks_and_connection_death() {
     assert_eq!((last.kind(), last.code), (BODY_END, 1));
 }
 
+/// The `streams` entry of a started HTTP/2 answer: it stays after the
+/// client resets (Dart's end part still has to free the slot), goes when
+/// the zombie runs out of time, and goes when the connection closes.
+#[test]
+fn http2_stream_entry_lives_until_end_expiry_or_close() {
+    use crate::h2::frame;
+    use crate::h2::hpack::encode_field;
+    let (mut core, port) = new_core(Limits {
+        max_streams: 1,
+        ..limits()
+    });
+    let mut inb = vec![0u8; 1 << 18];
+    let mut block = Vec::new();
+    for (n, v) in [(":method", "GET"), (":scheme", "http"), (":path", "/s")] {
+        encode_field(n.as_bytes(), v.as_bytes(), &mut block);
+    }
+    let mut req = PREFACE.to_vec();
+    frame::write(&mut req, frame::SETTINGS, 0, 0, b"");
+    frame::write_headers(&mut req, 1, &block, true, 16 * 1024);
+    let mut s = connect(port);
+    s.write_all(&req).unwrap();
+    let id = collect(&mut core, &mut inb, 1).pop().unwrap().id;
+    let idx = (id >> 32) as usize;
+    let mut out = Vec::new();
+    ans(
+        &mut out,
+        id,
+        200,
+        6,
+        b"",
+        &[&77u64.to_le_bytes()[..], b"hi"].concat(),
+    );
+    core.run(&out, &mut inb, 0).unwrap();
+    assert!(core.streams.contains_key(&77));
+    // the client resets: Dart is told, the entry stays
+    let mut rst = Vec::new();
+    frame::write(&mut rst, frame::RST_STREAM, 0, 1, &8u32.to_be_bytes());
+    s.write_all(&rst).unwrap();
+    let mut recs = Vec::new();
+    let end = Instant::now() + Duration::from_secs(5);
+    while !recs.iter().any(|r: &Rec| r.kind() == STREAM_GONE) && Instant::now() < end {
+        let n = core.run(&[], &mut inb, 1000).unwrap();
+        recs.extend(records(&inb[..n]));
+    }
+    assert!(recs.iter().any(|r| r.id == 77 && r.kind() == STREAM_GONE));
+    assert!(core.streams.contains_key(&77), "the entry stays");
+    // a new request, 31 s later (ZOMBIE_WAIT is 30 s): the zombie expires
+    // and the entry goes
+    let mut again = Vec::new();
+    frame::write_headers(&mut again, 3, &block, true, 16 * 1024);
+    let (mut pos, mut seq) = (0, 50);
+    let late = Instant::now() + Duration::from_secs(31);
+    let c = core.conns.get_mut(idx).unwrap();
+    let h2 = c.h2.as_mut().unwrap();
+    h2.step(&again, &mut pos, &mut c.wbuf, &mut seq, b"", late);
+    core.service(idx);
+    assert!(!core.streams.contains_key(&77), "expired: the entry goes");
+    // a started answer on a new connection goes with that connection
+    let mut s2 = connect(port);
+    s2.write_all(&req).unwrap();
+    let id2 = collect(&mut core, &mut inb, 1).pop().unwrap().id;
+    let mut out = Vec::new();
+    ans(
+        &mut out,
+        id2,
+        200,
+        6,
+        b"",
+        &[&78u64.to_le_bytes()[..], b"hi"].concat(),
+    );
+    core.run(&out, &mut inb, 0).unwrap();
+    assert!(core.streams.contains_key(&78));
+    core.kill((id2 >> 32) as usize);
+    assert!(!core.streams.contains_key(&78), "closed: the entry goes");
+}
+
 /// Writes `bytes` on a second thread, then closes the write side. A big
 /// write can be more than the socket buffers hold (smaller on macOS under
 /// load), and only `core.run` on the test thread reads them: on the test

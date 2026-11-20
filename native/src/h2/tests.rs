@@ -611,7 +611,7 @@ mod conn {
 
     use super::super::frame::{self, Error, Frame, Head};
     use super::super::hpack::{Decoder, encode_field, write_int};
-    use super::super::{CONN_WINDOW, DEFAULT_WINDOW, H2, HOLD, State};
+    use super::super::{CONN_WINDOW, DEFAULT_WINDOW, H2, HOLD, State, ZOMBIE_WAIT};
     use crate::SEND_WAIT;
     use crate::run::MAX_HEADERS;
 
@@ -2121,7 +2121,8 @@ mod conn {
             let fs = part(&mut c, 0, more, end, true);
             assert_eq!(kinds(&fs), rst(1, 0));
             assert_eq!(code(&fs), frame::INTERNAL_ERROR);
-            assert_eq!(c.h2.gone_streams, [SID]);
+            // an end part already ended the handler: no STREAM_GONE
+            assert_eq!(c.h2.gone_streams, if end { vec![] } else { vec![SID] });
         }
     }
 
@@ -2238,7 +2239,7 @@ mod conn {
         let mut c = Client::with_max(250, MAX_BODY);
         for i in 0..300u32 {
             c.get(1 + 2 * i, GET);
-            c.send(frame::RST_STREAM, 0, 1 + 2 * i, &8u32.to_be_bytes());
+            reset_late(&mut c, 1 + 2 * i);
         }
         assert_eq!(c.h2.client_resets.len(), 250);
         // closed ids: nothing is added
@@ -2325,6 +2326,28 @@ mod conn {
         assert_eq!(c.h2.stall_since(), None);
     }
 
+    /// The stall timer fires on a connection that had no frames for a long
+    /// time. The zombie of the cancelled answer starts at the cancel, not at
+    /// the last frame: it counts for the full ZOMBIE_WAIT.
+    #[test]
+    fn a_stall_cancel_zombie_counts_from_the_cancel() {
+        let mut c = Client::new(1);
+        let t0 = c.now;
+        c.get(1, GET);
+        assert!(start(&mut c, 0, b"", &vec![1u8; 100_000]).0);
+        c.h2.stall_mark(t0);
+        let mut out = Vec::new();
+        let cancel = t0 + SEND_WAIT;
+        c.h2.expire(cancel, SEND_WAIT, SEND_WAIT, DATE, &mut out);
+        assert_eq!(code(&frames(&out)), frame::CANCEL);
+        assert_eq!(c.h2.zombies.len(), 1);
+        c.now = cancel + ZOMBIE_WAIT - Duration::from_secs(1);
+        assert_eq!(code(&c.get(3, GET)), frame::REFUSED_STREAM);
+        assert_eq!(c.h2.zombies.len(), 1);
+        c.now = cancel + ZOMBIE_WAIT;
+        assert!(c.get(5, GET).is_empty(), "room again");
+    }
+
     /// A stream that drained and then stalls again gets a fresh clock.
     #[test]
     fn a_stall_after_a_drain_starts_a_fresh_clock() {
@@ -2376,16 +2399,34 @@ mod conn {
         c.now += Duration::from_secs(1);
     }
 
+    /// The handlers of the requests the client reset end in Dart: their
+    /// late answers free the slots (see `zombies`). They give no token
+    /// back.
+    fn dart_ends(c: &mut Client) {
+        let seqs: Vec<u32> = c.h2.zombies.keys().copied().collect();
+        for seq in seqs {
+            assert!(c.answer(seq, 200, b"", b"late").is_empty());
+        }
+    }
+
+    /// RST_STREAM from the client, then Dart ends the handler.
+    fn reset_late(c: &mut Client, id: u32) -> Vec<(Head, Vec<u8>)> {
+        let fs = c.send(frame::RST_STREAM, 0, id, &8u32.to_be_bytes());
+        dart_ends(c);
+        fs
+    }
+
     /// Rapid Reset (CVE-2023-44487): HEADERS then RST_STREAM, again and
     /// again. The bucket holds 1000 (a burst), then 100 come back each
-    /// second.
+    /// second. Dart ends each handler here; when it does not, the lost
+    /// handlers stop it first (see `attack_rapid_reset_with_lost_handlers`).
     #[test]
     fn attack_rapid_reset() {
         let mut c = Client::new(250);
         let rst = 8u32.to_be_bytes();
         for i in 0..1000u32 {
             c.get(1 + 2 * i, GET);
-            assert!(c.send(frame::RST_STREAM, 0, 1 + 2 * i, &rst).is_empty());
+            assert!(reset_late(&mut c, 1 + 2 * i).is_empty());
         }
         c.get(2001, GET);
         goaway(
@@ -2397,14 +2438,14 @@ mod conn {
         let mut c = Client::new(250);
         for i in 0..1000u32 {
             c.get(1 + 2 * i, GET);
-            c.send(frame::RST_STREAM, 0, 1 + 2 * i, &rst);
+            reset_late(&mut c, 1 + 2 * i);
         }
         for s in 0..5u32 {
             next_second(&mut c);
             for i in 0..100u32 {
                 let id = 2001 + 2 * (s * 100 + i);
                 c.get(id, GET);
-                assert!(c.send(frame::RST_STREAM, 0, id, &rst).is_empty());
+                assert!(reset_late(&mut c, id).is_empty());
             }
         }
         // 101 in one second is over the rate
@@ -2412,7 +2453,7 @@ mod conn {
         for i in 0..100u32 {
             let id = 3001 + 2 * i;
             c.get(id, GET);
-            c.send(frame::RST_STREAM, 0, id, &rst);
+            reset_late(&mut c, id);
         }
         c.get(4001, GET);
         goaway(
@@ -2438,7 +2479,7 @@ mod conn {
         let id = 1 + 2 * *n;
         *n += 1;
         c.get(id, GET);
-        c.send(frame::RST_STREAM, 0, id, &8u32.to_be_bytes())
+        reset_late(c, id)
     }
 
     /// After many answers, a flood is still cut within one burst.
@@ -2448,7 +2489,7 @@ mod conn {
             let id = 1 + 2 * *n;
             *n += 1;
             c.get(id, GET);
-            let fs = c.send(frame::RST_STREAM, 0, id, &8u32.to_be_bytes());
+            let fs = reset_late(c, id);
             if !fs.is_empty() {
                 goaway(&fs, frame::ENHANCE_YOUR_CALM);
                 cut = Some(i);
@@ -2626,6 +2667,7 @@ mod conn {
             // a WINDOW_UPDATE of 0 on a stream is a stream error
             let fs = c.send(frame::WINDOW_UPDATE, 0, 1 + 2 * i, &[0; 4]);
             assert_eq!(code(&fs), frame::PROTOCOL_ERROR);
+            dart_ends(&mut c);
         }
         assert_eq!(c.recs.len(), 1000);
         c.get(2001, GET);
@@ -2922,6 +2964,334 @@ mod conn {
         }
         assert_eq!(c.recs.len(), 600);
         assert_eq!(c.h2.open(), 0);
+    }
+
+    // ---- requests the client reset while Dart works on them ----
+
+    /// Rapid Reset where Dart never answers: each reset request leaves a
+    /// handler that runs in Dart. They count against max streams, so after
+    /// 250 every new stream is refused. Dart never gets more than 250
+    /// requests, and the refusals still use up the bucket.
+    #[test]
+    fn attack_rapid_reset_with_lost_handlers() {
+        let mut c = Client::new(250);
+        let rst = 8u32.to_be_bytes();
+        for i in 0..250u32 {
+            assert!(c.get(1 + 2 * i, GET).is_empty());
+            assert!(c.send(frame::RST_STREAM, 0, 1 + 2 * i, &rst).is_empty());
+        }
+        assert_eq!(c.h2.zombies.len(), 250);
+        assert_eq!(c.h2.open(), 0);
+        let mut cut = None;
+        for i in 250..2000u32 {
+            let id = 1 + 2 * i;
+            let fs = c.get(id, GET);
+            if c.h2.over() {
+                cut = Some(i);
+                break;
+            }
+            assert_eq!(code(&fs), frame::REFUSED_STREAM, "{i}");
+            c.send(frame::RST_STREAM, 0, id, &rst);
+            assert!(c.h2.zombies.len() <= 250);
+            assert_eq!(c.recs.len(), 250, "Dart work stays bounded");
+        }
+        // The bucket holds 1000. The 250 resets take 250. Each later round
+        // takes 1 for the reset of the refused id and 0.25 for the refusal
+        // itself (the zombies fill the slots, see ZOMBIE_REFUSAL_COST):
+        // 1.25 per round, so the cut comes after about 600 rounds.
+        assert!(
+            cut.is_some_and(|i| (800..900).contains(&i)),
+            "cut at {cut:?}"
+        );
+        assert_eq!(c.recs.len(), 250);
+    }
+
+    /// A streamed answer that ends with an error (or with too few bytes for
+    /// its content-length) is over: it must not leave a zombie. 250 such
+    /// failures must not block the connection.
+    #[test]
+    fn a_failed_end_part_leaves_no_zombie() {
+        let mut c = Client::new(2);
+        let mut id = 1;
+        for (lines, data, ok) in [
+            (&b""[..], &b"x"[..], false),
+            (&b"content-length: 5\r\n"[..], &b"abc"[..], true),
+        ] {
+            for _ in 0..5 {
+                let seq = c.seq;
+                c.get(id, GET);
+                assert!(start(&mut c, seq, lines, b"x").0);
+                part(&mut c, seq, data, true, ok);
+                assert!(c.h2.zombies.is_empty());
+                assert!(c.h2.gone_streams.is_empty());
+                id += 2;
+            }
+        }
+        assert!(c.get(id, GET).is_empty(), "a new stream is accepted");
+        assert!(!c.h2.over());
+    }
+
+    /// A zombie of a streamed answer that runs out of time reports its
+    /// stream id (the run loop forgets it). A late end part does nothing.
+    #[test]
+    fn an_expired_streamed_zombie_reports_its_stream() {
+        let mut c = Client::new(1);
+        let t0 = c.now;
+        c.get(1, GET);
+        assert!(start(&mut c, 0, b"", b"x").0);
+        c.send(frame::RST_STREAM, 0, 1, &8u32.to_be_bytes());
+        c.h2.gone_streams.clear();
+        assert!(c.h2.expired_streams.is_empty());
+        c.now = t0 + ZOMBIE_WAIT;
+        assert!(c.get(3, GET).is_empty(), "room again");
+        assert_eq!(c.h2.expired_streams.len(), 1);
+        assert_eq!(c.h2.streamed().count(), 1, "kill still tells Dart");
+        assert!(part(&mut c, 0, b"late", true, true).is_empty());
+        assert!(!c.h2.over());
+        assert_eq!(c.h2.open(), 1, "the new stream is not touched");
+    }
+
+    /// A streamed answer that started is not over when the client resets:
+    /// the handler goes on in Dart, so the slot stays taken until Dart's end
+    /// part (kind 8) comes. A part that is not the end does not free it.
+    #[test]
+    fn a_started_streamed_answer_holds_its_slot_until_its_end() {
+        let rst = 8u32.to_be_bytes();
+        let mut c = Client::new(1);
+        c.get(1, GET);
+        assert!(start(&mut c, 0, b"", b"x").0);
+        c.send(frame::RST_STREAM, 0, 1, &rst);
+        assert_eq!(c.h2.zombies.len(), 1);
+        assert_eq!(code(&c.get(3, GET)), frame::REFUSED_STREAM);
+        part(&mut c, 0, b"more", false, true);
+        assert_eq!(code(&c.get(5, GET)), frame::REFUSED_STREAM);
+        part(&mut c, 0, b"", true, true);
+        assert!(c.h2.zombies.is_empty());
+        assert!(c.get(7, GET).is_empty(), "room again");
+    }
+
+    /// Rapid Reset with streamed answers (SSE, server-streaming gRPC): the
+    /// client resets each one right after its first part, and Dart never
+    /// ends them. Dart never gets more than 250 requests.
+    #[test]
+    fn attack_rapid_reset_with_started_streams() {
+        let rst = 8u32.to_be_bytes();
+        let mut c = Client::new(250);
+        for i in 0..250u32 {
+            assert!(c.get(1 + 2 * i, GET).is_empty());
+            let seq = c.seq - 1;
+            assert!(start(&mut c, seq, b"", b"x").0);
+            c.send(frame::RST_STREAM, 0, 1 + 2 * i, &rst);
+        }
+        assert_eq!(c.h2.zombies.len(), 250);
+        for i in 250..650u32 {
+            let fs = c.get(1 + 2 * i, GET);
+            assert_eq!(code(&fs), frame::REFUSED_STREAM, "{i}");
+        }
+        assert_eq!(c.recs.len(), 250, "Dart work stays bounded");
+        assert!(!c.h2.over());
+    }
+
+    /// A real gRPC client after a mass cancel: 250 calls in flight, it
+    /// cancels all of them, sends 250 new ones (refused, as the zombies
+    /// fill the slots) and retries each once. Then Dart ends the lost
+    /// handlers and the next calls go through. Three waves, no GOAWAY.
+    #[test]
+    fn a_mass_cancel_does_not_cut_a_real_grpc_client() {
+        let rst = 8u32.to_be_bytes();
+        let mut c = Client::new(250);
+        let mut id = 1;
+        for _ in 0..3 {
+            next_second(&mut c);
+            let first = id;
+            for _ in 0..250 {
+                assert!(c.get(id, GET).is_empty(), "call {id} was refused");
+                id += 2;
+            }
+            for i in 0..250 {
+                c.send(frame::RST_STREAM, 0, first + 2 * i, &rst);
+            }
+            // the new calls, and one retry each
+            for _ in 0..500 {
+                assert_eq!(code(&c.get(id, GET)), frame::REFUSED_STREAM);
+                id += 2;
+            }
+            assert!(
+                !c.h2.over(),
+                "the client was cut by its own refused retries"
+            );
+            dart_ends(&mut c);
+        }
+        assert!(
+            c.get(id, GET).is_empty(),
+            "no room after Dart ended the handlers"
+        );
+        assert!(!c.h2.over(), "the client was cut at the end");
+    }
+
+    /// A late answer of Dart frees the slot of a request the client reset:
+    /// a whole answer, a streamed one, a refused one and a gzip job.
+    #[test]
+    fn late_answers_free_the_slots() {
+        let rst = 8u32.to_be_bytes();
+        let mut c = Client::new(2);
+        let full = |c: &mut Client, id: u32| {
+            let fs = c.get(id, GET);
+            assert_eq!(code(&fs), frame::REFUSED_STREAM);
+        };
+        for id in [1, 3] {
+            c.get(id, GET);
+            c.send(frame::RST_STREAM, 0, id, &rst);
+        }
+        full(&mut c, 5);
+        // a whole answer (kind 0)
+        assert!(c.answer(0, 200, b"", b"late").is_empty());
+        assert!(c.get(7, GET).is_empty(), "room again");
+        c.send(frame::RST_STREAM, 0, 7, &rst);
+        full(&mut c, 9);
+        // a streamed answer (kind 6): no stream, Dart must stop
+        assert!(!start(&mut c, 1, b"", b"x").0);
+        assert!(c.get(11, GET).is_empty());
+        c.send(frame::RST_STREAM, 0, 11, &rst);
+        full(&mut c, 13);
+        // a WebSocket accept or a broken kind 6 (refused)
+        let mut out = Vec::new();
+        c.h2.refuse(2, &mut out);
+        assert!(out.is_empty());
+        // a gzip answer: `defer` finds no stream
+        assert!(c.get(15, GET).is_empty());
+        c.send(frame::RST_STREAM, 0, 15, &rst);
+        full(&mut c, 17);
+        assert!(!c.h2.defer(3, 200, b""));
+        assert!(c.get(19, GET).is_empty());
+        // a gzip job that still runs when the client resets keeps the slot
+        // until it is done
+        assert!(c.h2.defer(5, 200, b""));
+        c.send(frame::RST_STREAM, 0, 19, &rst);
+        full(&mut c, 21);
+        c.h2.zipped(5, b"zipped", DATE, &mut out);
+        assert!(out.is_empty());
+        assert!(c.answer(4, 200, b"", b"late").is_empty());
+        assert!(c.get(23, GET).is_empty());
+        assert!(c.get(25, GET).is_empty());
+        assert!(c.h2.zombies.is_empty());
+        assert!(!c.h2.over());
+    }
+
+    /// A gRPC call with a streamed body: the client cancels it. Its body
+    /// ends for Dart (BODY_END 1), and the handler holds the slot until
+    /// Dart answers.
+    #[test]
+    fn a_cancelled_grpc_call_holds_its_slot_until_dart_ends() {
+        let mut c = Client::new(1);
+        c.send(
+            frame::HEADERS,
+            frame::END_HEADERS,
+            1,
+            &grpc("application/grpc"),
+        );
+        assert_eq!(c.recs.len(), 1);
+        c.send(frame::RST_STREAM, 0, 1, &8u32.to_be_bytes());
+        assert_eq!(to_dart(&mut c), vec![(0, crate::BODY_END, 1, Vec::new())]);
+        let fs = c.send(
+            frame::HEADERS,
+            frame::END_HEADERS,
+            3,
+            &grpc("application/grpc"),
+        );
+        assert_eq!(code(&fs), frame::REFUSED_STREAM);
+        // dox_grpc ends the call: a streamed answer with trailers
+        assert!(!start(&mut c, 0, b"", b"").0);
+        let fs = c.send(
+            frame::HEADERS,
+            frame::END_HEADERS,
+            5,
+            &grpc("application/grpc"),
+        );
+        assert!(fs.is_empty());
+        assert_eq!(c.recs.len(), 2);
+    }
+
+    /// The PR 34 review: a cheap answered request, then a costly one the
+    /// client resets at once, again and again. The cheap answers pay the
+    /// tokens, but the costly handlers that run in Dart without an answer
+    /// never go over max streams.
+    #[test]
+    fn cheap_answers_do_not_pay_for_lost_handlers() {
+        let mut c = Client::new(250);
+        let rst = 8u32.to_be_bytes();
+        let mut id = 1;
+        let mut answered = 0;
+        let mut rounds = 0;
+        while !c.h2.over() && rounds < 2000 {
+            rounds += 1;
+            for _ in 0..2 {
+                if c.get(id, GET).is_empty() {
+                    c.answer(c.seq - 1, 200, b"", b"cheap");
+                    answered += 1;
+                }
+                id += 2;
+            }
+            c.get(id, GET);
+            c.send(frame::RST_STREAM, 0, id, &rst);
+            id += 2;
+            // the costly handlers Dart got and never answered
+            assert!(c.recs.len() - answered <= 250);
+            assert!(c.h2.zombies.len() <= 250);
+        }
+        assert_eq!(c.recs.len() - answered, 250);
+        // once full, the refusals use up the bucket: the client is cut
+        assert!(c.h2.over(), "{rounds}");
+    }
+
+    /// A handler that never answers holds its slot for ZOMBIE_WAIT, not
+    /// for ever.
+    #[test]
+    fn a_lost_handler_stops_counting_after_a_while() {
+        let mut c = Client::new(1);
+        let t0 = c.now;
+        c.get(1, GET);
+        c.send(frame::RST_STREAM, 0, 1, &8u32.to_be_bytes());
+        c.now = t0 + ZOMBIE_WAIT - Duration::from_secs(1);
+        assert_eq!(code(&c.get(3, GET)), frame::REFUSED_STREAM);
+        c.now = t0 + ZOMBIE_WAIT;
+        assert!(c.get(5, GET).is_empty(), "room again");
+        assert!(c.h2.zombies.is_empty());
+        assert_eq!(c.recs.len(), 2);
+    }
+
+    /// A busy gRPC client with some deadlines: 200 calls at once, one in 4
+    /// is cancelled, and Dart ends the cancelled handlers a bit later (by
+    /// the next round). It is never refused or cut.
+    #[test]
+    fn a_client_with_some_timeouts_is_never_refused() {
+        let mut c = Client::new(250);
+        let mut id = 1;
+        for _ in 0..20 {
+            next_second(&mut c);
+            let first = c.seq;
+            let mut reset = Vec::new();
+            for i in 0..200u32 {
+                assert!(c.get(id, GET).is_empty(), "call {id} was refused");
+                if i % 4 == 0 {
+                    c.send(frame::RST_STREAM, 0, id, &8u32.to_be_bytes());
+                    reset.push(c.seq - 1);
+                }
+                id += 2;
+            }
+            for seq in first..c.seq {
+                if !reset.contains(&seq) {
+                    c.answer(seq, 200, b"", b"ok");
+                }
+            }
+            // the cancelled handlers end too
+            for seq in reset {
+                assert!(c.answer(seq, 200, b"", b"late").is_empty());
+            }
+            assert!(!c.h2.over(), "a client with some timeouts was cut");
+        }
+        assert_eq!(c.recs.len(), 4000);
+        assert!(c.h2.zombies.is_empty());
     }
 
     // ---- streamed request bodies and trailers ----

@@ -1959,9 +1959,15 @@ impl Core {
                 self.msgs.push(id, REQUEST_GONE, 0, b"");
             }
             for sid in h2.gone_streams.drain(..) {
-                if self.streams.remove(&sid).is_some() {
+                // The entry stays: Dart's end part (kind 8) still has to
+                // reach `h2.part` to free the zombie slot. `part` removes it.
+                if self.streams.contains_key(&sid) {
                     self.msgs.push(sid, STREAM_GONE, 0, b"");
                 }
+            }
+            // zombies that ran out of time: Dart knows, forget the entry
+            for sid in h2.expired_streams.drain(..) {
+                self.streams.remove(&sid);
             }
             c.shut |= h2.over();
             if c.written > before {
@@ -4099,6 +4105,7 @@ pub mod fuzz {
                     assert!(streamed <= (answer.unwrap_or(0) * seen.recs.len()) as u64);
                     h2.gone.clear();
                     h2.gone_streams.clear();
+                    h2.expired_streams.clear();
                 }
                 c.paused = false;
                 if need == 0 && (seen.recs.len(), c.rpos) == before {
