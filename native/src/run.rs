@@ -1959,7 +1959,9 @@ impl Core {
                 self.msgs.push(id, REQUEST_GONE, 0, b"");
             }
             for sid in h2.gone_streams.drain(..) {
-                if self.streams.remove(&sid).is_some() {
+                // The entry stays: Dart's end part (kind 8) still has to
+                // reach `h2.part` to free the zombie slot. `part` removes it.
+                if self.streams.contains_key(&sid) {
                     self.msgs.push(sid, STREAM_GONE, 0, b"");
                 }
             }

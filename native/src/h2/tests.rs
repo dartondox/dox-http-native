@@ -2972,9 +2972,84 @@ mod conn {
             assert!(c.h2.zombies.len() <= 250);
             assert_eq!(c.recs.len(), 250, "Dart work stays bounded");
         }
-        // 250 resets, then a refusal and a reset (2 tokens) per round
-        assert!(cut.is_some_and(|i| i < 700), "{cut:?}");
+        // The bucket holds 1000. The 250 resets take 250. Each later round
+        // takes 1 for the reset of the refused id and 0.25 for the refusal
+        // itself (the zombies fill the slots, see ZOMBIE_REFUSAL_COST):
+        // 1.25 per round, so the cut comes after about 600 rounds.
+        assert!(cut.is_some_and(|i| i < 1100), "{cut:?}");
         assert_eq!(c.recs.len(), 250);
+    }
+
+    /// A streamed answer that started is not over when the client resets:
+    /// the handler goes on in Dart, so the slot stays taken until Dart's end
+    /// part (kind 8) comes. A part that is not the end does not free it.
+    #[test]
+    fn a_started_streamed_answer_holds_its_slot_until_its_end() {
+        let rst = 8u32.to_be_bytes();
+        let mut c = Client::new(1);
+        c.get(1, GET);
+        assert!(start(&mut c, 0, b"", b"x").0);
+        c.send(frame::RST_STREAM, 0, 1, &rst);
+        assert_eq!(c.h2.zombies.len(), 1);
+        assert_eq!(code(&c.get(3, GET)), frame::REFUSED_STREAM);
+        part(&mut c, 0, b"more", false, true);
+        assert_eq!(code(&c.get(5, GET)), frame::REFUSED_STREAM);
+        part(&mut c, 0, b"", true, true);
+        assert!(c.h2.zombies.is_empty());
+        assert!(c.get(7, GET).is_empty(), "room again");
+    }
+
+    /// Rapid Reset with streamed answers (SSE, server-streaming gRPC): the
+    /// client resets each one right after its first part, and Dart never
+    /// ends them. Dart never gets more than 250 requests.
+    #[test]
+    fn attack_rapid_reset_with_started_streams() {
+        let rst = 8u32.to_be_bytes();
+        let mut c = Client::new(250);
+        for i in 0..250u32 {
+            assert!(c.get(1 + 2 * i, GET).is_empty());
+            let seq = c.seq - 1;
+            assert!(start(&mut c, seq, b"", b"x").0);
+            c.send(frame::RST_STREAM, 0, 1 + 2 * i, &rst);
+        }
+        assert_eq!(c.h2.zombies.len(), 250);
+        for i in 250..650u32 {
+            let fs = c.get(1 + 2 * i, GET);
+            assert_eq!(code(&fs), frame::REFUSED_STREAM, "{i}");
+        }
+        assert_eq!(c.recs.len(), 250, "Dart work stays bounded");
+        assert!(!c.h2.over());
+    }
+
+    /// A real gRPC client after a mass cancel: 250 calls in flight, it
+    /// cancels all of them, sends 250 new ones (refused, as the zombies
+    /// fill the slots) and retries each once. Then Dart ends the lost
+    /// handlers and the next calls go through. Three waves, no GOAWAY.
+    #[test]
+    fn a_mass_cancel_does_not_cut_a_real_grpc_client() {
+        let rst = 8u32.to_be_bytes();
+        let mut c = Client::new(250);
+        let mut id = 1;
+        for _ in 0..3 {
+            next_second(&mut c);
+            let first = id;
+            for _ in 0..250 {
+                assert!(c.get(id, GET).is_empty(), "refused");
+                id += 2;
+            }
+            for i in 0..250 {
+                c.send(frame::RST_STREAM, 0, first + 2 * i, &rst);
+            }
+            // the new calls, and one retry each
+            for _ in 0..500 {
+                assert_eq!(code(&c.get(id, GET)), frame::REFUSED_STREAM);
+                id += 2;
+            }
+            assert!(!c.h2.over());
+            dart_ends(&mut c);
+        }
+        assert!(c.get(id, GET).is_empty(), "accepted");
+        assert!(!c.h2.over());
     }
 
     /// A late answer of Dart frees the slot of a request the client reset:
