@@ -299,6 +299,8 @@ Future<NativeHttpServer> start(int port, {int maxBodySize = 1024}) async {
   NativeHttpServer server = await NativeHttpServer.bind(
     port,
     maxBodySize: maxBodySize,
+    // CI runs these HTTP/1.1 tests once more with HTTP/2 on
+    http2: Platform.environment['DOX_TEST_HTTP2'] == '1',
   );
   server.listen(handle);
   return server;

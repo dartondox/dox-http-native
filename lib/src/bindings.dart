@@ -15,7 +15,9 @@ external int doxInit(Pointer<Void> dlData);
 /// Binds [port] and starts the idle helper, which posts to [sendPort].
 /// [family] 0 is all interfaces, 4 is IPv4 (in [addrLo]), 6 is IPv6.
 /// [maxConnections] 0 is no limit. A connection with no request for
-/// [idleTimeoutMs] closes. Returns a handle for [doxRun].
+/// [idleTimeoutMs] closes. With [http2], a connection that starts with the
+/// HTTP/2 preface speaks HTTP/2 (at most [maxStreams] open streams).
+/// Returns a handle for [doxRun].
 @Native<
   Int64 Function(
     Int32,
@@ -27,6 +29,8 @@ external int doxInit(Pointer<Void> dlData);
     Uint64,
     Uint64,
     Int64,
+    Int64,
+    Bool,
     Int64,
   )
 >(symbol: 'dox_bind')
@@ -41,6 +45,8 @@ external int doxBind(
   int addrLo,
   int maxConnections,
   int idleTimeoutMs,
+  bool http2,
+  int maxStreams,
 );
 
 @Native<Int32 Function(Int64)>(symbol: 'dox_bound_port', isLeaf: true)

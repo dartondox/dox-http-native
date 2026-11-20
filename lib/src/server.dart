@@ -95,6 +95,11 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   /// A client that closed its sending side (a half-close) waits at most
   /// [idleTimeout] for its answer: with no write in that time the
   /// connection closes. Raise it when such clients call slow handlers.
+  /// With [http2], the same port also speaks HTTP/2 over plain TCP (h2c
+  /// with prior knowledge, no TLS): a connection that starts with the
+  /// HTTP/2 preface is HTTP/2, any other is HTTP/1.1. One HTTP/2
+  /// connection has at most [maxConcurrentStreams] open requests. Default:
+  /// off. For now an HTTP/2 request may not have a body (it gets 501).
   static Future<NativeHttpServer> bind(
     int port, {
     Object? address,
@@ -103,6 +108,8 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
     Duration bodyTimeout = const Duration(seconds: 120),
     int? maxConnections,
     Duration idleTimeout = const Duration(seconds: 30),
+    bool http2 = false,
+    int maxConcurrentStreams = 250,
   }) async {
     ensureAvailable();
     if (port < 0 || port > 65535) {
@@ -113,6 +120,13 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
         maxConnections,
         'maxConnections',
         'must be 1 or more',
+      );
+    }
+    if (maxConcurrentStreams < 1 || maxConcurrentStreams > 0x7fffffff) {
+      throw ArgumentError.value(
+        maxConcurrentStreams,
+        'maxConcurrentStreams',
+        'must be 1 to 2^31 - 1',
       );
     }
     if (idleTimeout <= Duration.zero) {
@@ -153,6 +167,8 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
       lo,
       maxConnections ?? 0,
       idleTimeout.inMilliseconds,
+      http2,
+      maxConcurrentStreams,
     );
     if (handle <= 0) {
       receive.close();
@@ -422,6 +438,7 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
           ip,
           remotePort,
           http10: flags & 1 == 1,
+          http2: flags & 8 == 8,
           isWebSocketUpgrade: flags & 2 == 2,
         );
         _batch.add(req);

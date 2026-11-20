@@ -128,13 +128,14 @@ static CANON: Canon = build();
 /// Decodes the Huffman string `src` and adds the bytes to `out`.
 ///
 /// Errors: EOS inside the data, padding over 7 bits or not all ones
-/// (`BadHuffman`), and more than `room` bytes in `out` (`ListTooLarge`).
-/// It stops at once, so a bomb never grows `out` past `room`.
+/// (`BadHuffman`). Only the first `room` bytes go to `out`, so a bomb never
+/// grows it past `room`. Gives the full decoded length.
 ///
 /// ponytail: one bit per step. A nibble table is faster; add it when
 /// header decoding shows up in a profile.
-pub(super) fn decode(src: &[u8], out: &mut Vec<u8>, room: usize) -> Result<(), HpackError> {
+pub(super) fn decode(src: &[u8], out: &mut Vec<u8>, room: usize) -> Result<usize, HpackError> {
     let mut code = 0u32;
+    let mut total = 0usize;
     let mut len = 0usize;
     for &byte in src {
         for shift in (0..8).rev() {
@@ -146,10 +147,10 @@ pub(super) fn decode(src: &[u8], out: &mut Vec<u8>, room: usize) -> Result<(), H
                 if sym == 256 {
                     return Err(HpackError::BadHuffman);
                 }
-                if out.len() >= room {
-                    return Err(HpackError::ListTooLarge);
+                if out.len() < room {
+                    out.push(sym as u8);
                 }
-                out.push(sym as u8);
+                total += 1;
                 code = 0;
                 len = 0;
             } else if len == MAX_BITS {
@@ -161,5 +162,5 @@ pub(super) fn decode(src: &[u8], out: &mut Vec<u8>, room: usize) -> Result<(), H
     if len > 7 || code != (1 << len) - 1 {
         return Err(HpackError::BadHuffman);
     }
-    Ok(())
+    Ok(total)
 }

@@ -2,8 +2,8 @@ name: Fuzz
 
 # Runs each fuzz target in native/fuzz for 60 s (inputs up to 32 KB, so
 # the 16 KB head and trailer limits are reached): the HTTP request parser,
-# the chunked body reader, a whole connection, the cookie decryption and
-# the HTTP/2 header decoder (HPACK).
+# the chunked body reader, a whole connection, the cookie decryption,
+# the HTTP/2 header decoder (HPACK) and a whole HTTP/2 connection.
 # See the README. A crash or a failed check fails the run and uploads the
 # input that caused it.
 
@@ -28,7 +28,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [parse_head, chunked_body, conn, aead_open, hpack]
+        target: [parse_head, chunked_body, conn, aead_open, hpack, h2_conn]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

@@ -1,6 +1,7 @@
 ## Unreleased
 
 - New (internal): an HPACK decoder and encoder (RFC 7541), the header compression of HTTP/2. Nothing uses it yet; it is the first step to HTTP/2 and gRPC. It is tested with all RFC 7541 Appendix C examples and has a new fuzz target, `hpack`.
+- New (in progress): HTTP/2 over plain TCP (h2c with prior knowledge). `NativeHttpServer.bind(port, http2: true)` makes the same port speak HTTP/1.1 and HTTP/2: a connection that starts with the HTTP/2 preface is HTTP/2. It is off by default; when it is off nothing changes. Handlers stay the same. `request.protocolVersion` is `2.0`, and answers go out in any order. `maxConcurrentStreams` (default 250) caps the open requests of one connection; more get `REFUSED_STREAM`. A graceful `close()` sends GOAWAY and lets open streams finish. Not yet: request bodies (they get `501`), streamed answers (the stream is reset) and trailers. New fuzz target `h2_conn`.
 
 ## 3.2.1
 
