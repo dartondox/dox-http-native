@@ -67,3 +67,10 @@ path = "fuzz_targets/aead_open.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "hpack"
+path = "fuzz_targets/hpack.rs"
+test = false
+doc = false
+bench = false

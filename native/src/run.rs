@@ -2922,6 +2922,11 @@ pub mod fuzz {
     use crate::aead;
     use std::sync::OnceLock;
 
+    /// HPACK: see `h2::hpack::fuzz`.
+    pub fn hpack(data: &[u8]) {
+        crate::h2::hpack::fuzz(data)
+    }
+
     /// The defaults of `NativeHttpServer.bind` in lib/src/server.dart
     /// (`maxBodySize`, `maxMultipartSize`, `bodyTimeout`, `idleTimeout`).
     /// Keep them the same when those change.
