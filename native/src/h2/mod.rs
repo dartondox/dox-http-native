@@ -10,14 +10,15 @@
 //!
 //! A request body is read whole before Dart gets the request (buffered,
 //! like HTTP/1.1). Streamed answers (kind 6, 7, 8) go out as DATA frames
-//! under the send windows. No flood limits yet (plan 4.10, PR 2c).
+//! under the send windows. Floods of small frames get GOAWAY
+//! ENHANCE_YOUR_CALM (plan 4.10): see the `MAX_*` limits below.
 
 pub(crate) mod frame;
 pub(crate) mod hpack;
 mod huffman;
 mod stream;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use frame::{Error, Frame, Head};
@@ -42,11 +43,39 @@ const CONN_WINDOW: i64 = 16 << 20;
 const DEFAULT_WINDOW: i64 = 65_535;
 /// The HPACK table size we allow the client (the default 4096).
 const TABLE_SIZE: usize = 4096;
-/// The largest MAX_FRAME_SIZE a client may set (RFC 9113 6.5.2).
 /// How many reset stream ids we remember.
 const RESETS: usize = 64;
-
+/// The largest MAX_FRAME_SIZE a client may set (RFC 9113 6.5.2).
 const MAX_FRAME_LIMIT: u32 = (1 << 24) - 1;
+
+// Flood limits (plan 4.10). Over one: GOAWAY ENHANCE_YOUR_CALM, then close.
+// "Per second" counts in windows of one second (see [Rate]).
+
+/// Resets and refusals: a token bucket. Each of these takes one token:
+/// RST_STREAM of the client, our RST_STREAM for a stream error of the
+/// client, and a HEADERS or DATA we refuse (they cost an HPACK decode).
+/// Rapid Reset (CVE-2023-44487) and "made you reset" (CVE-2025-8671) make
+/// the server start work and drop it at once.
+///
+/// The bucket holds a burst of `max(2 * max_streams, RESET_BURST_MIN)`, so
+/// a client or proxy that cancels all its calls at once is not cut. It
+/// refills `RESET_RATE` tokens a second: only a flood that goes on is cut.
+const RESET_BURST_MIN: u32 = 1000;
+/// Tokens that come back each second (the sustained rate of resets).
+const RESET_RATE: f64 = 100.0;
+/// SETTINGS frames per second.
+const MAX_SETTINGS: u32 = 100;
+/// SETTINGS whose ACK is not written yet: the client does not read.
+const MAX_UNACKED_SETTINGS: u32 = 10;
+/// PINGs per second. DATA we send starts the count again: grpc-go sends
+/// a PING (for its window estimate) each time DATA comes to it.
+const MAX_PINGS: u32 = 100;
+/// PING ACKs not written yet (17 bytes each): the client does not read.
+const MAX_UNACKED_PINGS: u32 = 100;
+/// Frames in a row that carry no work (see `no_work`), with no HEADERS or
+/// DATA between: eg. empty DATA or CONTINUATION, PRIORITY, unknown types.
+const MAX_EMPTY: u32 = 100;
+
 /// How many full-size uploads one connection may hold at once. The memory
 /// stays bounded at this many times one HTTP/1.1 connection.
 const BODY_STREAMS_CAP: usize = 4;
@@ -63,6 +92,55 @@ const MAX_CONCURRENT_STREAMS: u16 = 3;
 const INITIAL_WINDOW_SIZE: u16 = 4;
 const MAX_FRAME_SIZE: u16 = 5;
 const MAX_HEADER_LIST_SIZE: u16 = 6;
+
+/// A token bucket (see `RESET_RATE`).
+struct Bucket {
+    tokens: f64,
+    at: Instant,
+}
+
+impl Bucket {
+    fn new(now: Instant, burst: f64) -> Self {
+        Bucket {
+            tokens: burst,
+            at: now,
+        }
+    }
+
+    /// Takes one token at `now`. False when the bucket is empty.
+    fn take(&mut self, now: Instant, burst: f64) -> bool {
+        let gone = now.saturating_duration_since(self.at).as_secs_f64();
+        self.at = self.at.max(now);
+        self.tokens = (self.tokens + gone * RESET_RATE).min(burst);
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
+}
+
+/// A count of frames in the current one-second window.
+#[derive(Clone, Copy)]
+struct Rate {
+    start: Instant,
+    n: u32,
+}
+
+impl Rate {
+    fn new(now: Instant) -> Self {
+        Rate { start: now, n: 0 }
+    }
+
+    /// Counts one frame at `now`. True when this second has more than `max`.
+    fn over(&mut self, now: Instant, max: u32) -> bool {
+        if now.saturating_duration_since(self.start) >= Duration::from_secs(1) {
+            *self = Rate::new(now);
+        }
+        self.n += 1;
+        self.n > max
+    }
+}
 
 const fn conn_err(code: u32) -> Error {
     Error {
@@ -118,10 +196,17 @@ pub(crate) struct H2 {
     /// streams are not in it (RFC 9113 6.8)
     last: u32,
     /// the last streams we reset or refused: frames of the client that
-    /// were already on their way are ignored (RFC 9113 5.1)
-    /// (also the streams the client reset). Up to `max_streams` (at least
-    /// [RESETS]), so one round trip of resets fits.
+    /// were already on their way are ignored (RFC 9113 5.1). Up to
+    /// `max_streams` (at least [RESETS]), so one round trip of resets fits.
     resets: VecDeque<u32>,
+    /// the same ids as `resets`, for a fast `contains`
+    resets_set: HashSet<u32>,
+    /// the last open streams the client reset. A frame on one of them is a
+    /// stream error STREAM_CLOSED (RFC 9113 5.1). Apart from `resets`, and
+    /// only for streams that were open, so RSTs on closed ids add nothing.
+    client_resets: VecDeque<u32>,
+    /// the same ids as `client_resets`, for a fast `contains`
+    client_resets_set: HashSet<u32>,
     /// request body bytes buffered in all streams (see `data`)
     buffered: usize,
     /// we sent GOAWAY NO_ERROR: no new streams
@@ -144,6 +229,20 @@ pub(crate) struct H2 {
     /// streamed answers whose stream ended before Dart's end: Dart gets
     /// STREAM_GONE for each
     pub(crate) gone_streams: Vec<u64>,
+    /// flood counters, see the `MAX_*` limits
+    reset_bucket: Bucket,
+    reset_burst: f64,
+    settings_rate: Rate,
+    pings_rate: Rate,
+    unacked_settings: u32,
+    unacked_pings: u32,
+    empty: u32,
+    /// the current frame did real work / counts toward `empty`
+    worked: bool,
+    counted: bool,
+    /// a stream opened or closed: the idle time starts again. PING and
+    /// SETTINGS ACKs do not count (see `service` in run.rs).
+    pub(crate) stirred: bool,
 }
 
 impl H2 {
@@ -167,6 +266,8 @@ impl H2 {
             ],
         );
         frame::write_window(out, 0, (CONN_WINDOW - DEFAULT_WINDOW) as u32);
+        let now = Instant::now();
+        let burst = f64::from((2 * max_streams).max(RESET_BURST_MIN));
         Box::new(H2 {
             base: (idx as u64) << 32,
             peer,
@@ -174,7 +275,7 @@ impl H2 {
             max_streams: max_streams as usize,
             max_body,
             max_multipart,
-            now: Instant::now(),
+            now,
             greeted: false,
             peer_frame: MAX_FRAME,
             peer_window: DEFAULT_WINDOW,
@@ -185,6 +286,9 @@ impl H2 {
             seen: 0,
             last: 0,
             resets: VecDeque::new(),
+            resets_set: HashSet::new(),
+            client_resets: VecDeque::new(),
+            client_resets_set: HashSet::new(),
             buffered: 0,
             away: false,
             peer_away: false,
@@ -195,7 +299,23 @@ impl H2 {
             held: None,
             gone: Vec::new(),
             gone_streams: Vec::new(),
+            reset_bucket: Bucket::new(now, burst),
+            reset_burst: burst,
+            settings_rate: Rate::new(now),
+            pings_rate: Rate::new(now),
+            unacked_settings: 0,
+            unacked_pings: 0,
+            empty: 0,
+            worked: false,
+            counted: false,
+            stirred: false,
         })
+    }
+
+    /// Bytes went out to the client: our ACKs are on their way.
+    pub(crate) fn flushed(&mut self) {
+        self.unacked_settings = 0;
+        self.unacked_pings = 0;
     }
 
     /// Streams whose answer is not all sent.
@@ -343,8 +463,11 @@ impl H2 {
         let payload = &buf[*pos + frame::HEAD..end];
         *pos = end;
         if let Err(e) = self.frame(&h, payload, out, seq, date) {
-            if e.stream {
+            // a stream error counts as a reset (CVE-2025-8671)
+            if e.stream && self.spend().is_ok() {
                 self.reset(out, h.id, e.code);
+            } else if e.stream {
+                self.fail(out, frame::ENHANCE_YOUR_CALM);
             } else {
                 self.fail(out, e.code);
             }
@@ -352,7 +475,31 @@ impl H2 {
         true
     }
 
+    /// One frame. A frame that counts (see `counts`) and did no work adds
+    /// one to the empty count. Work sets it to 0.
     fn frame(
+        &mut self,
+        h: &Head,
+        p: &[u8],
+        out: &mut Vec<u8>,
+        seq: &mut u32,
+        date: &[u8],
+    ) -> Result<(), Error> {
+        self.worked = false;
+        self.counted = false;
+        self.dispatch(h, p, out, seq, date)?;
+        if self.worked {
+            self.empty = 0;
+        } else if self.counted {
+            self.empty += 1;
+            if self.empty > MAX_EMPTY {
+                return Err(conn_err(frame::ENHANCE_YOUR_CALM));
+            }
+        }
+        Ok(())
+    }
+
+    fn dispatch(
         &mut self,
         h: &Head,
         p: &[u8],
@@ -374,7 +521,9 @@ impl H2 {
         {
             return Err(conn_err(frame::PROTOCOL_ERROR));
         }
-        match frame::parse(h, p)? {
+        let f = frame::parse(h, p)?;
+        self.counted = Self::counts(&f);
+        match f {
             Frame::Data { end, data, flow } => self.data(h.id, data, flow, end, out, date),
             Frame::Headers {
                 end_stream,
@@ -389,8 +538,11 @@ impl H2 {
                     return Err(conn_err(frame::PROTOCOL_ERROR));
                 }
                 match self.state(h.id) {
-                    // a stream we reset: ignored after the decode
-                    State::Closed if self.resets.contains(&h.id) => {}
+                    // a stream we or the client reset: after the decode
+                    // (see `request`)
+                    State::Closed
+                        if self.client_resets_set.contains(&h.id)
+                            || self.resets_set.contains(&h.id) => {}
                     State::Closed => return Err(conn_err(frame::STREAM_CLOSED)),
                     // trailers, or an error after the decode (the table
                     // must stay in sync): see `request`
@@ -426,13 +578,31 @@ impl H2 {
                 if self.state(h.id) == State::Idle {
                     return Err(conn_err(frame::PROTOCOL_ERROR));
                 }
-                // its DATA may still be on its way: ignored (RFC 9113 5.1)
-                self.remember(h.id);
+                // also on a closed stream: it costs us the same
+                self.spend()?;
+                // an open stream is remembered: a later frame on it is
+                // STREAM_CLOSED (RFC 9113 5.1). A closed id is not, so
+                // RSTs on closed ids fill nothing.
+                if self.streams.contains_key(&h.id) && !self.client_resets_set.contains(&h.id) {
+                    if self.client_resets.len() >= self.max_streams.max(RESETS)
+                        && let Some(old) = self.client_resets.pop_front()
+                    {
+                        self.client_resets_set.remove(&old);
+                    }
+                    self.client_resets.push_back(h.id);
+                    self.client_resets_set.insert(h.id);
+                }
                 self.drop_stream(h.id);
                 Ok(())
             }
             Frame::Settings { ack: true, .. } => Ok(()),
             Frame::Settings { params, .. } => {
+                self.unacked_settings += 1;
+                if self.settings_rate.over(self.now, MAX_SETTINGS)
+                    || self.unacked_settings > MAX_UNACKED_SETTINGS
+                {
+                    return Err(conn_err(frame::ENHANCE_YOUR_CALM));
+                }
                 self.settings(params)?;
                 frame::write(out, frame::SETTINGS, frame::ACK, 0, &[]);
                 Ok(())
@@ -441,6 +611,12 @@ impl H2 {
             Frame::PushPromise { .. } => Err(conn_err(frame::PROTOCOL_ERROR)),
             Frame::Ping { ack: true, .. } => Ok(()),
             Frame::Ping { data, .. } => {
+                self.unacked_pings += 1;
+                if self.pings_rate.over(self.now, MAX_PINGS)
+                    || self.unacked_pings > MAX_UNACKED_PINGS
+                {
+                    return Err(conn_err(frame::ENHANCE_YOUR_CALM));
+                }
                 frame::write(out, frame::PING, frame::ACK, 0, &data);
                 Ok(())
             }
@@ -451,6 +627,34 @@ impl H2 {
             }
             Frame::WindowUpdate { inc } => self.window_update(h.id, inc),
             Frame::Unknown => Ok(()),
+        }
+    }
+
+    /// True for a frame that counts toward `MAX_EMPTY`: HEADERS, empty DATA,
+    /// empty CONTINUATION, PRIORITY, an unknown type. The count starts
+    /// again only when real work is done: a HEADERS that opens a stream,
+    /// DATA with bytes or END_STREAM on an open stream (see `request` and
+    /// `data`). The rest have their own limits or are normal in a row.
+    /// WINDOW_UPDATE is one: package:http2 sends one for each DATA it got,
+    /// also after the stream ended. DATA with bytes is one too: it is
+    /// bounded by the receive window, and after we reset an upload (413)
+    /// a whole window of it may still be in flight.
+    fn counts(f: &Frame) -> bool {
+        match f {
+            Frame::Continuation { block, .. } => block.is_empty(),
+            Frame::Data { data, .. } => data.is_empty(),
+            Frame::Headers { .. } | Frame::Priority { .. } | Frame::Unknown => true,
+            _ => false,
+        }
+    }
+
+    /// Takes a token of the reset bucket: the client costs us a reset or a
+    /// refusal. Empty bucket: ENHANCE_YOUR_CALM.
+    fn spend(&mut self) -> Result<(), Error> {
+        if self.reset_bucket.take(self.now, self.reset_burst) {
+            Ok(())
+        } else {
+            Err(conn_err(frame::ENHANCE_YOUR_CALM))
         }
     }
 
@@ -483,9 +687,14 @@ impl H2 {
             self.recv = CONN_WINDOW;
         }
         if state == State::Closed {
-            // DATA of a stream we reset may still be on its way: ignored.
-            // On a stream that ended it is an error (RFC 9113 5.1).
-            if self.resets.contains(&id) {
+            // After its own RST_STREAM the client may not send DATA: a
+            // stream error (RFC 9113 5.1). DATA of a stream we reset may
+            // still be on its way: ignored. On a stream that ended it is
+            // a connection error.
+            if self.client_resets_set.contains(&id) {
+                return Err(stream_err(frame::STREAM_CLOSED));
+            }
+            if self.resets_set.contains(&id) {
                 return Ok(());
             }
             return Err(conn_err(frame::STREAM_CLOSED));
@@ -507,6 +716,7 @@ impl H2 {
         }
         if got > r.max as u64 {
             // only this stream ends, the connection goes on
+            self.spend()?;
             self.reply(out, id, 413, false, date);
             self.drop_stream(id);
             return Ok(());
@@ -520,8 +730,12 @@ impl H2 {
                 .max(self.max_multipart)
                 .saturating_mul(BODY_STREAMS_CAP)
         {
+            self.spend()?;
             self.reset(out, id, frame::REFUSED_STREAM);
             return Ok(());
+        }
+        if !data.is_empty() || end {
+            self.worked = true;
         }
         self.buffered += data.len();
         r.data.extend_from_slice(data);
@@ -620,12 +834,22 @@ impl H2 {
         };
         // any HPACK error leaves our table out of sync with the client's:
         // the connection must close
+        // a decode we drop costs a token (the client's own reset costs
+        // one as a stream error)
+        if closed && !self.client_resets_set.contains(&id) {
+            self.spend()?;
+        }
         let list = self
             .dec
             .decode(block, MAX_HEAD, |n, v| req.field(n, v))
             .map_err(|_| conn_err(frame::COMPRESSION_ERROR))?;
         if closed {
-            return Ok(()); // a stream we reset (see `frame`)
+            // the client reset it: STREAM_CLOSED. We reset it: ignored.
+            return if self.client_resets_set.contains(&id) {
+                Err(stream_err(frame::STREAM_CLOSED))
+            } else {
+                Ok(())
+            };
         }
         match known {
             Some(false) => return Err(stream_err(frame::STREAM_CLOSED)),
@@ -639,10 +863,15 @@ impl H2 {
         }
         self.seen = id;
         if self.away || self.peer_away {
+            self.spend()?;
             self.remember(id);
+            // a flood is bounded by the bucket, not by the empty count: a
+            // busy client has many requests in flight after our GOAWAY
+            self.counted = false;
             return Ok(()); // after GOAWAY: ignored (RFC 9113 6.8)
         }
         if self.streams.len() >= self.max_streams {
+            self.spend()?;
             frame::write_rst(out, id, frame::REFUSED_STREAM);
             self.remember(id);
             return Ok(());
@@ -656,6 +885,7 @@ impl H2 {
         match check {
             Check::Bad => Err(stream_err(frame::PROTOCOL_ERROR)),
             Check::Status(status) => {
+                self.spend()?;
                 self.reply(out, id, status, end_stream, date);
                 Ok(())
             }
@@ -668,6 +898,7 @@ impl H2 {
                 let length = req.length;
                 if length.is_some_and(|l| l > max as u64) {
                     // too big: say no before the body comes
+                    self.spend()?;
                     self.reply(out, id, 413, false, date);
                     return Ok(());
                 }
@@ -688,6 +919,8 @@ impl H2 {
                 };
                 let s = Stream::new(*seq, self.peer_window, head, recv);
                 self.streams.insert(id, s);
+                self.stirred = true;
+                self.worked = true;
                 self.seqs.insert(*seq, id);
                 *seq = seq.wrapping_add(1);
                 Ok(())
@@ -712,10 +945,18 @@ impl H2 {
 
     /// Notes that we reset stream `id`. Only the last [RESETS] are kept.
     fn remember(&mut self, id: u32) {
-        if self.resets.len() >= self.max_streams.max(RESETS) {
-            self.resets.pop_front();
+        // already kept: a second copy would leave the set short when the
+        // first one is evicted
+        if self.resets_set.contains(&id) {
+            return;
+        }
+        if self.resets.len() >= self.max_streams.max(RESETS)
+            && let Some(old) = self.resets.pop_front()
+        {
+            self.resets_set.remove(&old);
         }
         self.resets.push_back(id);
+        self.resets_set.insert(id);
     }
 
     /// A stream error: RST_STREAM, and the stream is gone.
@@ -727,6 +968,7 @@ impl H2 {
 
     fn drop_stream(&mut self, id: u32) {
         if let Some(s) = self.streams.remove(&id) {
+            self.stirred = true;
             if s.turn {
                 self.turns.retain(|&t| t != id);
             }
@@ -970,6 +1212,7 @@ impl H2 {
             s.sent += k;
             s.stalled = None; // bytes moved: the stall clock starts again
             self.data_sent += k as u64;
+            self.pings_rate.n = 0; // see MAX_PINGS
             s.window -= k as i64;
             self.window -= k as i64;
             if let Some(sid) = s.sid {

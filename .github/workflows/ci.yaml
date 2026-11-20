@@ -60,6 +60,49 @@ jobs:
           # the HTTP/1.1 tests again, with HTTP/2 on: nothing may change
           DOX_TEST_HTTP2=1 dart test --concurrency=1 test/server_test.dart
 
+  # HTTP/2 conformance: h2spec (strict) against a small Dart server with
+  # `http2: true` (tool/h2spec_server.dart). All tests must pass but one:
+  # 3.5/2 sends a bad preface. On a port with HTTP/2 and HTTP/1.1, a bad
+  # preface is not HTTP/2, so it goes to HTTP/1.1 and gets 400 (by design,
+  # not a GOAWAY). h2spec has no exclude flag, so the job lists all specs
+  # with 3.5/1 alone in place of 3.5.
+  h2spec:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: native
+      - uses: dart-lang/setup-dart@2286a0c042b44434fe26d292bbce8d34f7ec662b # v1.8.2
+        with:
+          sdk: stable
+      - name: Build
+        working-directory: native
+        run: cargo build --release
+      - name: Start the server
+        run: |
+          dart pub get
+          dart run tool/h2spec_server.dart 8080 > server.log 2>&1 &
+          for _ in $(seq 60); do grep -q listening server.log && exit 0; sleep 1; done
+          cat server.log
+          exit 1
+      - name: h2spec
+        env:
+          H2SPEC: summerwind/h2spec:2.6.0@sha256:5f4a65c30cae8569558ced048b4bfe0dcf01a221e36767ae504ccd8348a7aeb0
+        run: |
+          run() { docker run --rm --network host "$H2SPEC" -p 8080 -P /stream --strict "$@"; }
+          run generic hpack http2/3.5/1 http2/4 http2/5 http2/6 http2/7 http2/8
+          # a failed test must fail the job: 3.5/2 fails by design (above)
+          if run http2/3.5/2 > /dev/null; then
+            echo "::error::h2spec did not fail on a failed test"
+            exit 1
+          fi
+
   build:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: test
