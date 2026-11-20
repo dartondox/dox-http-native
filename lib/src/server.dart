@@ -730,8 +730,11 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   void sendPart(int id, List<int> data) {
     if (_handle == 0 || data.isEmpty) return;
     _partsWaiting = true;
-    _endRecord(_startRecord(id, 0, 7), data);
-    _partsWaiting = false;
+    try {
+      _endRecord(_startRecord(id, 0, 7), data);
+    } finally {
+      _partsWaiting = false;
+    }
   }
 
   /// true only while [sendPart] queues a record, see [_schedulePump].

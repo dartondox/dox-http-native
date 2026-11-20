@@ -146,7 +146,9 @@ void handle(HttpRequest req) async {
       room.add(nr.hasRoom);
       res.write(room.join(','));
     case '/many-parts':
-      // 300 parts from a generator: all go out, in order
+      // flush first: the stream starts, so every part goes through sendPart
+      res.write('start,');
+      await res.flush();
       await res.addStream(manyParts());
     case '/flush-then-stream':
       res.write('a');
@@ -396,7 +398,7 @@ Stream<List<int>> manyParts() async* {
 
 /// what [manyParts] adds up to
 String manyPartsText() =>
-    '${<int>[for (int i = 0; i < 300; i++) i].join(',')},';
+    'start,${<int>[for (int i = 0; i < 300; i++) i].join(',')},';
 
 void main() {
   late NativeHttpServer server;
