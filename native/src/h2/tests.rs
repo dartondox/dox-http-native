@@ -2326,6 +2326,28 @@ mod conn {
         assert_eq!(c.h2.stall_since(), None);
     }
 
+    /// The stall timer fires on a connection that had no frames for a long
+    /// time. The zombie of the cancelled answer starts at the cancel, not at
+    /// the last frame: it counts for the full ZOMBIE_WAIT.
+    #[test]
+    fn a_stall_cancel_zombie_counts_from_the_cancel() {
+        let mut c = Client::new(1);
+        let t0 = c.now;
+        c.get(1, GET);
+        assert!(start(&mut c, 0, b"", &vec![1u8; 100_000]).0);
+        c.h2.stall_mark(t0);
+        let mut out = Vec::new();
+        let cancel = t0 + SEND_WAIT;
+        c.h2.expire(cancel, SEND_WAIT, SEND_WAIT, DATE, &mut out);
+        assert_eq!(code(&frames(&out)), frame::CANCEL);
+        assert_eq!(c.h2.zombies.len(), 1);
+        c.now = cancel + ZOMBIE_WAIT - Duration::from_secs(1);
+        assert_eq!(code(&c.get(3, GET)), frame::REFUSED_STREAM);
+        assert_eq!(c.h2.zombies.len(), 1);
+        c.now = cancel + ZOMBIE_WAIT;
+        assert!(c.get(5, GET).is_empty(), "room again");
+    }
+
     /// A stream that drained and then stalls again gets a fresh clock.
     #[test]
     fn a_stall_after_a_drain_starts_a_fresh_clock() {

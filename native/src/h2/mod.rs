@@ -484,6 +484,9 @@ impl H2 {
         if self.dead {
             return; // no frame after a GOAWAY with an error
         }
+        // a connection with no frames has an old `now`: `drop_stream`
+        // stamps its zombies with it
+        self.now = now;
         // each timer source must change its state here, or the timer
         // would run again at once
         let mut dull = Vec::new();
