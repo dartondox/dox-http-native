@@ -35,6 +35,10 @@ Completer<void> goneSeen = Completer<void>();
 /// `/gone-normal`: did `gone` complete after a normal answer?
 bool goneAfterAnswer = false;
 
+/// `/hold` (a normal route that never reads its body) answers once this
+/// completes.
+Completer<void> hold = Completer<void>();
+
 /// The error the body stream of `/grpc-reset` ended with.
 Completer<Object> bodyError = Completer<Object>();
 
@@ -147,6 +151,9 @@ void handle(HttpRequest req) async {
       res.write('start,');
       await res.flush();
       await res.addStream(manyParts());
+    case '/hold':
+      await hold.future;
+      res.write('held');
     case '/proto':
       res.write('${req.protocolVersion} ${req.persistentConnection}');
     case '/empty':
@@ -690,6 +697,119 @@ void main() {
       }
     }
     expect(trailers, <String, String>{'grpc-status': '0'});
+  });
+
+  test(
+    'unread gRPC bodies on a normal route do not freeze other uploads',
+    () async {
+      ClientTransportConnection shared = await connect(server.port);
+      List<Future<Answer>> held = <Future<Answer>>[];
+      // 16 x 1 MiB with content-type application/grpc to a route that never
+      // reads: they used to hold the whole 16 MiB connection window
+      for (int i = 0; i < 16; i++) {
+        ClientTransportStream s = shared.makeRequest(<Header>[
+          Header.ascii(':method', 'POST'),
+          Header.ascii(':scheme', 'http'),
+          Header.ascii(':path', '/hold'),
+          Header.ascii('content-type', 'application/grpc'),
+        ]);
+        s.sendData(bytes(1 << 20));
+        held.add(answerOf(s));
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      // a JSON POST on the same connection still goes through
+      List<int> json = utf8.encode(
+        '[${List<String>.filled(50000, '1').join(',')}]',
+      );
+      Answer a = await request(
+        shared,
+        '/echo',
+        method: 'POST',
+        extra: <Header>[Header.ascii('content-type', 'application/json')],
+        body: json,
+      ).timeout(const Duration(seconds: 10));
+      expect(utf8.decode(a.body), startsWith('${json.length} '));
+      hold.complete();
+      for (Answer h in await Future.wait(held)) {
+        expect(utf8.decode(h.body), 'held');
+      }
+      await shared.finish();
+    },
+  );
+
+  test(
+    'too many resets drain the connection, open requests still finish',
+    () async {
+      NativeHttpServer small = await NativeHttpServer.bind(
+        0,
+        address: '127.0.0.1',
+        http2: true,
+        http2ResetBurst: 30,
+        http2ResetRate: 0,
+      );
+      Completer<void> slow = Completer<void>();
+      small.listen((HttpRequest req) async {
+        if (req.uri.path == '/slow') await slow.future;
+        req.response.write('done ${req.uri.path}');
+        await req.response.close();
+      });
+      ClientTransportConnection proxy = await connect(small.port);
+      // another user's slow request on the same connection
+      Future<Answer> sibling = request(proxy, '/slow');
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      // one user cancels a lot
+      for (int i = 0; i < 40; i++) {
+        proxy.makeRequest(<Header>[
+          Header.ascii(':method', 'GET'),
+          Header.ascii(':scheme', 'http'),
+          Header.ascii(':path', '/'),
+        ], endStream: true).terminate();
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      expect(proxy.isOpen, isFalse, reason: 'GOAWAY came');
+      slow.complete();
+      Answer a = await sibling.timeout(const Duration(seconds: 5));
+      expect(a.status, 200);
+      expect(utf8.decode(a.body), 'done /slow');
+      await proxy.finish();
+      await small.close();
+    },
+  );
+
+  test('http2ResetBurst and http2ResetRate are checked at bind', () async {
+    await expectLater(
+      NativeHttpServer.bind(0, http2: true, http2ResetBurst: 0),
+      throwsArgumentError,
+    );
+    await expectLater(
+      NativeHttpServer.bind(0, http2: true, http2ResetRate: -1),
+      throwsArgumentError,
+    );
+    // the smallest values are fine: one reset, no refill
+    NativeHttpServer tiny = await NativeHttpServer.bind(
+      0,
+      address: '127.0.0.1',
+      http2: true,
+      http2ResetBurst: 1,
+      http2ResetRate: 0,
+    );
+    tiny.listen((HttpRequest req) => req.response.close());
+    ClientTransportConnection t = await connect(tiny.port);
+    expect((await request(t, '/')).status, 200);
+    await t.finish();
+    await tiny.close();
+  });
+
+  test('a 20 KB header block gets 431, the connection goes on', () async {
+    ClientTransportConnection big = await connect(server.port);
+    Answer a = await request(
+      big,
+      '/',
+      extra: <Header>[Header.ascii('x-big', 'a' * 20000)],
+    );
+    expect(a.status, 431);
+    expect((await request(big, '/')).status, 200);
+    await big.finish();
   });
 
   test('one port serves HTTP/1.1 and HTTP/2', () async {

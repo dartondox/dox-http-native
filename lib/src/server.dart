@@ -102,6 +102,20 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   /// request the client reset counts until its handler ends the response
   /// (at most 30 seconds). Default: off. An HTTP/2 request body has the
   /// same limits as on HTTP/1.1.
+  ///
+  /// [http2ResetBurst] and [http2ResetRate] limit stream resets on one
+  /// HTTP/2 connection (Rapid Reset, CVE-2023-44487): resets of the client,
+  /// and streams the server must reset or refuse. A connection may make
+  /// [http2ResetBurst] of them at once (default: 2 x
+  /// [maxConcurrentStreams], at least 1000), then [http2ResetRate] a
+  /// second (default: 100). Each answer with a body gives half a reset
+  /// back. Over the limit the connection drains: GOAWAY `NO_ERROR`, its
+  /// open requests still get their answers, and new ones are refused
+  /// (`REFUSED_STREAM`), so a proxy retries them on a new connection. If
+  /// the resets still go on (one more burst), the connection closes at
+  /// once (GOAWAY `ENHANCE_YOUR_CALM`). Behind a proxy (eg. Caddy or
+  /// Envoy over h2c) one connection carries many users: raise them when
+  /// the proxy sends many cancels.
   static Future<NativeHttpServer> bind(
     int port, {
     Object? address,
@@ -112,6 +126,8 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
     Duration idleTimeout = const Duration(seconds: 30),
     bool http2 = false,
     int maxConcurrentStreams = 250,
+    int? http2ResetBurst,
+    int http2ResetRate = 100,
   }) async {
     ensureAvailable();
     if (port < 0 || port > 65535) {
@@ -129,6 +145,21 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
         maxConcurrentStreams,
         'maxConcurrentStreams',
         'must be 1 to 2^31 - 1',
+      );
+    }
+    if (http2ResetBurst != null &&
+        (http2ResetBurst < 1 || http2ResetBurst > 0xffffffff)) {
+      throw ArgumentError.value(
+        http2ResetBurst,
+        'http2ResetBurst',
+        'must be 1 to 2^32 - 1',
+      );
+    }
+    if (http2ResetRate < 0) {
+      throw ArgumentError.value(
+        http2ResetRate,
+        'http2ResetRate',
+        'must be 0 or more',
       );
     }
     if (idleTimeout <= Duration.zero) {
@@ -171,6 +202,8 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
       idleTimeout.inMilliseconds,
       http2,
       maxConcurrentStreams,
+      http2ResetBurst ?? 0,
+      http2ResetRate,
     );
     if (handle <= 0) {
       receive.close();

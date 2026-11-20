@@ -11,10 +11,15 @@
 //! A request body is read whole before Dart gets the request (buffered,
 //! like HTTP/1.1). A gRPC request (`content-type: application/grpc*`)
 //! streams its body to Dart instead: BODY_PART records, and the client gets
-//! its window back only when Dart acks the bytes (BODY_ACK). Streamed
+//! its stream window back only when Dart acks the bytes (BODY_ACK). The
+//! connection window comes back at once, so unread bodies never stall the
+//! other streams of the connection. Streamed
 //! answers (kind 6, 7, 8) go out as DATA frames
 //! under the send windows. Floods of small frames get GOAWAY
-//! ENHANCE_YOUR_CALM (plan 4.10): see the `MAX_*` limits below.
+//! ENHANCE_YOUR_CALM (plan 4.10): see the `MAX_*` limits below. Too many
+//! resets first get a graceful GOAWAY NO_ERROR (see `spend_n`): one
+//! connection of a proxy carries many users, and their open requests must
+//! still get their answers.
 
 pub(crate) mod frame;
 pub(crate) mod hpack;
@@ -52,6 +57,7 @@ const RESETS: usize = 64;
 const MAX_FRAME_LIMIT: u32 = (1 << 24) - 1;
 
 // Flood limits (plan 4.10). Over one: GOAWAY ENHANCE_YOUR_CALM, then close.
+// The reset bucket first drains gracefully (see `H2::spend_n`).
 // "Per second" counts in windows of one second (see [Rate]).
 
 /// Resets and refusals: a token bucket. Each of these takes one token:
@@ -63,6 +69,10 @@ const MAX_FRAME_LIMIT: u32 = (1 << 24) - 1;
 /// The bucket holds a burst of `max(2 * max_streams, RESET_BURST_MIN)`, so
 /// a client or proxy that cancels all its calls at once is not cut. It
 /// refills `RESET_RATE` tokens a second: only a flood that goes on is cut.
+/// Both can be set from Dart (`http2ResetBurst`, `http2ResetRate`).
+/// An empty bucket is not cut at once: GOAWAY NO_ERROR lets the open
+/// streams finish (they may be other users of a proxy), and the bucket
+/// gets one more burst for the frames in flight. Empty again: cut.
 /// Each answer with a body gives half a token back (`RESET_REFUND`). A
 /// gRPC client sends all its calls on one connection, and a call over its
 /// deadline is a reset: a busy client with some timeouts must not be cut.
@@ -74,8 +84,10 @@ const MAX_FRAME_LIMIT: u32 = (1 << 24) - 1;
 /// `max_streams` until Dart answers them (`zombies`, as grpc-go does). The
 /// bucket still guards cheap frame floods and the HPACK decode cost.
 const RESET_BURST_MIN: u32 = 1000;
-/// Tokens that come back each second (the sustained rate of resets).
-const RESET_RATE: f64 = 100.0;
+/// Tokens that come back each second (the sustained rate of resets). The
+/// default of `http2ResetRate` in Dart: the rate comes from there.
+#[cfg(test)]
+pub(crate) const RESET_RATE: f64 = 100.0;
 /// Tokens an answer with a body gives back. It is half, so an attacker
 /// that pairs each reset with one cheap answer still loses tokens. Answers
 /// without a body (HEAD, 204, 304, empty, headers only) give nothing.
@@ -101,6 +113,24 @@ const ZOMBIE_WAIT: Duration = Duration::from_secs(30);
 /// is bounded, only not as fast. When the live streams alone are at
 /// `max_streams`, the client broke our SETTINGS and pays a full token.
 const ZOMBIE_REFUSAL_COST: f64 = 0.25;
+/// Answer body bytes of one connection that wait for the client's windows
+/// (or for [HOLD]). Over it new streams get REFUSED_STREAM until the
+/// client reads. Reads go on (its WINDOW_UPDATEs must come in).
+/// ponytail: a fixed cap; make it an option if real answers need more.
+const UNSENT_CAP: usize = 32 << 20;
+/// Streamed body bytes of one connection that Dart has not acked. The
+/// connection window comes back at once (so unread bodies do not stall the
+/// other streams), and each stream holds at most STREAM_WINDOW. But any
+/// client may send `content-type: application/grpc` to any route, and a
+/// streamed body has no timeout: without this cap `max_streams` unread
+/// bodies would pin `max_streams` MiB per connection. The DATA that would
+/// pass it resets the streams that hold the most (see `evict`); the
+/// other streams go on. A gRPC handler that reads acks at once and never
+/// comes close. Same as the old cap: CONN_WINDOW.
+const UNACKED_CAP: u64 = CONN_WINDOW as u64;
+/// The encoded header block of one request, with its CONTINUATIONs. Over
+/// it: GOAWAY. The decoded list keeps MAX_HEAD (over it: 431).
+const MAX_BLOCK: usize = 4 * MAX_HEAD;
 /// SETTINGS frames per second.
 const MAX_SETTINGS: u32 = 100;
 /// SETTINGS whose ACK is not written yet: the client does not read.
@@ -145,13 +175,16 @@ const MAX_HEADER_LIST_SIZE: u16 = 6;
 struct Bucket {
     tokens: f64,
     at: Instant,
+    /// tokens back per second
+    rate: f64,
 }
 
 impl Bucket {
-    fn new(now: Instant, burst: f64) -> Self {
+    fn new(now: Instant, burst: f64, rate: f64) -> Self {
         Bucket {
             tokens: burst,
             at: now,
+            rate,
         }
     }
 
@@ -159,7 +192,7 @@ impl Bucket {
     fn take(&mut self, now: Instant, burst: f64, cost: f64) -> bool {
         let gone = now.saturating_duration_since(self.at).as_secs_f64();
         self.at = self.at.max(now);
-        self.tokens = (self.tokens + gone * RESET_RATE).min(burst);
+        self.tokens = (self.tokens + gone * self.rate).min(burst);
         if self.tokens < cost {
             return false;
         }
@@ -303,14 +336,21 @@ pub(crate) struct H2 {
     /// streamed request bodies: records for Dart (request seq, kind
     /// BODY_PART or BODY_END, status, bytes), in order
     pub(crate) to_dart: Vec<(u32, u32, u16, Vec<u8>)>,
-    /// streamed body bytes Dart has not acked yet, all streams. Their
-    /// connection window is not given back before (see `settle`).
-    unacked: i64,
+    /// answer body bytes of all streams not sent yet (see UNSENT_CAP)
+    unsent: usize,
+    /// streamed body bytes Dart has not acked yet, all streams (see
+    /// UNACKED_CAP)
+    unacked: u64,
     /// flood counters, see the `MAX_*` limits
     reset_bucket: Bucket,
     reset_burst: f64,
+    /// the reset bucket ran out once: we drain (GOAWAY NO_ERROR). Out
+    /// again: GOAWAY ENHANCE_YOUR_CALM.
+    calm: bool,
     settings_rate: Rate,
     pings_rate: Rate,
+    /// RST_STREAMs on closed streams this second (see `dispatch`)
+    closed_rsts: Rate,
     unacked_settings: u32,
     unacked_pings: u32,
     empty: u32,
@@ -330,6 +370,7 @@ impl H2 {
         peer: [u8; 18],
         max_streams: u32,
         (max_body, max_multipart): (usize, usize),
+        (reset_burst, reset_rate): (u32, f64),
         out: &mut Vec<u8>,
     ) -> Box<Self> {
         frame::write_settings(
@@ -344,7 +385,11 @@ impl H2 {
         );
         frame::write_window(out, 0, (CONN_WINDOW - DEFAULT_WINDOW) as u32);
         let now = Instant::now();
-        let burst = f64::from((2 * max_streams).max(RESET_BURST_MIN));
+        // 0: the default, see RESET_BURST_MIN
+        let burst = match reset_burst {
+            0 => f64::from(max_streams.saturating_mul(2).max(RESET_BURST_MIN)),
+            n => f64::from(n),
+        };
         Box::new(H2 {
             base: (idx as u64) << 32,
             peer,
@@ -379,11 +424,14 @@ impl H2 {
             gone_streams: Vec::new(),
             expired_streams: Vec::new(),
             to_dart: Vec::new(),
+            unsent: 0,
             unacked: 0,
-            reset_bucket: Bucket::new(now, burst),
+            reset_bucket: Bucket::new(now, burst, reset_rate),
             reset_burst: burst,
+            calm: false,
             settings_rate: Rate::new(now),
             pings_rate: Rate::new(now),
+            closed_rsts: Rate::new(now),
             unacked_settings: 0,
             unacked_pings: 0,
             empty: 0,
@@ -573,20 +621,22 @@ impl H2 {
                 self.fail(out, e.code);
             }
         }
+        if self.calm {
+            self.drain(out); // see `spend_n`
+        }
         self.settle(out);
         true
     }
 
-    /// Gives connection window back to the client: what it sent and is
-    /// not held for Dart (`unacked`). Only once enough is due, or the
-    /// client is nearly stuck, so a mix of buffered and streamed bodies
-    /// never stalls. The streamed bytes of Dart keep CONN_WINDOW as their
-    /// cap: `recv + unacked <= CONN_WINDOW`.
+    /// Gives connection window back to the client: all it sent, also the
+    /// streamed bytes Dart has not acked (their stream window holds them
+    /// back, so one stream holds at most STREAM_WINDOW). Only once enough
+    /// is due, or the client is nearly stuck.
     fn settle(&mut self, out: &mut Vec<u8>) {
         if self.dead {
             return;
         }
-        let due = CONN_WINDOW - self.unacked - self.recv;
+        let due = CONN_WINDOW - self.recv;
         if due > 0 && (due >= CONN_WINDOW / 2 || self.recv < ACK_BATCH as i64) {
             frame::write_window(out, 0, due as u32);
             self.recv += due;
@@ -682,9 +732,10 @@ impl H2 {
                 let Some((_, _, b)) = self.block.as_mut() else {
                     return Err(conn_err(frame::PROTOCOL_ERROR));
                 };
-                // ponytail: the encoded block is capped at MAX_HEAD, like
-                // the decoded list. A real client never comes close.
-                if b.len() + block.len() > MAX_HEAD {
+                // the decoded list over MAX_HEAD is a 431 for the stream
+                // (see `request`), only a far bigger block cuts the
+                // connection
+                if b.len() + block.len() > MAX_BLOCK {
                     return Err(conn_err(frame::ENHANCE_YOUR_CALM));
                 }
                 b.extend_from_slice(block);
@@ -701,12 +752,23 @@ impl H2 {
                 if self.state(h.id) == State::Idle {
                     return Err(conn_err(frame::PROTOCOL_ERROR));
                 }
-                // also on a closed stream: it costs us the same
+                // A closed stream: the RST cancels no work (eg. a proxy's
+                // cancel crossed our answer, or our refusal after GOAWAY).
+                // Up to one burst of them a second take no reset token,
+                // so a burst of them can not cut the other users of the
+                // connection. Past that each one takes a token like any
+                // reset: a flood drains, then is cut (see `spend_n`).
+                if !self.streams.contains_key(&h.id) {
+                    if self.closed_rsts.over(self.now, self.reset_burst as u32) {
+                        self.spend()?;
+                    }
+                    return Ok(());
+                }
+                // it cancels open work: a reset token
                 self.spend()?;
                 // an open stream is remembered: a later frame on it is
-                // STREAM_CLOSED (RFC 9113 5.1). A closed id is not, so
-                // RSTs on closed ids fill nothing.
-                if self.streams.contains_key(&h.id) && !self.client_resets_set.contains(&h.id) {
+                // STREAM_CLOSED (RFC 9113 5.1)
+                if !self.client_resets_set.contains(&h.id) {
                     if self.client_resets.len() >= self.max_streams.max(RESETS)
                         && let Some(old) = self.client_resets.pop_front()
                     {
@@ -772,18 +834,28 @@ impl H2 {
     }
 
     /// Takes a token of the reset bucket: the client costs us a reset or a
-    /// refusal. Empty bucket: ENHANCE_YOUR_CALM.
+    /// refusal. See `spend_n` for an empty bucket.
     fn spend(&mut self) -> Result<(), Error> {
         self.spend_n(1.0)
     }
 
-    /// Like `spend`, for a part of a token.
+    /// Like `spend`, for a part of a token. The first time the bucket is
+    /// empty, the connection drains: `step` sends GOAWAY NO_ERROR with the
+    /// last stream we took, so the open streams (other users behind a
+    /// proxy) still get their answers, and new ones are refused. The
+    /// bucket gets one more burst for the frames already in flight. Empty
+    /// again: ENHANCE_YOUR_CALM, the connection closes at once.
     fn spend_n(&mut self, cost: f64) -> Result<(), Error> {
         if self.reset_bucket.take(self.now, self.reset_burst, cost) {
-            Ok(())
-        } else {
-            Err(conn_err(frame::ENHANCE_YOUR_CALM))
+            return Ok(());
         }
+        if self.calm {
+            return Err(conn_err(frame::ENHANCE_YOUR_CALM));
+        }
+        self.calm = true;
+        // the frame that ran it out pays from the new burst
+        self.reset_bucket.tokens = (self.reset_burst - cost).max(0.0);
+        Ok(())
     }
 
     /// DATA: request body bytes. `flow` (with the padding) counts against
@@ -822,6 +894,12 @@ impl H2 {
             }
             return Err(conn_err(frame::STREAM_CLOSED));
         }
+        if self.unacked + data.len() as u64 > UNACKED_CAP
+            && self.streams[&id].streaming()
+            && !self.evict(id, data.len() as u64, out)
+        {
+            return Ok(()); // this stream was the biggest: it is reset
+        }
         let s = self.streams.get_mut(&id).expect("an open stream");
         let Some(r) = s.recv.as_mut() else {
             // the request is whole: no more DATA (RFC 9113 5.1)
@@ -838,9 +916,9 @@ impl H2 {
             return Err(stream_err(frame::PROTOCOL_ERROR));
         }
         if r.streamed {
-            // to Dart at once. The window comes back on Dart's ack, the
-            // padding now (Dart never sees it). The connection window of
-            // the data also waits for the ack (`unacked`).
+            // to Dart at once. The stream window comes back on Dart's
+            // ack, the padding now (Dart never sees it). The connection
+            // window comes back now (`settle`).
             r.taken = got;
             r.acked += (flow - data.len()) as u64;
             give_back(out, id, r);
@@ -849,7 +927,7 @@ impl H2 {
             }
             if !data.is_empty() {
                 s.owed += data.len() as u64;
-                self.unacked += data.len() as i64;
+                self.unacked += data.len() as u64;
                 // Join it to a part of this stream that waits for Dart:
                 // 1M frames of 1 byte must not be 1M records.
                 let last = self
@@ -904,6 +982,33 @@ impl H2 {
             r.window = STREAM_WINDOW;
         }
         Ok(())
+    }
+
+    /// `n` more streamed bytes for stream `id` would pass UNACKED_CAP:
+    /// resets the streams that hold the most unacked bytes (ties: the
+    /// oldest) until they fit. So one user of a proxy connection that
+    /// pins the cap with slow handlers loses its own streams, not the
+    /// next user's. ENHANCE_YOUR_CALM, not FLOW_CONTROL_ERROR: the client
+    /// kept to its windows, it only sends more than the server takes
+    /// (gRPC maps it to RESOURCE_EXHAUSTED). No reset token: the client
+    /// broke no rule, and each such stream cost it a full window. False
+    /// when stream `id` itself was reset.
+    fn evict(&mut self, id: u32, n: u64, out: &mut Vec<u8>) -> bool {
+        while self.unacked + n > UNACKED_CAP {
+            let Some((&victim, _)) = self
+                .streams
+                .iter()
+                .filter(|(_, s)| s.owed > 0)
+                .max_by_key(|(sid, s)| (s.owed, std::cmp::Reverse(**sid)))
+            else {
+                break; // nothing to free (can not happen: n <= MAX_FRAME)
+            };
+            self.reset(out, victim, frame::ENHANCE_YOUR_CALM);
+            if victim == id {
+                return false;
+            }
+        }
+        true
     }
 
     fn window_update(&mut self, id: u32, inc: u32) -> Result<(), Error> {
@@ -1022,7 +1127,13 @@ impl H2 {
             // a flood is bounded by the bucket, not by the empty count: a
             // busy client has many requests in flight after our GOAWAY
             self.counted = false;
-            return Ok(()); // after GOAWAY: ignored (RFC 9113 6.8)
+            // after our GOAWAY: not taken (RFC 9113 6.8). REFUSED_STREAM
+            // tells the client (or proxy) at once that it may retry it
+            // on another connection.
+            if self.away {
+                frame::write_rst(out, id, frame::REFUSED_STREAM);
+            }
+            return Ok(());
         }
         // Requests Dart still works on count too (see `zombies`). A refusal
         // takes a token either way: each one costs an HPACK decode, so a
@@ -1040,6 +1151,15 @@ impl H2 {
             } else {
                 self.spend()?;
             }
+            frame::write_rst(out, id, frame::REFUSED_STREAM);
+            self.remember(id);
+            return Ok(());
+        }
+        // too many answer bytes wait for this client: no new work until
+        // it reads. Like the zombies, the client may not see it.
+        if self.unsent > UNSENT_CAP {
+            self.spend_n(ZOMBIE_REFUSAL_COST)?;
+            self.counted = false;
             frame::write_rst(out, id, frame::REFUSED_STREAM);
             self.remember(id);
             return Ok(());
@@ -1172,8 +1292,9 @@ impl H2 {
                 self.turns.retain(|&t| t != id);
             }
             self.seqs.remove(&s.seq);
+            self.unsent -= s.unsent();
             // what Dart never acked will not be acked now
-            self.unacked -= s.owed as i64;
+            self.unacked -= s.owed;
             // Dart knows the request once its body is whole (or streams)
             if !s.answered && s.known() {
                 self.gone.push(s.seq);
@@ -1232,17 +1353,16 @@ impl H2 {
         let Some(s) = self.streams.get_mut(&id) else {
             return;
         };
-        // the connection window of these bytes (never more than owed)
+        // never more than owed (also after the body ended)
         let free = n.min(s.owed);
         s.owed -= free;
-        self.unacked -= free as i64;
+        self.unacked -= free;
         if let Some(r) = s.recv.as_mut().filter(|r| r.streamed) {
             // never more than the client used: the window stays <= ours
             let used = (STREAM_WINDOW - r.window) as u64;
             r.acked = r.acked.saturating_add(n).min(used);
             give_back(out, id, r);
         } // else: the body ended, no more DATA comes
-        self.settle(out);
     }
 
     /// No more frames come (the client closed its side): each body that
@@ -1422,6 +1542,7 @@ impl H2 {
             *l -= n;
         }
         s.push(data);
+        self.unsent += data.len();
         s.done = end;
         if end {
             push_lines(trailers, &mut s.trailers);
@@ -1469,6 +1590,7 @@ impl H2 {
             self.finish(out, id, false);
         } else {
             s.body = body.to_vec();
+            self.unsent += body.len();
             s.done = true;
             s.turn = true;
             self.turns.push_back(id);
@@ -1517,6 +1639,7 @@ impl H2 {
             };
             frame::write(out, frame::DATA, flags, id, &s.body[s.sent..s.sent + k]);
             s.sent += k;
+            self.unsent -= k;
             s.wrote |= k > 0;
             s.stalled = None; // bytes moved: the stall clock starts again
             self.data_sent += k as u64;
@@ -1764,8 +1887,10 @@ impl Req {
         if self.method == b"CONNECT" {
             return Check::Status(405);
         }
-        let path_ok = self.path.iter().all(|&c| c > b' ' && c != 0x7f);
-        if !self.scheme || self.path.is_empty() || !path_ok {
+        // origin form, or `*` for OPTIONS (RFC 9113 8.3.1)
+        let path_ok = self.path.iter().all(|&c| c > b' ' && c != 0x7f)
+            && (self.path.starts_with(b"/") || (self.path == b"*" && self.method == b"OPTIONS"));
+        if !self.scheme || !path_ok {
             return Check::Bad;
         }
         if !self.method.iter().all(|c| c.is_ascii_graphic()) {
