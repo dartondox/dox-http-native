@@ -68,11 +68,11 @@ const MAX_FRAME_LIMIT: u32 = (1 << 24) - 1;
 /// deadline is a reset: a busy client with some timeouts must not be cut.
 /// A client with up to about a third of its calls reset is not cut. An
 /// attacker needs two real answers per reset.
-/// Known limit (the same trade as Envoy's premature-reset check): the two
-/// answers may come from a cheap route and the reset from a costly one.
-/// The handler of a reset request still runs to its end in Dart. A full
-/// fix counts those handlers against `max_streams` until they answer (as
-/// grpc-go does).
+/// The answers may come from a cheap route and the resets from a costly
+/// one. The bucket can not see that, but the handler of a reset request
+/// still runs to its end in Dart. So those handlers count against
+/// `max_streams` until Dart answers them (`zombies`, as grpc-go does). The
+/// bucket still guards cheap frame floods and the HPACK decode cost.
 const RESET_BURST_MIN: u32 = 1000;
 /// Tokens that come back each second (the sustained rate of resets).
 const RESET_RATE: f64 = 100.0;
@@ -80,6 +80,15 @@ const RESET_RATE: f64 = 100.0;
 /// that pairs each reset with one cheap answer still loses tokens. Answers
 /// without a body (HEAD, 204, 304, empty, headers only) give nothing.
 const RESET_REFUND: f64 = 0.5;
+/// How long a request the client reset still counts against
+/// `max_streams` while Dart has not answered it (see `H2::zombies`).
+/// Some handlers never answer (eg. one that forgets `close` once the
+/// client is gone), and they must not hold a slot forever. It is the same
+/// as SEND_WAIT (30 s, the wait for a client that does not read). A real
+/// handler is done long before; `bodyTimeout` (120 s) is for slow clients,
+/// not for handlers. After it, an attacker gets at most `max_streams` lost
+/// handlers per 30 s on one connection (about 8 a second with 250).
+const ZOMBIE_WAIT: Duration = Duration::from_secs(30);
 /// SETTINGS frames per second.
 const MAX_SETTINGS: u32 = 100;
 /// SETTINGS whose ACK is not written yet: the client does not read.
@@ -252,6 +261,17 @@ pub(crate) struct H2 {
     seqs: HashMap<u32, u32>,
     /// streams with body bytes to send, in turn order
     turns: VecDeque<u32>,
+    /// Requests whose stream is gone while Dart still works on them: the
+    /// client reset them (or they were cut) before Dart answered, or a
+    /// gzip job of the answer still runs. Request seq to the time it
+    /// went. A Dart handler can not be stopped, so each one counts
+    /// against `max_streams` until its answer comes (any kind, see `due`
+    /// and `zipped`), or until ZOMBIE_WAIT. Never more than `max_streams`:
+    /// a stream only moves here from `streams`, and a new stream is
+    /// refused while both together are full. When the connection dies
+    /// they go with it; the client may open a new connection, but those
+    /// are bounded by `maxConnections`.
+    zombies: HashMap<u32, Instant>,
     /// the last request (record head and body), until it fits in Dart's
     /// buffer
     pub(crate) held: Option<(Vec<u8>, Vec<u8>)>,
@@ -334,6 +354,7 @@ impl H2 {
             streams: HashMap::new(),
             seqs: HashMap::new(),
             turns: VecDeque::new(),
+            zombies: HashMap::new(),
             held: None,
             gone: Vec::new(),
             gone_streams: Vec::new(),
@@ -973,7 +994,13 @@ impl H2 {
             self.counted = false;
             return Ok(()); // after GOAWAY: ignored (RFC 9113 6.8)
         }
-        if self.streams.len() >= self.max_streams {
+        // Requests Dart still works on count too (see `zombies`). A refusal
+        // takes a token either way: each one costs an HPACK decode, so a
+        // client that keeps sending HEADERS while full is still cut. A real
+        // client is not: it is only full while it has `max_streams`
+        // handlers in Dart, and gRPC retries a REFUSED_STREAM only once
+        // on its own (gRPC A6), so it takes few tokens.
+        if self.full() {
             self.spend()?;
             frame::write_rst(out, id, frame::REFUSED_STREAM);
             self.remember(id);
@@ -1042,6 +1069,20 @@ impl H2 {
         }
     }
 
+    /// No room for a new stream: the open streams and the `zombies` that
+    /// are not older than ZOMBIE_WAIT fill `max_streams`.
+    fn full(&mut self) -> bool {
+        if self.streams.len() + self.zombies.len() < self.max_streams {
+            return false;
+        }
+        // only when full, so at most `max_streams` entries, and each refusal
+        // takes a token: the old ones go now, no timer is needed
+        let now = self.now;
+        self.zombies
+            .retain(|_, at| now.saturating_duration_since(*at) < ZOMBIE_WAIT);
+        self.streams.len() + self.zombies.len() >= self.max_streams
+    }
+
     /// Answers from Rust (eg. 405) with no body. When the client still
     /// sends a body, RST_STREAM NO_ERROR then tells it to stop (RFC 9113
     /// 8.1).
@@ -1092,6 +1133,10 @@ impl H2 {
             // Dart knows the request once its body is whole (or streams)
             if !s.answered && s.known() {
                 self.gone.push(s.seq);
+            }
+            // Dart (or a gzip job) still works on it: it keeps its slot
+            if (!s.answered && s.known()) || s.zip.is_some() {
+                self.zombies.insert(s.seq, self.now);
             }
             if s.streaming() {
                 self.to_dart.push((s.seq, BODY_END, 1, Vec::new()));
@@ -1183,7 +1228,12 @@ impl H2 {
     }
 
     /// The stream of request `seq`, when it waits for its answer.
+    /// Each answer of Dart comes here first (whole, streamed start, gzip,
+    /// refused), so a request that was gone frees its slot.
     fn due(&mut self, seq: u32) -> Option<(u32, &mut Stream)> {
+        if !self.zombies.is_empty() {
+            self.zombies.remove(&seq);
+        }
         if self.dead {
             return None;
         }
@@ -1208,6 +1258,9 @@ impl H2 {
 
     /// The gzip job of `seq` is done: send the answer.
     pub(crate) fn zipped(&mut self, seq: u32, body: &[u8], date: &[u8], out: &mut Vec<u8>) {
+        if !self.zombies.is_empty() {
+            self.zombies.remove(&seq);
+        }
         let Some(&id) = self.seqs.get(&seq) else {
             return;
         };

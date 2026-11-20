@@ -98,8 +98,9 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   /// With [http2], the same port also speaks HTTP/2 over plain TCP (h2c
   /// with prior knowledge, no TLS): a connection that starts with the
   /// HTTP/2 preface is HTTP/2, any other is HTTP/1.1. One HTTP/2
-  /// connection has at most [maxConcurrentStreams] open requests. Default:
-  /// off. An HTTP/2 request body has the same limits as on HTTP/1.1.
+  /// connection has at most [maxConcurrentStreams] open requests. A
+  /// request the client reset counts until its handler ends the response
+  /// (at most 30 seconds). Default: off. An HTTP/2 request body has the same limits as on HTTP/1.1.
   static Future<NativeHttpServer> bind(
     int port, {
     Object? address,
