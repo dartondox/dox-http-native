@@ -1876,6 +1876,7 @@ impl Core {
             }
         }
         let before = c.written;
+        let data = c.h2.as_ref().map_or(0, |h| h.data_sent);
         loop {
             if let Some(h2) = c.h2.as_mut() {
                 h2.send(&mut c.wbuf, c.wpos);
@@ -1914,7 +1915,14 @@ impl Core {
         // HTTP/2: a closed window with data waiting also counts as stuck
         if c.pending() == 0 && !blocked {
             c.stuck = None;
-        } else if c.written > before || c.stuck.is_none() {
+        } else if c.stuck.is_none()
+            // a blocked HTTP/2 window: ACKs and PINGs are no progress, only DATA is
+            || if blocked {
+                c.h2.as_ref().is_some_and(|h| h.data_sent > data)
+            } else {
+                c.written > before
+            }
+        {
             c.stuck = Some(now);
         }
         if c.pending() == 0 && c.live_ws() && !c.ws.as_ref().unwrap().queue.is_empty() {

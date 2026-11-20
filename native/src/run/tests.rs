@@ -1582,3 +1582,47 @@ fn http2_preface_in_pieces_and_http1_on_the_same_port() {
         "{h1:?}"
     );
 }
+
+/// A client with a send window of 0 that keeps sending PINGs is stuck all
+/// the same: PING ACKs are no progress, so SEND_WAIT closes the connection.
+#[test]
+fn http2_pings_do_not_keep_a_blocked_window_alive() {
+    use crate::h2::frame;
+    use crate::h2::hpack::encode_field;
+    let (mut core, port) = new_core(limits());
+    let mut inb = vec![0u8; 1 << 18];
+    let mut req = PREFACE.to_vec();
+    frame::write(&mut req, frame::SETTINGS, 0, 0, b"");
+    let mut block = Vec::new();
+    for (n, v) in [(":method", "GET"), (":scheme", "http"), (":path", "/big")] {
+        encode_field(n.as_bytes(), v.as_bytes(), &mut block);
+    }
+    frame::write_headers(&mut req, 1, &block, true, 16 * 1024);
+    let mut s = connect(port);
+    s.write_all(&req).unwrap();
+    let r = collect(&mut core, &mut inb, 1).pop().unwrap();
+    // more than the default window of 65535 bytes
+    let mut out = Vec::new();
+    ans(&mut out, r.id, 200, 0, b"", &vec![0u8; 200_000]);
+    core.run(&out, &mut inb, 0).unwrap();
+    assert_eq!(core.conns.len(), 1);
+    // a PING every 20 s, never a WINDOW_UPDATE. `run` reads the real
+    // clock, so 20 s pass by moving the start of the wait back.
+    for _ in 0..3 {
+        let mut ping = Vec::new();
+        frame::write(&mut ping, frame::PING, 0, 0, &[7; 8]);
+        s.write_all(&ping).unwrap();
+        let end = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < end {
+            core.run(&[], &mut inb, 0).unwrap();
+        }
+        let ids: Vec<usize> = core.conns.iter().map(|(i, _)| i).collect();
+        for i in ids {
+            let c = core.conns.get_mut(i).unwrap();
+            c.stuck = c.stuck.map(|t| t - Duration::from_secs(20));
+            core.arm_timer(i);
+        }
+        after(&mut core, &mut inb, Duration::ZERO);
+    }
+    assert_eq!(core.conns.len(), 0, "closed");
+}

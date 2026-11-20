@@ -96,6 +96,8 @@ pub(crate) struct H2 {
     peer_window: i64,
     /// the connection send window
     window: i64,
+    /// DATA bytes sent so far: the progress that counts when blocked
+    pub(crate) data_sent: u64,
     /// the connection receive window left
     recv: i64,
     /// a header block that waits for CONTINUATION: (stream id,
@@ -156,6 +158,7 @@ impl H2 {
             peer_frame: MAX_FRAME,
             peer_window: DEFAULT_WINDOW,
             window: DEFAULT_WINDOW,
+            data_sent: 0,
             recv: CONN_WINDOW,
             block: None,
             seen: 0,
@@ -700,6 +703,7 @@ impl H2 {
             let flags = if end { frame::END_STREAM } else { 0 };
             frame::write(out, frame::DATA, flags, id, &s.body[s.sent..s.sent + k]);
             s.sent += k;
+            self.data_sent += k as u64;
             s.window -= k as i64;
             self.window -= k as i64;
             if end {
