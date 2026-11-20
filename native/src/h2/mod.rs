@@ -10,7 +10,8 @@
 //!
 //! A request body is read whole before Dart gets the request (buffered,
 //! like HTTP/1.1). Streamed answers (kind 6, 7, 8) go out as DATA frames
-//! under the send windows. No flood limits yet (plan 4.10, PR 2c).
+//! under the send windows. Floods of small frames get GOAWAY
+//! ENHANCE_YOUR_CALM (plan 4.10): see the `MAX_*` limits below.
 
 pub(crate) mod frame;
 pub(crate) mod hpack;
@@ -42,11 +43,31 @@ const CONN_WINDOW: i64 = 16 << 20;
 const DEFAULT_WINDOW: i64 = 65_535;
 /// The HPACK table size we allow the client (the default 4096).
 const TABLE_SIZE: usize = 4096;
-/// The largest MAX_FRAME_SIZE a client may set (RFC 9113 6.5.2).
 /// How many reset stream ids we remember.
 const RESETS: usize = 64;
-
+/// The largest MAX_FRAME_SIZE a client may set (RFC 9113 6.5.2).
 const MAX_FRAME_LIMIT: u32 = (1 << 24) - 1;
+
+// Flood limits (plan 4.10). Over one: GOAWAY ENHANCE_YOUR_CALM, then close.
+// "Per second" counts in windows of one second (see [Rate]).
+
+/// Resets per second: RST_STREAM of the client, and our RST_STREAM for a
+/// stream error of the client. Rapid Reset (CVE-2023-44487) and "made you
+/// reset" (CVE-2025-8671) make the server start work and drop it at once.
+const MAX_RESETS: u32 = 100;
+/// SETTINGS frames per second.
+const MAX_SETTINGS: u32 = 100;
+/// SETTINGS whose ACK is not written yet: the client does not read.
+const MAX_UNACKED_SETTINGS: u32 = 10;
+/// PINGs per second. DATA we send starts the count again: grpc-go sends
+/// a PING (for its window estimate) each time DATA comes to it.
+const MAX_PINGS: u32 = 100;
+/// PING ACKs not written yet (17 bytes each): the client does not read.
+const MAX_UNACKED_PINGS: u32 = 100;
+/// Frames in a row that carry no work (see `no_work`), with no HEADERS or
+/// DATA between: eg. empty DATA or CONTINUATION, PRIORITY, unknown types.
+const MAX_EMPTY: u32 = 100;
+
 /// How many full-size uploads one connection may hold at once. The memory
 /// stays bounded at this many times one HTTP/1.1 connection.
 const BODY_STREAMS_CAP: usize = 4;
@@ -63,6 +84,28 @@ const MAX_CONCURRENT_STREAMS: u16 = 3;
 const INITIAL_WINDOW_SIZE: u16 = 4;
 const MAX_FRAME_SIZE: u16 = 5;
 const MAX_HEADER_LIST_SIZE: u16 = 6;
+
+/// A count of frames in the current one-second window.
+#[derive(Clone, Copy)]
+struct Rate {
+    start: Instant,
+    n: u32,
+}
+
+impl Rate {
+    fn new(now: Instant) -> Self {
+        Rate { start: now, n: 0 }
+    }
+
+    /// Counts one frame at `now`. True when this second has more than `max`.
+    fn over(&mut self, now: Instant, max: u32) -> bool {
+        if now.saturating_duration_since(self.start) >= Duration::from_secs(1) {
+            *self = Rate::new(now);
+        }
+        self.n += 1;
+        self.n > max
+    }
+}
 
 const fn conn_err(code: u32) -> Error {
     Error {
@@ -118,9 +161,8 @@ pub(crate) struct H2 {
     /// streams are not in it (RFC 9113 6.8)
     last: u32,
     /// the last streams we reset or refused: frames of the client that
-    /// were already on their way are ignored (RFC 9113 5.1)
-    /// (also the streams the client reset). Up to `max_streams` (at least
-    /// [RESETS]), so one round trip of resets fits.
+    /// were already on their way are ignored (RFC 9113 5.1). Up to
+    /// `max_streams` (at least [RESETS]), so one round trip of resets fits.
     resets: VecDeque<u32>,
     /// request body bytes buffered in all streams (see `data`)
     buffered: usize,
@@ -144,6 +186,16 @@ pub(crate) struct H2 {
     /// streamed answers whose stream ended before Dart's end: Dart gets
     /// STREAM_GONE for each
     pub(crate) gone_streams: Vec<u64>,
+    /// flood counters, see the `MAX_*` limits
+    resets_rate: Rate,
+    settings_rate: Rate,
+    pings_rate: Rate,
+    unacked_settings: u32,
+    unacked_pings: u32,
+    empty: u32,
+    /// a stream opened or closed: the idle time starts again. PING and
+    /// SETTINGS ACKs do not count (see `service` in run.rs).
+    pub(crate) stirred: bool,
 }
 
 impl H2 {
@@ -167,6 +219,7 @@ impl H2 {
             ],
         );
         frame::write_window(out, 0, (CONN_WINDOW - DEFAULT_WINDOW) as u32);
+        let now = Instant::now();
         Box::new(H2 {
             base: (idx as u64) << 32,
             peer,
@@ -174,7 +227,7 @@ impl H2 {
             max_streams: max_streams as usize,
             max_body,
             max_multipart,
-            now: Instant::now(),
+            now,
             greeted: false,
             peer_frame: MAX_FRAME,
             peer_window: DEFAULT_WINDOW,
@@ -195,7 +248,20 @@ impl H2 {
             held: None,
             gone: Vec::new(),
             gone_streams: Vec::new(),
+            resets_rate: Rate::new(now),
+            settings_rate: Rate::new(now),
+            pings_rate: Rate::new(now),
+            unacked_settings: 0,
+            unacked_pings: 0,
+            empty: 0,
+            stirred: false,
         })
+    }
+
+    /// Bytes went out to the client: our ACKs are on their way.
+    pub(crate) fn flushed(&mut self) {
+        self.unacked_settings = 0;
+        self.unacked_pings = 0;
     }
 
     /// Streams whose answer is not all sent.
@@ -343,8 +409,11 @@ impl H2 {
         let payload = &buf[*pos + frame::HEAD..end];
         *pos = end;
         if let Err(e) = self.frame(&h, payload, out, seq, date) {
-            if e.stream {
+            // a stream error counts as a reset (CVE-2025-8671)
+            if e.stream && !self.resets_rate.over(now, MAX_RESETS) {
                 self.reset(out, h.id, e.code);
+            } else if e.stream {
+                self.fail(out, frame::ENHANCE_YOUR_CALM);
             } else {
                 self.fail(out, e.code);
             }
@@ -374,7 +443,18 @@ impl H2 {
         {
             return Err(conn_err(frame::PROTOCOL_ERROR));
         }
-        match frame::parse(h, p)? {
+        let f = frame::parse(h, p)?;
+        match Self::no_work(&f) {
+            Some(true) => {
+                self.empty += 1;
+                if self.empty > MAX_EMPTY {
+                    return Err(conn_err(frame::ENHANCE_YOUR_CALM));
+                }
+            }
+            Some(false) => self.empty = 0,
+            None => {}
+        }
+        match f {
             Frame::Data { end, data, flow } => self.data(h.id, data, flow, end, out, date),
             Frame::Headers {
                 end_stream,
@@ -426,13 +506,25 @@ impl H2 {
                 if self.state(h.id) == State::Idle {
                     return Err(conn_err(frame::PROTOCOL_ERROR));
                 }
-                // its DATA may still be on its way: ignored (RFC 9113 5.1)
-                self.remember(h.id);
+                // also on a closed stream: it costs us the same
+                if self.resets_rate.over(self.now, MAX_RESETS) {
+                    return Err(conn_err(frame::ENHANCE_YOUR_CALM));
+                }
+                // not remembered: the client sends nothing on it after its
+                // own reset, so a later frame is STREAM_CLOSED (RFC 9113
+                // 5.1). A reset of a closed id thus pushes no real id out
+                // of `resets`.
                 self.drop_stream(h.id);
                 Ok(())
             }
             Frame::Settings { ack: true, .. } => Ok(()),
             Frame::Settings { params, .. } => {
+                self.unacked_settings += 1;
+                if self.settings_rate.over(self.now, MAX_SETTINGS)
+                    || self.unacked_settings > MAX_UNACKED_SETTINGS
+                {
+                    return Err(conn_err(frame::ENHANCE_YOUR_CALM));
+                }
                 self.settings(params)?;
                 frame::write(out, frame::SETTINGS, frame::ACK, 0, &[]);
                 Ok(())
@@ -441,6 +533,12 @@ impl H2 {
             Frame::PushPromise { .. } => Err(conn_err(frame::PROTOCOL_ERROR)),
             Frame::Ping { ack: true, .. } => Ok(()),
             Frame::Ping { data, .. } => {
+                self.unacked_pings += 1;
+                if self.pings_rate.over(self.now, MAX_PINGS)
+                    || self.unacked_pings > MAX_UNACKED_PINGS
+                {
+                    return Err(conn_err(frame::ENHANCE_YOUR_CALM));
+                }
                 frame::write(out, frame::PING, frame::ACK, 0, &data);
                 Ok(())
             }
@@ -451,6 +549,22 @@ impl H2 {
             }
             Frame::WindowUpdate { inc } => self.window_update(h.id, inc),
             Frame::Unknown => Ok(()),
+        }
+    }
+
+    /// Some(true): a frame with no work (empty DATA or CONTINUATION,
+    /// PRIORITY, an unknown type). Some(false): a frame with work
+    /// (HEADERS, DATA with bytes or END_STREAM, CONTINUATION with bytes).
+    /// None: the rest, which have their own limits or are normal in a row.
+    /// WINDOW_UPDATE is one: package:http2 sends one for each DATA it got,
+    /// also after the stream ended.
+    fn no_work(f: &Frame) -> Option<bool> {
+        match f {
+            Frame::Data { data, end, .. } => Some(data.is_empty() && !end),
+            Frame::Continuation { block, end_headers } => Some(block.is_empty() && !end_headers),
+            Frame::Headers { .. } => Some(false),
+            Frame::Priority { .. } | Frame::Unknown => Some(true),
+            _ => None,
         }
     }
 
@@ -688,6 +802,7 @@ impl H2 {
                 };
                 let s = Stream::new(*seq, self.peer_window, head, recv);
                 self.streams.insert(id, s);
+                self.stirred = true;
                 self.seqs.insert(*seq, id);
                 *seq = seq.wrapping_add(1);
                 Ok(())
@@ -727,6 +842,7 @@ impl H2 {
 
     fn drop_stream(&mut self, id: u32) {
         if let Some(s) = self.streams.remove(&id) {
+            self.stirred = true;
             if s.turn {
                 self.turns.retain(|&t| t != id);
             }
@@ -970,6 +1086,7 @@ impl H2 {
             s.sent += k;
             s.stalled = None; // bytes moved: the stall clock starts again
             self.data_sent += k as u64;
+            self.pings_rate.n = 0; // see MAX_PINGS
             s.window -= k as i64;
             self.window -= k as i64;
             if let Some(sid) = s.sid {

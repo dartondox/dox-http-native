@@ -301,6 +301,32 @@ void main() {
     expect((await request(c, '/')).status, 200);
   });
 
+  // the flood limits (RST_STREAM, PING, SETTINGS, empty frames) must not
+  // cut a normal busy client
+  test('a busy normal client is not cut by the flood limits', () async {
+    ClientTransportConnection busy = await connect(server.port);
+    for (int round = 0; round < 3; round++) {
+      List<Future<Object?>> work = <Future<Object?>>[
+        for (int i = 0; i < 100; i++) request(busy, '/'),
+        for (int i = 0; i < 20; i++) busy.ping(),
+        request(busy, '/big'),
+        request(busy, '/stream'),
+      ];
+      // some streams are cancelled, as a browser does on a page change
+      for (int i = 0; i < 20; i++) {
+        busy.makeRequest(<Header>[
+          Header.ascii(':method', 'GET'),
+          Header.ascii(':scheme', 'http'),
+          Header.ascii(':path', '/'),
+        ], endStream: true).terminate();
+      }
+      await Future.wait(work);
+    }
+    expect((await request(busy, '/')).status, 200);
+    expect(busy.isOpen, isTrue);
+    await busy.finish();
+  });
+
   test('one port serves HTTP/1.1 and HTTP/2', () async {
     HttpClient client = HttpClient();
     HttpClientResponse res = await (await client.get(

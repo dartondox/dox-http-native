@@ -1699,6 +1699,14 @@ impl Core {
                         c.fail(408, &self.date.1);
                         self.service(idx);
                     }
+                    // HTTP/2 idle: GOAWAY NO_ERROR, then close once it is
+                    // written (the send stall covers a client that does
+                    // not read)
+                    Due::Head if c.h2.is_some() && !c.shut => {
+                        c.h2.as_mut().unwrap().drain(&mut c.wbuf);
+                        c.shut = true;
+                        self.service(idx);
+                    }
                     Due::H2Body => {
                         let h2 = c.h2.as_mut().unwrap();
                         h2.expire(now, limits.timeout, SEND_WAIT, &self.date.1, &mut c.wbuf);
@@ -1935,6 +1943,9 @@ impl Core {
                 }
             }
             c.shut |= h2.over();
+            if c.written > before {
+                h2.flushed(); // our ACKs are on their way
+            }
         }
         // a write starts to wait: make sure its timer runs
         let blocked = c.h2.as_ref().is_some_and(|h| h.blocked());
@@ -1946,9 +1957,14 @@ impl Core {
             c.marks.pop_front();
             self.msgs.push(sid, STREAM_SENT, 0, &n.to_le_bytes());
         }
-        if c.written > before {
-            // the idle time (and the grace of a client that closed its
-            // side, see `due`) counts from the last write
+        // the idle time (and the grace of a client that closed its side,
+        // see `due`) counts from the last write. HTTP/2: PING and SETTINGS
+        // ACKs do not count, only streams that open, close or send.
+        let active = match c.h2.as_mut() {
+            Some(h2) => std::mem::take(&mut h2.stirred) || (c.written > before && h2.open() > 0),
+            None => c.written > before,
+        };
+        if active {
             c.since = now;
         }
         // HTTP/2: a closed window with data waiting also counts as stuck

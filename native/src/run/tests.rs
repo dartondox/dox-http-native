@@ -1687,3 +1687,56 @@ fn http2_dead_connection_with_an_open_body_does_not_spin() {
     after(&mut core, &mut inb, SEND_WAIT + Duration::from_secs(6));
     assert_eq!(core.conns.len(), 0, "closed");
 }
+
+/// An idle HTTP/2 connection (no open stream) gets GOAWAY NO_ERROR after
+/// the idle time, then closes. A PING (and our ACK) is no activity.
+#[test]
+fn http2_idle_connection_gets_goaway() {
+    use crate::h2::frame;
+    let (mut core, port) = new_core(limits());
+    let mut inb = vec![0u8; 1 << 18];
+    let mut s = connect(port);
+    let mut req = PREFACE.to_vec();
+    frame::write(&mut req, frame::SETTINGS, 0, 0, b"");
+    s.write_all(&req).unwrap();
+    accept(&mut core, &mut inb, 1);
+    let idx = core.conns.iter().next().unwrap().0;
+    let end = Instant::now() + Duration::from_secs(3);
+    while core.conns[idx].h2.is_none() && Instant::now() < end {
+        core.run(&[], &mut inb, 1000).unwrap();
+    }
+    let since = core.conns[idx].since;
+    // a PING: the ACK goes out, the idle time does not start again
+    let mut ping = Vec::new();
+    frame::write(&mut ping, frame::PING, 0, 0, &[7; 8]);
+    s.write_all(&ping).unwrap();
+    let mut got = Vec::new();
+    while !got
+        .windows(9)
+        .any(|w| w[3] == frame::PING && w[4] == frame::ACK)
+    {
+        core.run(&[], &mut inb, 1000).unwrap();
+        let mut buf = [0u8; 256];
+        s.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+        if let Ok(k) = s.read(&mut buf) {
+            got.extend_from_slice(&buf[..k]);
+        }
+    }
+    assert_eq!(core.conns[idx].since, since, "a PING is no activity");
+    after(&mut core, &mut inb, IDLE / 2);
+    assert_eq!(core.conns.len(), 1, "too early");
+    after(&mut core, &mut inb, IDLE + Duration::from_secs(1));
+    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let mut rest = Vec::new();
+    let _ = s.read_to_end(&mut rest);
+    // the last frame is GOAWAY NO_ERROR (last stream id 0)
+    assert!(rest.len() >= 17, "{rest:?}");
+    let g = &rest[rest.len() - 17..];
+    assert_eq!(
+        (g[3], &g[9..17]),
+        (frame::GOAWAY, &[0u8; 8][..]),
+        "{rest:?}"
+    );
+    // closed: only the lingering close is left
+    assert!(core.conns.iter().all(|(_, c)| c.linger.is_some()));
+}
