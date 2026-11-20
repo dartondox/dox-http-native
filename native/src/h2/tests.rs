@@ -2421,6 +2421,59 @@ mod conn {
         );
     }
 
+    /// HEADERS on a stream we reset are decoded and dropped: each takes a
+    /// token. Work in between (a new stream) does not stop the cost.
+    #[test]
+    fn attack_headers_on_a_reset_stream() {
+        let mut c = Client::with_max(250, 100);
+        c.send(frame::HEADERS, frame::END_HEADERS, 1, &block(GET));
+        let fs = c.send(frame::DATA, 0, 1, &[1; 101]);
+        assert_eq!(decode(&fs[0].1)[0], (":status".into(), "413".into()));
+        // one late trailers HEADERS is fine
+        assert!(
+            c.send(
+                frame::HEADERS,
+                frame::END_HEADERS | frame::END_STREAM,
+                1,
+                &block(&[("x-t", "1")])
+            )
+            .is_empty()
+        );
+        let mut sent = 0u32;
+        let mut id = 3;
+        'outer: for _ in 0..100 {
+            for _ in 0..99 {
+                sent += 1;
+                if c.h2.over() {
+                    break 'outer;
+                }
+                c.send(frame::HEADERS, frame::END_HEADERS, 1, &block(GET));
+            }
+            // work: a new stream, so the empty count starts again
+            c.get(id, GET);
+            id += 2;
+        }
+        assert!(c.h2.over());
+        assert!(sent < 1300, "{sent}");
+    }
+
+    /// After our own GOAWAY a busy client still has many requests in
+    /// flight: they are ignored, and the connection is not cut.
+    #[test]
+    fn many_headers_after_our_goaway_do_not_cut() {
+        let mut c = Client::new(250);
+        c.get(1, GET);
+        let mut out = Vec::new();
+        c.h2.drain(&mut out);
+        for i in 0..300u32 {
+            assert!(c.get(3 + 2 * i, GET).is_empty());
+        }
+        assert!(!c.h2.over());
+        let fs = c.answer(0, 200, b"", b"a");
+        assert!(!fs.is_empty());
+        assert!(c.h2.over());
+    }
+
     /// A client or proxy that cancels all its calls at once is not cut.
     #[test]
     fn a_mass_cancel_is_fine() {

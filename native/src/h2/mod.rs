@@ -18,7 +18,7 @@ pub(crate) mod hpack;
 mod huffman;
 mod stream;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use frame::{Error, Frame, Head};
@@ -199,10 +199,14 @@ pub(crate) struct H2 {
     /// were already on their way are ignored (RFC 9113 5.1). Up to
     /// `max_streams` (at least [RESETS]), so one round trip of resets fits.
     resets: VecDeque<u32>,
+    /// the same ids as `resets`, for a fast `contains`
+    resets_set: HashSet<u32>,
     /// the last open streams the client reset. A frame on one of them is a
     /// stream error STREAM_CLOSED (RFC 9113 5.1). Apart from `resets`, and
     /// only for streams that were open, so RSTs on closed ids add nothing.
     client_resets: VecDeque<u32>,
+    /// the same ids as `client_resets`, for a fast `contains`
+    client_resets_set: HashSet<u32>,
     /// request body bytes buffered in all streams (see `data`)
     buffered: usize,
     /// we sent GOAWAY NO_ERROR: no new streams
@@ -282,7 +286,9 @@ impl H2 {
             seen: 0,
             last: 0,
             resets: VecDeque::new(),
+            resets_set: HashSet::new(),
             client_resets: VecDeque::new(),
+            client_resets_set: HashSet::new(),
             buffered: 0,
             away: false,
             peer_away: false,
@@ -535,7 +541,8 @@ impl H2 {
                     // a stream we or the client reset: after the decode
                     // (see `request`)
                     State::Closed
-                        if self.client_resets.contains(&h.id) || self.resets.contains(&h.id) => {}
+                        if self.client_resets_set.contains(&h.id)
+                            || self.resets_set.contains(&h.id) => {}
                     State::Closed => return Err(conn_err(frame::STREAM_CLOSED)),
                     // trailers, or an error after the decode (the table
                     // must stay in sync): see `request`
@@ -577,10 +584,13 @@ impl H2 {
                 // STREAM_CLOSED (RFC 9113 5.1). A closed id is not, so
                 // RSTs on closed ids fill nothing.
                 if self.streams.contains_key(&h.id) {
-                    if self.client_resets.len() >= self.max_streams.max(RESETS) {
-                        self.client_resets.pop_front();
+                    if self.client_resets.len() >= self.max_streams.max(RESETS)
+                        && let Some(old) = self.client_resets.pop_front()
+                    {
+                        self.client_resets_set.remove(&old);
                     }
                     self.client_resets.push_back(h.id);
+                    self.client_resets_set.insert(h.id);
                 }
                 self.drop_stream(h.id);
                 Ok(())
@@ -681,10 +691,10 @@ impl H2 {
             // stream error (RFC 9113 5.1). DATA of a stream we reset may
             // still be on its way: ignored. On a stream that ended it is
             // a connection error.
-            if self.client_resets.contains(&id) {
+            if self.client_resets_set.contains(&id) {
                 return Err(stream_err(frame::STREAM_CLOSED));
             }
-            if self.resets.contains(&id) {
+            if self.resets_set.contains(&id) {
                 return Ok(());
             }
             return Err(conn_err(frame::STREAM_CLOSED));
@@ -824,13 +834,18 @@ impl H2 {
         };
         // any HPACK error leaves our table out of sync with the client's:
         // the connection must close
+        // a decode we drop costs a token (the client's own reset costs
+        // one as a stream error)
+        if closed && !self.client_resets_set.contains(&id) {
+            self.spend()?;
+        }
         let list = self
             .dec
             .decode(block, MAX_HEAD, |n, v| req.field(n, v))
             .map_err(|_| conn_err(frame::COMPRESSION_ERROR))?;
         if closed {
             // the client reset it: STREAM_CLOSED. We reset it: ignored.
-            return if self.client_resets.contains(&id) {
+            return if self.client_resets_set.contains(&id) {
                 Err(stream_err(frame::STREAM_CLOSED))
             } else {
                 Ok(())
@@ -850,6 +865,9 @@ impl H2 {
         if self.away || self.peer_away {
             self.spend()?;
             self.remember(id);
+            // a flood is bounded by the bucket, not by the empty count: a
+            // busy client has many requests in flight after our GOAWAY
+            self.counted = false;
             return Ok(()); // after GOAWAY: ignored (RFC 9113 6.8)
         }
         if self.streams.len() >= self.max_streams {
@@ -927,10 +945,13 @@ impl H2 {
 
     /// Notes that we reset stream `id`. Only the last [RESETS] are kept.
     fn remember(&mut self, id: u32) {
-        if self.resets.len() >= self.max_streams.max(RESETS) {
-            self.resets.pop_front();
+        if self.resets.len() >= self.max_streams.max(RESETS)
+            && let Some(old) = self.resets.pop_front()
+        {
+            self.resets_set.remove(&old);
         }
         self.resets.push_back(id);
+        self.resets_set.insert(id);
     }
 
     /// A stream error: RST_STREAM, and the stream is gone.
