@@ -47,13 +47,12 @@ const TABLE_SIZE: usize = 4096;
 const RESETS: usize = 64;
 
 const MAX_FRAME_LIMIT: u32 = (1 << 24) - 1;
-/// Answer bytes in the write buffer before more DATA frames are added.
-/// The rest waits in its stream, so the buffer stays small and the
-/// streams take turns.
 /// How many full-size uploads one connection may hold at once. The memory
 /// stays bounded at this many times one HTTP/1.1 connection.
 const BODY_STREAMS_CAP: usize = 4;
-
+/// Answer bytes in the write buffer before more DATA frames are added.
+/// The rest waits in its stream, so the buffer stays small and the
+/// streams take turns.
 const HOLD: usize = 64 * 1024;
 /// Request flag bit 3: the request came over HTTP/2.
 const FLAG_H2: u32 = 8;
@@ -515,7 +514,12 @@ impl H2 {
         // all bodies of the connection together: BODY_STREAMS_CAP full-size
         // uploads at once. Dart has not seen this request, so the client
         // may retry it.
-        if self.buffered + data.len() > BODY_STREAMS_CAP * self.max_body.max(self.max_multipart) {
+        if self.buffered + data.len()
+            > self
+                .max_body
+                .max(self.max_multipart)
+                .saturating_mul(BODY_STREAMS_CAP)
+        {
             self.reset(out, id, frame::REFUSED_STREAM);
             return Ok(());
         }
