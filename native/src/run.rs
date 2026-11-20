@@ -1092,9 +1092,13 @@ impl Conn {
                     break;
                 }
             }
-            // the client closed its side and all its frames are read: a
-            // streamed body can not end well any more
-            if self.eof && self.rpos == self.rlen && h2.held.is_none() {
+            // the client closed its side and all its frames are read (a
+            // partial frame is left at most): a streamed body can not end
+            // well any more
+            if self.eof
+                && h2.held.is_none()
+                && crate::h2::H2::partial(&self.rbuf[self.rpos..self.rlen])
+            {
                 h2.cut_bodies();
             }
             return Ok(());
@@ -4110,6 +4114,19 @@ pub mod fuzz {
             }
         }
         assert_eq!(open, ended, "each streamed body ends once");
+        // parts that waited for Dart are joined, so how the bytes came in
+        // changes the part sizes: compare one part per stream
+        let mut joined: Vec<(u32, u32, u16, Vec<u8>)> = Vec::new();
+        for rec in std::mem::take(&mut seen.body) {
+            let at = joined
+                .iter()
+                .position(|j| j.0 == rec.0 && j.1 == crate::BODY_PART && rec.1 == crate::BODY_PART);
+            match at {
+                Some(i) => joined[i].3.extend_from_slice(&rec.3),
+                None => joined.push(rec),
+            }
+        }
+        seen.body = joined;
         seen
     }
 

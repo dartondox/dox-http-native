@@ -328,7 +328,7 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
       }
       streams.clear();
       for (NativeResponse res in List<NativeResponse>.of(watched.values)) {
-        res.gone();
+        res.markGone();
       }
       watched.clear();
       // and no request body part comes any more
@@ -360,13 +360,13 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   /// Rust closed the connection of request [id] before it got an answer.
   void _requestGone(int id) {
     NativeResponse? res = watched[id];
-    if (res != null) return res.gone();
+    if (res != null) return res.markGone();
     // a request of this batch: its handler already ran. When it answered
     // (or started a stream) nothing waits, so no id is kept.
     for (NativeRequest req in _batch) {
       if (req.id != id) continue;
       NativeResponse res = req.response;
-      if (!res.isClosed && !res.headSent) res.gone();
+      if (!res.isClosed && !res.headSent) res.markGone();
       return;
     }
     // An open request of an earlier batch whose `done` is not read yet:

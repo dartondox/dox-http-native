@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:collection';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -184,9 +183,10 @@ class NativeRequest extends Stream<Uint8List> implements HttpRequest {
 
   // ---- a body in parts ([isStreamed]) ----
 
-  /// parts from Rust the listener did not take yet. At most the stream
-  /// window of Rust (1 MiB): the client waits for our acks.
-  late final Queue<Uint8List> _waiting = Queue<Uint8List>();
+  /// bytes from Rust the listener did not take yet, in one buffer: a
+  /// million tiny parts are one chunk, not a million objects. At most the
+  /// stream window of Rust (1 MiB): the client waits for our acks.
+  final BytesBuilder _waiting = BytesBuilder();
 
   /// sync: a part counts as taken once `add` returns (the listener's
   /// `onData` ran). A paused listener gets no part, so none is acked.
@@ -212,12 +212,14 @@ class NativeRequest extends Stream<Uint8List> implements HttpRequest {
   }
 
   /// For the server: the body ended (BODY_END). [status] 0 is a clean end.
-  /// Else the stream was reset (or the connection died): the parts not
-  /// taken yet are dropped and the body stream ends with an error.
+  /// 2 means the response ended first (the handler answered before it read
+  /// all): also a clean end, with no error. Any other status: the stream
+  /// was reset (or the connection died): the parts not taken yet are
+  /// dropped and the body stream ends with an error.
   void bodyEnd(int status) {
     if (_ended) return;
     _ended = true;
-    if (status == 0) return _drainSoon();
+    if (status == 0 || status == 2) return _drainSoon();
     _waiting.clear();
     if (_cancelled) return;
     _parts.addError(HttpException('stream reset', uri: uri));
@@ -237,23 +239,25 @@ class NativeRequest extends Stream<Uint8List> implements HttpRequest {
     StreamController<Uint8List> parts = _parts;
     if (parts.isClosed) return;
     int taken = 0;
-    while (_waiting.isNotEmpty && parts.hasListener && !parts.isPaused) {
-      Uint8List part = _waiting.removeFirst();
-      taken += part.length;
-      parts.add(part);
+    try {
+      // all that waits goes as one chunk, and what the listener got is acked
+      if (_waiting.isNotEmpty && parts.hasListener && !parts.isPaused) {
+        Uint8List part = _waiting.takeBytes();
+        taken = part.length;
+        parts.add(part);
+      }
+    } finally {
+      // also when the listener throws: the client must not stall
+      server.sendBodyAck(id, taken);
+      if (_ended && _waiting.isEmpty) parts.close();
     }
-    server.sendBodyAck(id, taken);
-    if (_ended && _waiting.isEmpty) parts.close();
   }
 
   /// The listener cancelled: drop what waits, and ack it and all later
   /// parts, so the client is not stuck.
   void _dropAll() {
     _cancelled = true;
-    int dropped = 0;
-    for (Uint8List part in _waiting) {
-      dropped += part.length;
-    }
+    int dropped = _waiting.length;
     _waiting.clear();
     server.sendBodyAck(id, dropped);
   }

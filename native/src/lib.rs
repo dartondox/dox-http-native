@@ -49,16 +49,27 @@
 //! ([REQUEST_GONE]): the connection closed while this request (the id) had
 //! no answer yet. Dart then completes `done` of its response.
 //!
-//! Streamed request body (HTTP/2 only, `content-type: application/grpc*`):
-//! the request record comes as soon as the HEADERS do, with flag bit 4 and
-//! no body. Then records of kind 7 ([BODY_PART], id: the request id, body:
-//! the bytes) and one of kind 8 ([BODY_END], the remote_port field is the
-//! status: 0 a clean end, else the stream was reset or the connection
-//! died). A request whose HEADERS end the stream has no body: it comes as a
+//! Streamed request body (HTTP/2 only, `content-type: application/grpc`,
+//! also `application/grpc+proto` or `application/grpc;...`): the request
+//! record comes as soon as the HEADERS do, with flag bit 4 and no body.
+//! Then records of kind 7 ([BODY_PART], id: the request id, body: the
+//! bytes) and one of kind 8 ([BODY_END], the remote_port field is the
+//! status). Parts that wait for Dart may be joined: a part can hold the
+//! bytes of many DATA frames. BODY_END status:
+//! - 0: the client ended the body cleanly.
+//! - 1: the client reset the stream, closed its side early or the
+//!   connection died. This is a real failure.
+//! - 2: the answer ended before the body, so we reset the stream with
+//!   NO_ERROR. This is not a failure: Dart closes the body stream without
+//!   an error.
+//!
+//! A request whose HEADERS end the stream has no body: it comes as a
 //! normal record, without bit 4. Dart answers bytes it consumed with
 //! response kind 10 (id: the request id, body: u64 bytes). Only then does
-//! the client get them back in its stream window (WINDOW_UPDATE), so the
-//! stream window (1 MiB) bounds the bytes that wait for Dart.
+//! the client get them back in its stream window and in the connection
+//! window (WINDOW_UPDATE). So the stream window (1 MiB) bounds the bytes
+//! that wait for Dart per stream, and the connection window (16 MiB) per
+//! connection.
 //! The header lines of a kind 8 are trailers (HTTP/2 only): they go out in
 //! a last HEADERS frame.
 //!

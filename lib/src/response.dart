@@ -27,6 +27,10 @@ class NativeResponse implements HttpResponse {
   /// Headers sent after the body, eg. `grpc-status` for gRPC. HTTP/2 only:
   /// on HTTP/1.1 they are dropped. Set them before [close]. `HttpResponse`
   /// has no trailers, so cast to [NativeResponse] to use them.
+  ///
+  /// When [close] sends a whole body with trailers, it goes out as a
+  /// streamed answer. It gets a `content-length` of the body (when you set
+  /// none), but it is never compressed, also not with `autoCompress`.
   NativeHeaders get trailers => _trailers ??= NativeHeaders.empty();
 
   /// the trailers to send: set, and HTTP/2
@@ -135,15 +139,47 @@ class NativeResponse implements HttpResponse {
   /// Rust sent [bytes] of the streamed body to the client. -1: the client
   /// is gone, stop sending.
   void streamed(int bytes) {
-    if (bytes < 0) return gone();
+    if (bytes < 0) return markGone();
     _unsent -= bytes;
     _wake();
   }
 
+  Completer<void>? _goneSignal;
+
+  /// True once the client is gone: it reset the stream, or the
+  /// connection died, before the response was sent. False for a response
+  /// that finished normally.
+  bool get isGone {
+    NativeHttpServer server = _request.server;
+    // the client left before anyone asked (see `goneIds`)
+    if (!_gone &&
+        server.goneIds.isNotEmpty &&
+        server.goneIds.remove(_request.id)) {
+      markGone();
+    }
+    return _gone;
+  }
+
+  /// Completes once, when the client is gone (see [isGone]). It never
+  /// completes for a response that finishes normally, so do not wait for
+  /// it without a timeout or a [done] to race against. It has no error.
+  Future<void> get gone {
+    Completer<void> signal = _goneSignal ??= Completer<void>();
+    if (isGone) {
+      if (!signal.isCompleted) signal.complete();
+    } else if (!_closed && _stream == null) {
+      // a response with no stream yet hears it from the server
+      _request.server.watched[_request.id] = this;
+    }
+    return signal.future;
+  }
+
   /// The client is gone. Writes are dropped from now on, [addStream] stops
   /// and [done] completes (with no error).
-  void gone() {
+  void markGone() {
     _gone = true;
+    Completer<void>? signal = _goneSignal;
+    if (signal != null && !signal.isCompleted) signal.complete();
     StreamIterator<List<int>>? source = _source;
     // ends a pending wait for the next chunk in [addStream]. An error of
     // the source's `onCancel` goes to [addStream], not to the zone.
@@ -338,7 +374,7 @@ class NativeResponse implements HttpResponse {
     // the head is out: later header and status changes are ignored
     headers.sent = true;
     // the server is closed: nothing goes out, so no wait for room
-    if (!_request.server.isOpen) gone();
+    if (!_request.server.isOpen) markGone();
   }
 
   /// Cookie does not check its domain, so a line break there would add a
@@ -401,7 +437,10 @@ class NativeResponse implements HttpResponse {
       if (stream == null && trailers != null) {
         // only the end of a streamed answer (kind 8) carries trailers: the
         // whole body goes as its first part
-        stream = _stream = server.startStream(_request, this, takeBody());
+        List<int> body = takeBody();
+        // the whole body is known, so the client gets its length
+        if (headers.contentLength < 0) headers.contentLength = body.length;
+        stream = _stream = server.startStream(_request, this, body);
         headers.sent = true;
       }
       if (stream == null) {
@@ -435,7 +474,7 @@ class NativeResponse implements HttpResponse {
       // the client left before anyone read done (see `goneIds`)
       NativeHttpServer server = _request.server;
       if (server.goneIds.isNotEmpty && server.goneIds.remove(_request.id)) {
-        gone();
+        markGone();
       }
       if (_closed || _gone) return Future<HttpResponse>.value(this);
       done = _done = Completer<HttpResponse>();

@@ -2848,19 +2848,31 @@ mod conn {
         }
         assert!(c.bodies.iter().all(|b| b.is_empty()));
         // not gRPC: Dart waits for the whole body
-        for (id, ct) in [(5, "application/json"), (7, "application/gr")] {
+        for (id, ct) in [
+            (5, "application/json"),
+            (7, "application/gr"),
+            (11, "application/grpc-web"),
+            (13, "application/grpc-web+proto"),
+            (15, "application/grpcfoo"),
+        ] {
             c.send(frame::HEADERS, frame::END_HEADERS, id, &grpc(ct));
         }
         assert_eq!(c.recs.len(), 2);
         c.send(frame::DATA, frame::END_STREAM, 5, b"{}");
         assert_eq!(record(&c.recs[2]).0, 8);
         assert_eq!(c.bodies[2], b"{}");
+
         // gRPC with END_STREAM on the HEADERS: no body, no bit 4
         let flags = frame::END_HEADERS | frame::END_STREAM;
-        c.send(frame::HEADERS, flags, 9, &grpc("application/grpc"));
+        c.send(frame::HEADERS, flags, 19, &grpc("application/grpc"));
         assert_eq!(record(&c.recs[3]).0, 8);
         assert!(to_dart(&mut c).is_empty());
         assert_eq!(c.h2.streaming().count(), 2);
+        // `;` and `+` after the type still count
+        let ct = "application/grpc; charset=utf-8";
+        c.send(frame::HEADERS, frame::END_HEADERS, 21, &grpc(ct));
+        assert_eq!(record(c.recs.last().unwrap()).0, 8 | 16);
+        assert_eq!(c.h2.streaming().count(), 3);
     }
 
     /// Parts go to Dart in order. The stream window comes back only after
@@ -2878,13 +2890,8 @@ mod conn {
         let p = padded(b"cde", 4);
         assert!(c.send(frame::DATA, frame::PADDED, 1, &p).is_empty());
         let got = to_dart(&mut c);
-        assert_eq!(
-            got,
-            [
-                (0, crate::BODY_PART, 0, b"ab".to_vec()),
-                (0, crate::BODY_PART, 0, b"cde".to_vec()),
-            ]
-        );
+        // the parts that wait for Dart are joined
+        assert_eq!(got, [(0, crate::BODY_PART, 0, b"abcde".to_vec())]);
         // a whole window with no ack: no stream WINDOW_UPDATE at all
         let big = vec![7u8; 16_384];
         let mut sent = 2 + 3 + 5;
@@ -3067,7 +3074,8 @@ mod conn {
             let fs = c.send(frame::DATA, 0, 1, &[1; 1000]);
             assert!(updates(&fs).is_empty());
         }
-        assert_eq!(to_dart(&mut c).len(), 10);
+        let parts: usize = to_dart(&mut c).iter().map(|m| m.3.len()).sum();
+        assert_eq!(parts, 10_000);
         assert_eq!(c.h2.buffered, 0);
         // a buffered upload next to it still fits under the cap
         c.send(frame::HEADERS, frame::END_HEADERS, 3, &post(100));
@@ -3106,7 +3114,8 @@ mod conn {
             ]
         );
         assert_eq!(code(&fs), frame::NO_ERROR);
-        assert_eq!(to_dart(&mut c), [(0, crate::BODY_END, 1, Vec::new())]);
+        // status 2: we answered first, not a failure
+        assert_eq!(to_dart(&mut c), [(0, crate::BODY_END, 2, Vec::new())]);
         assert!(c.h2.gone.is_empty(), "it was answered");
         assert!(c.send(frame::DATA, 0, 1, b"cd").is_empty());
         assert!(!c.h2.over());
@@ -3198,10 +3207,198 @@ mod conn {
             c.send(frame::DATA, 0, 1, &i.to_be_bytes());
             ack(&mut c, 0, 4);
         }
-        assert_eq!(to_dart(&mut c).len(), 5000);
+        let parts = to_dart(&mut c);
+        assert_eq!(parts.len(), 1, "joined");
+        assert_eq!(parts[0].3.len(), 5000 * 4);
         for _ in 0..200 {
             c.send(frame::DATA, 0, 1, b"");
         }
         assert!(c.h2.over(), "empty DATA is still a flood");
+    }
+
+    /// One body byte per DATA frame, a million of them on two streams that
+    /// take turns: the parts are joined, so Dart gets few records and the
+    /// bytes stay in order.
+    #[test]
+    fn tiny_data_frames_are_joined() {
+        let mut c = Client::new(250);
+        for id in [1, 3] {
+            c.send(
+                frame::HEADERS,
+                frame::END_HEADERS,
+                id,
+                &grpc("application/grpc"),
+            );
+        }
+        let (mut want, mut have) = ([Vec::new(), Vec::new()], [Vec::new(), Vec::new()]);
+        let mut records = 0;
+        for i in 0..(1u32 << 19) {
+            for (n, id) in [1u32, 3].into_iter().enumerate() {
+                let b = (i % 251) as u8;
+                want[n].push(b);
+                c.send(frame::DATA, 0, id, &[b]);
+            }
+            // Rust drains `to_dart` once in a while
+            if i % 1000 == 999 {
+                assert!(c.h2.to_dart.len() <= 2, "{}", c.h2.to_dart.len());
+                for (seq, kind, _, data) in to_dart(&mut c) {
+                    assert_eq!(kind, crate::BODY_PART);
+                    have[seq as usize].extend_from_slice(&data);
+                    records += 1;
+                }
+            }
+        }
+        for (seq, _, _, data) in to_dart(&mut c) {
+            have[seq as usize].extend_from_slice(&data);
+        }
+        assert!(have == want, "the bytes are in order");
+        assert!(records <= 2 * 525, "{records}");
+    }
+
+    /// The connection window of streamed bytes comes back on the ack, not
+    /// on arrival: the unacked bytes never pass CONN_WINDOW. A mix with a
+    /// buffered upload does not stall.
+    #[test]
+    fn streamed_bytes_hold_the_connection_window_until_acked() {
+        let mut c = Client::new(250);
+        let big = vec![3u8; 16_384];
+        let mut conn_updates = 0;
+        // 16 streams fill the connection window, 1 MiB each, no acks
+        for k in 0..16u32 {
+            let id = 2 * k + 1;
+            c.send(
+                frame::HEADERS,
+                frame::END_HEADERS,
+                id,
+                &grpc("application/grpc"),
+            );
+            for _ in 0..64 {
+                let fs = c.send(frame::DATA, 0, id, &big);
+                conn_updates += updates(&fs).iter().filter(|u| u.0 == 0).count();
+            }
+        }
+        assert_eq!(conn_updates, 0, "nothing is given back before an ack");
+        assert_eq!(c.h2.unacked, CONN_WINDOW);
+        assert_eq!(c.h2.recv, 0);
+        // one byte more is over the connection window
+        let fs = c.send(frame::DATA, 0, 1, b"x");
+        goaway(&fs, frame::FLOW_CONTROL_ERROR);
+
+        // an ack gives connection credit back
+        let mut c = Client::new(250);
+        for k in 0..16u32 {
+            let id = 2 * k + 1;
+            c.send(
+                frame::HEADERS,
+                frame::END_HEADERS,
+                id,
+                &grpc("application/grpc"),
+            );
+            for _ in 0..64 {
+                c.send(frame::DATA, 0, id, &big);
+            }
+        }
+        let fs = ack(&mut c, 0, 1 << 20);
+        let conn: Vec<_> = updates(&fs).into_iter().filter(|u| u.0 == 0).collect();
+        assert_eq!(conn, [(0, 1 << 20)]);
+        assert_eq!(c.h2.unacked, CONN_WINDOW - (1 << 20));
+        // an over-ack gives back at most what is owed
+        let fs = ack(&mut c, 0, u64::MAX);
+        assert!(updates(&fs).is_empty());
+        assert_eq!(c.h2.unacked, CONN_WINDOW - (1 << 20));
+
+        // a dropped stream gives back what was never acked
+        let mut conn = Vec::new();
+        for k in 1..9u32 {
+            let fs = c.send(frame::RST_STREAM, 0, 2 * k + 1, &8u32.to_be_bytes());
+            conn.extend(updates(&fs).into_iter().filter(|u| u.0 == 0));
+        }
+        // given back in a batch once half the window is due
+        assert_eq!(conn, [(0, 8 << 20)]);
+        assert_eq!(c.h2.unacked, CONN_WINDOW - (9 << 20));
+        assert_eq!(c.h2.recv, 9 << 20);
+
+        // buffered bytes still come back on arrival, next to streamed ones
+        let mut c = Client::new(250);
+        for k in 0..15u32 {
+            let id = 2 * k + 1;
+            c.send(
+                frame::HEADERS,
+                frame::END_HEADERS,
+                id,
+                &grpc("application/grpc"),
+            );
+            for _ in 0..64 {
+                c.send(frame::DATA, 0, id, &big);
+            }
+        }
+        assert_eq!(c.h2.unacked, 15 << 20);
+        // 1 MiB left: buffered uploads of 64 KiB each, 40 of them (2.5 MiB
+        // in all) must go through, because their bytes come back
+        let mut seen = 0;
+        for k in 0..40u32 {
+            let id = 100 + 2 * k;
+            c.send(frame::HEADERS, frame::END_HEADERS, id, &post(65_536));
+            for i in 0..4 {
+                let end = if i == 3 { frame::END_STREAM } else { 0 };
+                let fs = c.send(frame::DATA, end, id, &big);
+                assert!(
+                    !fs.iter().any(|f| f.0.kind == frame::GOAWAY),
+                    "stalled at {k}"
+                );
+                seen += c.bodies.len();
+            }
+        }
+        assert!(seen > 0);
+        assert!(c.h2.recv + c.h2.unacked <= CONN_WINDOW);
+    }
+
+    /// An ack after the body ended (END_STREAM) still gives connection
+    /// credit back.
+    #[test]
+    fn an_ack_after_the_end_gives_credit() {
+        let mut c = Client::new(250);
+        c.send(
+            frame::HEADERS,
+            frame::END_HEADERS,
+            1,
+            &grpc("application/grpc"),
+        );
+        c.send(frame::DATA, frame::END_STREAM, 1, &[1u8; 1000]);
+        assert_eq!(c.h2.unacked, 1000);
+        ack(&mut c, 0, 1000);
+        assert_eq!(c.h2.unacked, 0);
+    }
+
+    /// An ack for a buffered stream does nothing.
+    #[test]
+    fn an_ack_for_a_buffered_stream_is_ignored() {
+        let mut c = Client::new(250);
+        c.send(frame::HEADERS, frame::END_HEADERS, 1, &post(1000));
+        c.send(frame::DATA, 0, 1, &[1u8; 100]);
+        assert!(ack(&mut c, 0, 1 << 20).is_empty());
+        let r = c.h2.streams[&1].recv.as_ref().unwrap();
+        assert_eq!(r.acked, 0);
+        assert_eq!(r.window, (1 << 20) - 100);
+    }
+
+    /// A client reset (not our answer) ends the body with status 1.
+    #[test]
+    fn a_streamed_body_end_without_answer_is_status_1() {
+        let mut c = Client::new(250);
+        c.send(
+            frame::HEADERS,
+            frame::END_HEADERS,
+            1,
+            &grpc("application/grpc"),
+        );
+        c.send(frame::DATA, 0, 1, b"ab");
+        c.send(frame::RST_STREAM, 0, 1, &8u32.to_be_bytes());
+        let ends: Vec<u16> = to_dart(&mut c)
+            .iter()
+            .filter(|m| m.1 == crate::BODY_END)
+            .map(|m| m.2)
+            .collect();
+        assert_eq!(ends, [1]);
     }
 }

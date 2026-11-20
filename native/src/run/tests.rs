@@ -1866,4 +1866,20 @@ fn http2_streamed_body_acks_and_connection_death() {
         .map(|r| (r.kind(), r.code))
         .collect();
     assert_eq!(ends, [(REQUEST_GONE, 0)]);
+
+    // the client closes its side in the middle of a frame: the body ends
+    // at once too
+    let mut s = connect(port);
+    let cut = req.len() - 10 * (frame::HEAD + part.len());
+    s.write_all(&req[..cut]).unwrap();
+    s.write_all(&req[cut..cut + 5]).unwrap();
+    s.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut recs = Vec::new();
+    let end = Instant::now() + Duration::from_secs(5);
+    while !recs.iter().any(|r: &Rec| r.kind() == BODY_END) && Instant::now() < end {
+        let n = core.run(&[], &mut inb, 1000).unwrap();
+        recs.extend(records(&inb[..n]));
+    }
+    let last = recs.last().unwrap();
+    assert_eq!((last.kind(), last.code), (BODY_END, 1));
 }

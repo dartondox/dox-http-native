@@ -26,6 +26,15 @@ Completer<void> streamGone = Completer<void>();
 /// gRPC handlers: `/grpc-ignore` answers once this completes.
 Completer<void> release = Completer<void>();
 
+/// `/grpc-early`: its body stream ended (`done`, no error).
+Completer<bool> earlyDone = Completer<bool>();
+
+/// `/gone-wait` heard that the client left.
+Completer<void> goneSeen = Completer<void>();
+
+/// `/gone-normal`: did `gone` complete after a normal answer?
+bool goneAfterAnswer = false;
+
 /// The error the body stream of `/grpc-reset` ended with.
 Completer<Object> bodyError = Completer<Object>();
 
@@ -78,6 +87,21 @@ Future<void> grpc(NativeRequest req, NativeResponse res) async {
       // no body, trailers: HEADERS, then the trailers HEADERS
       await req.drain<void>();
       res.trailers.set('grpc-status', '5');
+    case '/grpc-early':
+      // answers before the body ends, listens with no onError
+      req.listen((Uint8List _) {}, onDone: () => earlyDone.complete(true));
+      res.write('early');
+    case '/grpc-cancel':
+      // takes one part, cancels: the rest must still be acked
+      Completer<void> first = Completer<void>();
+      late StreamSubscription<Uint8List> sub;
+      sub = req.listen((Uint8List _) {
+        if (!first.isCompleted) first.complete();
+      });
+      await first.future;
+      await sub.cancel();
+      await Future<void>.delayed(const Duration(seconds: 1));
+      res.write('ok');
     case '/grpc-reset':
       try {
         await req.drain<void>();
@@ -97,9 +121,9 @@ Future<void> grpc(NativeRequest req, NativeResponse res) async {
 }
 
 void handle(HttpRequest req) async {
-  HttpResponse res = req.response;
+  NativeResponse res = req.response as NativeResponse;
   if (req.uri.path.startsWith('/grpc')) {
-    return grpc(req as NativeRequest, res as NativeResponse);
+    return grpc(req as NativeRequest, res);
   }
   switch (req.uri.path) {
     case '/':
@@ -128,6 +152,19 @@ void handle(HttpRequest req) async {
         }
       }
       res.write('$length $sum');
+    case '/gone-wait':
+      unawaited(res.gone.then((_) => goneSeen.complete()));
+      await goneSeen.future.timeout(const Duration(seconds: 5));
+      expect(res.isGone, isTrue);
+    case '/gone-normal':
+      unawaited(res.gone.then((_) => goneAfterAnswer = true));
+      res.write('ok');
+    case '/trailers-204':
+      res.statusCode = HttpStatus.noContent;
+      res.trailers.set('grpc-status', '0');
+    case '/trailers-plain':
+      res.write('hello');
+      res.trailers.set('grpc-status', '0');
     case '/stream':
       await res.addStream(
         Stream<List<int>>.fromIterable(<List<int>>[
@@ -473,6 +510,75 @@ void main() {
     expect(a.status, 200);
     expect(utf8.decode(a.body), 'ok');
     expect((await request(c, '/')).status, 200);
+  });
+
+  test('an early answer ends the body stream without an error', () async {
+    ClientTransportStream s = grpcCall(c, '/grpc-early');
+    s.sendData(bytes(100));
+    Answer a = await answerOf(s);
+    expect(utf8.decode(a.body), 'early');
+    expect(await earlyDone.future.timeout(const Duration(seconds: 5)), isTrue);
+    expect((await request(c, '/')).status, 200);
+  });
+
+  test('a cancelled body subscription still acks the rest', () async {
+    ClientTransportStream s = grpcCall(c, '/grpc-cancel');
+    List<int> body = bytes(3 << 20);
+    for (int at = 0; at < body.length; at += 16 * 1024) {
+      s.sendData(body.sublist(at, at + 16 * 1024));
+    }
+    s.sendData(<int>[], endStream: true);
+    Answer a = await answerOf(s).timeout(const Duration(seconds: 10));
+    expect(utf8.decode(a.body), 'ok');
+  });
+
+  test(
+    'gone completes when the client resets, not on a normal answer',
+    () async {
+      ClientTransportStream s = c.makeRequest(<Header>[
+        Header.ascii(':method', 'GET'),
+        Header.ascii(':scheme', 'http'),
+        Header.ascii(':path', '/gone-wait'),
+      ], endStream: true);
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      s.terminate();
+      await goneSeen.future.timeout(const Duration(seconds: 5));
+      Answer a = await request(c, '/gone-normal');
+      expect(utf8.decode(a.body), 'ok');
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      expect(goneAfterAnswer, isFalse);
+    },
+  );
+
+  test('trailers on a whole body: content-length, HEAD and 204', () async {
+    ClientTransportStream s = c.makeRequest(<Header>[
+      Header.ascii(':method', 'GET'),
+      Header.ascii(':scheme', 'http'),
+      Header.ascii(':path', '/trailers-plain'),
+    ], endStream: true);
+    Answer a = await answerOf(s);
+    expect(utf8.decode(a.body), 'hello');
+    expect(a.headers['content-length'], '5');
+    expect(a.trailers, <String, String>{'grpc-status': '0'});
+    // HEAD: no body
+    s = c.makeRequest(<Header>[
+      Header.ascii(':method', 'HEAD'),
+      Header.ascii(':scheme', 'http'),
+      Header.ascii(':path', '/trailers-plain'),
+    ], endStream: true);
+    a = await answerOf(s);
+    expect(a.status, 200);
+    expect(a.body, isEmpty);
+    // 204: no body, no length
+    s = c.makeRequest(<Header>[
+      Header.ascii(':method', 'GET'),
+      Header.ascii(':scheme', 'http'),
+      Header.ascii(':path', '/trailers-204'),
+    ], endStream: true);
+    a = await answerOf(s);
+    expect(a.status, 204);
+    expect(a.body, isEmpty);
+    expect(a.headers.containsKey('content-length'), isFalse);
   });
 
   test('trailers come after the body', () async {

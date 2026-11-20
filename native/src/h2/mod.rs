@@ -245,6 +245,9 @@ pub(crate) struct H2 {
     /// streamed request bodies: records for Dart (request seq, kind
     /// BODY_PART or BODY_END, status, bytes), in order
     pub(crate) to_dart: Vec<(u32, u32, u16, Vec<u8>)>,
+    /// streamed body bytes Dart has not acked yet, all streams. Their
+    /// connection window is not given back before (see `settle`).
+    unacked: i64,
     /// flood counters, see the `MAX_*` limits
     reset_bucket: Bucket,
     reset_burst: f64,
@@ -316,6 +319,7 @@ impl H2 {
             gone: Vec::new(),
             gone_streams: Vec::new(),
             to_dart: Vec::new(),
+            unacked: 0,
             reset_bucket: Bucket::new(now, burst),
             reset_burst: burst,
             settings_rate: Rate::new(now),
@@ -447,6 +451,7 @@ impl H2 {
             self.reply(out, id, 408, false, date);
             self.drop_stream(id);
         }
+        self.settle(out);
     }
 
     /// True when the connection can close once the write buffer is out.
@@ -503,7 +508,29 @@ impl H2 {
                 self.fail(out, e.code);
             }
         }
+        self.settle(out);
         true
+    }
+
+    /// Gives connection window back to the client: what it sent and is
+    /// not held for Dart (`unacked`). Only once enough is due, or the
+    /// client is nearly stuck, so a mix of buffered and streamed bodies
+    /// never stalls. The streamed bytes of Dart keep CONN_WINDOW as their
+    /// cap: `recv + unacked <= CONN_WINDOW`.
+    fn settle(&mut self, out: &mut Vec<u8>) {
+        if self.dead {
+            return;
+        }
+        let due = CONN_WINDOW - self.unacked - self.recv;
+        if due > 0 && (due >= CONN_WINDOW / 2 || self.recv < ACK_BATCH as i64) {
+            frame::write_window(out, 0, due as u32);
+            self.recv += due;
+        }
+    }
+
+    /// True when `buf` holds no whole frame: more bytes are needed.
+    pub(crate) fn partial(buf: &[u8]) -> bool {
+        frame::read_head(buf).is_none_or(|h| buf.len() < frame::HEAD + h.len)
     }
 
     /// One frame. A frame that counts (see `counts`) and did no work adds
@@ -711,12 +738,7 @@ impl H2 {
             return Err(conn_err(frame::FLOW_CONTROL_ERROR));
         }
         self.recv -= flow as i64;
-        // give the window back once half of it is used, so the
-        // connection never stalls
-        if self.recv < CONN_WINDOW / 2 {
-            frame::write_window(out, 0, (CONN_WINDOW - self.recv) as u32);
-            self.recv = CONN_WINDOW;
-        }
+        // the window comes back in `settle`, after each frame
         if state == State::Closed {
             // After its own RST_STREAM the client may not send DATA: a
             // stream error (RFC 9113 5.1). DATA of a stream we reset may
@@ -747,7 +769,8 @@ impl H2 {
         }
         if r.streamed {
             // to Dart at once. The window comes back on Dart's ack, the
-            // padding now (Dart never sees it).
+            // padding now (Dart never sees it). The connection window of
+            // the data also waits for the ack (`unacked`).
             r.taken = got;
             r.acked += (flow - data.len()) as u64;
             give_back(out, id, r);
@@ -755,7 +778,19 @@ impl H2 {
                 self.worked = true;
             }
             if !data.is_empty() {
-                self.to_dart.push((s.seq, BODY_PART, 0, data.to_vec()));
+                s.owed += data.len() as u64;
+                self.unacked += data.len() as i64;
+                // Join it to a part of this stream that waits for Dart:
+                // 1M frames of 1 byte must not be 1M records.
+                let last = self
+                    .to_dart
+                    .iter_mut()
+                    .rev()
+                    .find(|p| p.0 == s.seq && p.1 == BODY_PART);
+                match last {
+                    Some(p) => p.3.extend_from_slice(data),
+                    None => self.to_dart.push((s.seq, BODY_PART, 0, data.to_vec())),
+                }
             }
             if end {
                 s.recv = None;
@@ -1033,6 +1068,8 @@ impl H2 {
                 self.turns.retain(|&t| t != id);
             }
             self.seqs.remove(&s.seq);
+            // what Dart never acked will not be acked now
+            self.unacked -= s.owed as i64;
             // Dart knows the request once its body is whole (or streams)
             if !s.answered && s.known() {
                 self.gone.push(s.seq);
@@ -1053,11 +1090,20 @@ impl H2 {
     /// comes (streamed) is not needed any more: RST_STREAM NO_ERROR tells
     /// the client to stop (RFC 9113 8.1).
     fn finish(&mut self, out: &mut Vec<u8>, id: u32) {
-        if self.streams.get(&id).is_some_and(|s| s.recv.is_some()) {
+        if let Some(s) = self.streams.get_mut(&id)
+            && s.recv.is_some()
+        {
+            // a streamed body ends for Dart with status 2: we answered
+            // first, nobody failed
+            if s.streaming() {
+                s.recv = None;
+                self.to_dart.push((s.seq, BODY_END, 2, Vec::new()));
+            }
             frame::write_rst(out, id, frame::NO_ERROR);
             self.remember(id);
         }
         self.drop_stream(id);
+        self.settle(out);
     }
 
     /// Dart consumed `n` bytes of the streamed body of request `seq`
@@ -1069,13 +1115,20 @@ impl H2 {
         let Some(&id) = self.seqs.get(&seq) else {
             return;
         };
-        let Some(r) = self.streams.get_mut(&id).and_then(|s| s.recv.as_mut()) else {
-            return; // the body ended: no more DATA comes
+        let Some(s) = self.streams.get_mut(&id) else {
+            return;
         };
-        // never more than the client used: the window stays <= ours
-        let used = (STREAM_WINDOW - r.window) as u64;
-        r.acked = r.acked.saturating_add(n).min(used);
-        give_back(out, id, r);
+        // the connection window of these bytes (never more than owed)
+        let free = n.min(s.owed);
+        s.owed -= free;
+        self.unacked -= free as i64;
+        if let Some(r) = s.recv.as_mut().filter(|r| r.streamed) {
+            // never more than the client used: the window stays <= ours
+            let used = (STREAM_WINDOW - r.window) as u64;
+            r.acked = r.acked.saturating_add(n).min(used);
+            give_back(out, id, r);
+        } // else: the body ended, no more DATA comes
+        self.settle(out);
     }
 
     /// No more frames come (the client closed its side): each body that
@@ -1552,9 +1605,12 @@ impl Req {
                 self.form = mime
                     .trim_ascii()
                     .eq_ignore_ascii_case(b"multipart/form-data");
-                self.grpc = value
-                    .get(..GRPC.len())
-                    .is_some_and(|p| p.eq_ignore_ascii_case(GRPC));
+                // `application/grpc`, then the end, `+` or `;` (not
+                // `application/grpc-web` or `application/grpcfoo`)
+                self.grpc = value.get(..GRPC.len()).is_some_and(|p| {
+                    p.eq_ignore_ascii_case(GRPC)
+                        && matches!(value.get(GRPC.len()), None | Some(b'+' | b';'))
+                });
             }
             _ => {}
         }
