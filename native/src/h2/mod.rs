@@ -63,9 +63,23 @@ const MAX_FRAME_LIMIT: u32 = (1 << 24) - 1;
 /// The bucket holds a burst of `max(2 * max_streams, RESET_BURST_MIN)`, so
 /// a client or proxy that cancels all its calls at once is not cut. It
 /// refills `RESET_RATE` tokens a second: only a flood that goes on is cut.
+/// Each answer with a body gives half a token back (`RESET_REFUND`). A
+/// gRPC client sends all its calls on one connection, and a call over its
+/// deadline is a reset: a busy client with some timeouts must not be cut.
+/// A client with up to about a third of its calls reset is not cut. An
+/// attacker needs two real answers per reset.
+/// Known limit (the same trade as Envoy's premature-reset check): the two
+/// answers may come from a cheap route and the reset from a costly one.
+/// The handler of a reset request still runs to its end in Dart. A full
+/// fix counts those handlers against `max_streams` until they answer (as
+/// grpc-go does).
 const RESET_BURST_MIN: u32 = 1000;
 /// Tokens that come back each second (the sustained rate of resets).
 const RESET_RATE: f64 = 100.0;
+/// Tokens an answer with a body gives back. It is half, so an attacker
+/// that pairs each reset with one cheap answer still loses tokens. Answers
+/// without a body (HEAD, 204, 304, empty, headers only) give nothing.
+const RESET_REFUND: f64 = 0.5;
 /// SETTINGS frames per second.
 const MAX_SETTINGS: u32 = 100;
 /// SETTINGS whose ACK is not written yet: the client does not read.
@@ -130,6 +144,11 @@ impl Bucket {
         }
         self.tokens -= 1.0;
         true
+    }
+
+    /// Gives `RESET_REFUND` back: a stream was answered with a body.
+    fn give(&mut self, burst: f64) {
+        self.tokens = (self.tokens + RESET_REFUND).min(burst);
     }
 }
 
@@ -1088,8 +1107,9 @@ impl H2 {
 
     /// The answer of stream `id` is all out. A request body that still
     /// comes (streamed) is not needed any more: RST_STREAM NO_ERROR tells
-    /// the client to stop (RFC 9113 8.1).
-    fn finish(&mut self, out: &mut Vec<u8>, id: u32) {
+    /// the client to stop (RFC 9113 8.1). `paid` is true when the answer
+    /// sent a body: only then the reset bucket gets a refund.
+    fn finish(&mut self, out: &mut Vec<u8>, id: u32, paid: bool) {
         if let Some(s) = self.streams.get_mut(&id)
             && s.recv.is_some()
         {
@@ -1101,6 +1121,9 @@ impl H2 {
             }
             frame::write_rst(out, id, frame::NO_ERROR);
             self.remember(id);
+        }
+        if paid && self.streams.contains_key(&id) {
+            self.reset_bucket.give(self.reset_burst);
         }
         self.drop_stream(id);
         self.settle(out);
@@ -1250,7 +1273,7 @@ impl H2 {
         let silent = no_body || s.head;
         frame::write_headers(out, id, &head_block(status, lines, left, date), silent, max);
         if silent {
-            self.finish(out, id);
+            self.finish(out, id, false);
             return false;
         }
         s.sid = Some(sid);
@@ -1310,7 +1333,9 @@ impl H2 {
             } else {
                 frame::write_headers(out, id, &s.trailers, true, self.peer_frame);
             }
-            self.finish(out, id);
+            // no DATA bytes (eg. a gRPC error with trailers only): no refund
+            let paid = s.wrote;
+            self.finish(out, id, paid);
         }
     }
 
@@ -1336,7 +1361,7 @@ impl H2 {
         let block = head_block(status, lines, len, date);
         frame::write_headers(out, id, &block, silent, self.peer_frame);
         if silent {
-            self.finish(out, id);
+            self.finish(out, id, false);
         } else {
             s.body = body.to_vec();
             s.done = true;
@@ -1387,6 +1412,7 @@ impl H2 {
             };
             frame::write(out, frame::DATA, flags, id, &s.body[s.sent..s.sent + k]);
             s.sent += k;
+            s.wrote |= k > 0;
             s.stalled = None; // bytes moved: the stall clock starts again
             self.data_sent += k as u64;
             self.pings_rate.n = 0; // see MAX_PINGS
@@ -1401,7 +1427,7 @@ impl H2 {
                 if !s.trailers.is_empty() {
                     frame::write_headers(out, id, &s.trailers, true, self.peer_frame);
                 }
-                self.finish(out, id);
+                self.finish(out, id, true);
             } else if s.unsent() > 0 {
                 self.turns.push_back(id);
             } else {

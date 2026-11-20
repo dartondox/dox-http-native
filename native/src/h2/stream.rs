@@ -58,6 +58,9 @@ pub(crate) struct Stream {
     /// answer body bytes, `sent..` is not sent yet
     pub(crate) body: Vec<u8>,
     pub(crate) sent: usize,
+    /// Some answer bytes went out in DATA: a full answer then gives a
+    /// reset token back (see `RESET_REFUND`).
+    pub(crate) wrote: bool,
     /// streamed request body: bytes given to Dart that it has not acked.
     /// Their connection window waits for the ack (`H2::unacked`).
     pub(crate) owed: u64,
@@ -83,6 +86,7 @@ impl Stream {
             turn: false,
             body: Vec::new(),
             sent: 0,
+            wrote: false,
             owed: 0,
             trailers: Vec::new(),
             stalled: None,
