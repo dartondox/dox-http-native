@@ -35,6 +35,14 @@ void main() {
         for (int i = 0; i < 256; i++) {
           ws.add(Uint8List(64 * 1024));
         }
+      case '/later':
+        // like a handler that asks a database before it answers
+        WebSocket ws = await NativeWebSocket.upgrade(req);
+        accepted.add(ws);
+        ws.listen((dynamic message) async {
+          await Future<void>.delayed(Duration.zero);
+          ws.add(message);
+        });
       default:
         WebSocket ws = await NativeWebSocket.upgrade(
           req,
@@ -55,6 +63,20 @@ void main() {
   });
 
   tearDown(() => server.close(force: true));
+
+  test('an answer that comes one event-loop turn later is not held', () async {
+    WebSocket ws = await WebSocket.connect(url('/later'));
+    StreamIterator<dynamic> answers = StreamIterator<dynamic>(ws);
+    Stopwatch clock = Stopwatch()..start();
+    for (int i = 0; i < 300; i++) {
+      ws.add('m$i');
+      expect(await answers.moveNext(), isTrue);
+      expect(answers.current, 'm$i');
+    }
+    // a wait for requests after each message would cost 1 ms each
+    expect(clock.elapsedMilliseconds, lessThan(200));
+    await ws.close();
+  });
 
   test('echoes text and binary', () async {
     WebSocket ws = await WebSocket.connect(url('/ws'));

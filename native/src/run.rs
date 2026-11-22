@@ -8,9 +8,10 @@
 //!
 //! It returns the bytes it wrote there. Dart may pass a budget: then the
 //! call waits up to that long for new requests when there are none. Dart
-//! passes a budget only when it has no open request and its last call
-//! found nothing. Else Dart may have other work (timers, database replies,
-//! other ports), and a wait here would hold it up.
+//! passes a budget only when the call sends a whole answer and Dart has
+//! no open request and no streamed answer. Else Dart may have other work
+//! (timers, database replies, other ports), and a wait here would hold it
+//! up.
 //!
 //! When a call finds nothing, it returns 0 and the idle helper takes over:
 //! one small thread per server. It sleeps while Dart runs. Then it waits
@@ -2960,6 +2961,9 @@ impl Native {
         let mut core = self.core.lock().unwrap();
         core.update_clock();
         core.wait(Some(wait.min(Duration::from_millis(1))));
+        // the wait can send a gzip answer, and a write that stalls sets a
+        // timer: the helper must know it
+        self.set_due(core.next_timer());
         core.has_work()
     }
 
