@@ -43,6 +43,13 @@ void handle(HttpRequest req) async {
         res.contentLength = 80 * 65536;
       }
       await res.addStream(parts(80));
+    case '/drip':
+      // a real stream (the flush starts it), then 200 small parts, each
+      // made in its own event-loop turn
+      res.headers.contentType = ContentType.binary;
+      res.add(const <int>[7]);
+      await res.flush();
+      await res.addStream(drip(200));
     case '/liar':
       // a content length that is too small for the streamed body
       res.contentLength = 100000;
@@ -350,6 +357,30 @@ Future<String> raw(int port, String request, {Duration? wait}) async {
 
 /// Load from another isolate: 32 clients send requests to [args] port
 /// one after the other, until [args] milliseconds passed.
+Stream<List<int>> drip(int count) async* {
+  for (int i = 0; i < count; i++) {
+    await Future<void>.delayed(Duration.zero);
+    yield const <int>[7];
+  }
+}
+
+/// One connection that sends `GET /` about every 0.7 ms for `args[1]` ms.
+void steady(List<Object> args) async {
+  Socket socket = await Socket.connect('127.0.0.1', args[0] as int);
+  socket.setOption(SocketOption.tcpNoDelay, true);
+  StreamIterator<Uint8List> answers = StreamIterator<Uint8List>(socket);
+  Stopwatch clock = Stopwatch()..start();
+  while (clock.elapsedMilliseconds < (args[1] as int)) {
+    socket.add(ascii.encode('GET / HTTP/1.1\r\nHost: a\r\n\r\n'));
+    if (!await answers.moveNext()) break;
+    // a timer is too coarse for 0.7 ms
+    int until = clock.elapsedMicroseconds + 700;
+    while (clock.elapsedMicroseconds < until) {}
+  }
+  socket.destroy();
+  (args[2] as SendPort).send(true);
+}
+
 void load(List<Object> args) async {
   int port = args[0] as int;
   Stopwatch clock = Stopwatch()..start();
@@ -582,6 +613,54 @@ void main() {
     expect(worst, lessThan(50), reason: 'late by $worst ms');
     await done.first;
   });
+
+  test(
+    'the event loop gets its turns while requests come one by one',
+    () async {
+      // each answer is followed by a short wait for the next request. The
+      // waits of one chain of calls must not add up: a timer, a database
+      // reply or another port needs its turn.
+      ReceivePort done = ReceivePort();
+      await Isolate.spawn(steady, <Object>[port, 400, done.sendPort]);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      int ticks = 0;
+      Timer timer = Timer.periodic(
+        const Duration(milliseconds: 1),
+        (Timer _) => ticks++,
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      timer.cancel();
+      expect(ticks, greaterThan(75), reason: '$ticks turns in 300 ms');
+      await done.first.timeout(const Duration(seconds: 10));
+    },
+  );
+
+  test(
+    'a streamed answer does not wait while other requests get answers',
+    () async {
+      // The stream is open, and whole answers go out on another connection.
+      // A wait for requests after each of them would hold the next part.
+      await get('/');
+      ReceivePort done = ReceivePort();
+      await Isolate.spawn(steady, <Object>[port, 1500, done.sendPort]);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      // the best of 5: one stall of the machine does not fail the test
+      int best = 1 << 30;
+      for (int run = 0; run < 5; run++) {
+        Stopwatch clock = Stopwatch()..start();
+        HttpClientRequest req = await client.get('127.0.0.1', port, '/drip');
+        HttpClientResponse res = await req.close();
+        int length = 0;
+        await for (List<int> part in res) {
+          length += part.length;
+        }
+        expect(length, 201);
+        best = min(best, clock.elapsedMilliseconds);
+      }
+      expect(best, lessThan(100), reason: 'the best run took $best ms');
+      await done.first.timeout(const Duration(seconds: 10));
+    },
+  );
 
   test('a line break in a cookie domain or server header is refused', () async {
     expect(await get('/bad-cookie'), (200, 'refused'));

@@ -35,6 +35,14 @@ void main() {
         for (int i = 0; i < 256; i++) {
           ws.add(Uint8List(64 * 1024));
         }
+      case '/later':
+        // like a handler that asks a database before it answers
+        WebSocket ws = await NativeWebSocket.upgrade(req);
+        accepted.add(ws);
+        ws.listen((dynamic message) async {
+          await Future<void>.delayed(Duration.zero);
+          ws.add(message);
+        });
       default:
         WebSocket ws = await NativeWebSocket.upgrade(
           req,
@@ -55,6 +63,25 @@ void main() {
   });
 
   tearDown(() => server.close(force: true));
+
+  test('an answer that comes one event-loop turn later is not held', () async {
+    WebSocket ws = await WebSocket.connect(url('/later'));
+    StreamIterator<dynamic> answers = StreamIterator<dynamic>(ws);
+    // A wait for requests after each message would cost 1 ms each: 60 ms
+    // for a run. The best of 5 runs: one stall does not fail the test.
+    int best = 1 << 30;
+    for (int run = 0; run < 5; run++) {
+      Stopwatch clock = Stopwatch()..start();
+      for (int i = 0; i < 60; i++) {
+        ws.add('m$i');
+        expect(await answers.moveNext(), isTrue);
+        expect(answers.current, 'm$i');
+      }
+      if (clock.elapsedMilliseconds < best) best = clock.elapsedMilliseconds;
+    }
+    expect(best, lessThan(40), reason: 'the best run took $best ms');
+    await ws.close();
+  });
 
   test('echoes text and binary', () async {
     WebSocket ws = await WebSocket.connect(url('/ws'));

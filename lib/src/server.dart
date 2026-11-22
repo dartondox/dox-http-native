@@ -565,14 +565,25 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   bool _pumpQueued = false;
   int _chain = 0;
 
-  /// the last `dox_run` call found nothing
-  bool _lastEmpty = true;
-
-  /// How long `dox_run` may wait for new requests. Only when no request is
-  /// open and the last call found nothing: else Dart may have other work
-  /// (timers, database replies, other ports) and must not wait here. When
-  /// none comes, Rust hands the sockets to its idle thread.
+  /// How long `dox_run` may wait for new requests. Only when this call
+  /// sends a whole answer, and no request and no streamed answer is open:
+  /// the clients of the answers send their next requests soon, so a short
+  /// wait here gets them without a trip through the idle thread and the
+  /// event loop (2 thread wake-ups). In all other cases Dart can have
+  /// work that Rust does not see (a timer, a database reply, the next
+  /// part of a stream, the answer to a WebSocket message), and a wait
+  /// here would hold it up. When nothing comes in this time, Rust hands
+  /// the sockets to its idle thread.
   static const int _budgetUs = 1000;
+
+  /// a whole answer was queued after the last `dox_run` call
+  bool _answered = false;
+
+  /// The time of the calls that had a wait budget, since the event loop
+  /// last had a turn. At [_budgetUs] the next call goes through the event
+  /// loop, so the waits of a chain of calls do not add up.
+  int _waitedUs = 0;
+  final Stopwatch _clock = Stopwatch()..start();
 
   Uint8List _defaultLines = Uint8List(0);
   int _defaultVersion = -1;
@@ -658,6 +669,7 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
     // an answer to a request (whole, WebSocket accept or streamed)
     int k = kind & 0xff;
     if (k == 0 || k == 1 || k == 6) _open--;
+    if (k == 0) _answered = true;
     _ensure(20);
     int start = _len;
     _outData.setUint64(start, id, Endian.little);
@@ -825,7 +837,8 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
     // under load, and more parts can join this write. A whole answer that
     // comes while such a pump waits also waits one event-loop turn. That
     // is short, and a microtask pump that is already queued is not delayed.
-    if (_partsWaiting || ++_chain & 15 == 0) {
+    if (_partsWaiting || ++_chain & 15 == 0 || _waitedUs >= _budgetUs) {
+      _waitedUs = 0;
       Timer.run(_pump);
     } else {
       scheduleMicrotask(_pump);
@@ -916,14 +929,11 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   void _pump() {
     _pumpQueued = false;
     if (_handle == 0) return;
-    int n = doxRun(
-      _handle,
-      _outPtr,
-      _len,
-      _inPtr,
-      _inList.length,
-      _open <= 0 && _lastEmpty ? _budgetUs : 0,
-    );
+    int budget = _answered && _open <= 0 && streams.isEmpty ? _budgetUs : 0;
+    _answered = false;
+    int start = budget > 0 ? _clock.elapsedMicroseconds : 0;
+    int n = doxRun(_handle, _outPtr, _len, _inPtr, _inList.length, budget);
+    if (budget > 0) _waitedUs += _clock.elapsedMicroseconds - start;
     _len = 0;
     if (_out.length > 1 << 20) {
       // do not keep a big body buffer forever
@@ -943,9 +953,9 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
       _inList = _inPtr.asTypedList(size);
       n = doxRun(_handle, _outPtr, 0, _inPtr, size, 0);
     }
-    _lastEmpty = n == 0;
     if (n == 0) {
       _chain = 0;
+      _waitedUs = 0;
       return; // Rust posts to the port when more comes
     }
     // a copy: Rust writes the next batch into the same buffer, and the
