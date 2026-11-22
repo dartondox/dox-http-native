@@ -1813,6 +1813,12 @@ impl Core {
         }
         self.events = events;
         self.kill_dead();
+        if woke {
+            // A gzip job is done. Take it now: this poll used up the event
+            // of the waker, so no later poll (of Dart or of the idle
+            // helper) sees it, and the answer would wait for other traffic.
+            self.take_zipped();
+        }
         (any, woke)
     }
 

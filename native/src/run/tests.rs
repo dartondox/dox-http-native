@@ -832,6 +832,30 @@ fn gzip_runs_on_the_helper_thread() {
     assert_eq!(back, b"hello ".repeat(100));
 }
 
+/// The gzip thread wakes the poll while a call waits. That call must send
+/// the answer: the event of the waker comes only once, so no later call
+/// and no idle helper would know about the done job.
+#[test]
+fn gzip_done_during_the_wait_is_sent_by_the_same_call() {
+    let (mut core, port) = new_core(limits());
+    let mut inb = vec![0u8; 1 << 18];
+    let mut out = Vec::new();
+    let mut s = connect(port);
+    accept(&mut core, &mut inb, 1);
+    s.write_all(b"GET /zip HTTP/1.1\r\n\r\n").unwrap();
+    let end = Instant::now() + Duration::from_secs(5);
+    while out.is_empty() && Instant::now() < end {
+        turn(&mut core, &mut inb, &mut out, 1000);
+    }
+    assert!(!out.is_empty(), "the app answered");
+    // one call: it gives the job to the gzip thread, then waits
+    assert_eq!(core.run(&out, &mut inb, 2_000_000), Ok(0));
+    let mut head = [0u8; 15];
+    s.read_exact(&mut head)
+        .expect("the answer, with no other call");
+    assert_eq!(&head, b"HTTP/1.1 200 OK");
+}
+
 /// A graceful shutdown: no new connections, the open request gets its
 /// answer (with `connection: close`), then it is done.
 #[test]

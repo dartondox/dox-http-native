@@ -565,13 +565,13 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   bool _pumpQueued = false;
   int _chain = 0;
 
-  /// the last `dox_run` call found nothing
-  bool _lastEmpty = true;
-
-  /// How long `dox_run` may wait for new requests. Only when no request is
-  /// open and the last call found nothing: else Dart may have other work
-  /// (timers, database replies, other ports) and must not wait here. When
-  /// none comes, Rust hands the sockets to its idle thread.
+  /// How long `dox_run` may wait for new requests, when no request is
+  /// open. The clients of the answers that go out with this call send
+  /// their next requests soon, so a short wait here gets them without a
+  /// trip through the idle thread and the event loop (2 thread wake-ups).
+  /// With an open request there is no wait: Dart has work for it (a
+  /// timer, a database reply). When nothing comes in this time, Rust
+  /// hands the sockets to its idle thread.
   static const int _budgetUs = 1000;
 
   Uint8List _defaultLines = Uint8List(0);
@@ -922,7 +922,7 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
       _len,
       _inPtr,
       _inList.length,
-      _open <= 0 && _lastEmpty ? _budgetUs : 0,
+      _open <= 0 ? _budgetUs : 0,
     );
     _len = 0;
     if (_out.length > 1 << 20) {
@@ -943,7 +943,6 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
       _inList = _inPtr.asTypedList(size);
       n = doxRun(_handle, _outPtr, 0, _inPtr, size, 0);
     }
-    _lastEmpty = n == 0;
     if (n == 0) {
       _chain = 0;
       return; // Rust posts to the port when more comes
