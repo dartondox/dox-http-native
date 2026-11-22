@@ -1,4 +1,4 @@
-## Unreleased
+## 3.2.3
 
 - Faster: lower tail latency, and more requests a second when the server has idle CPU cores. After the server sends a whole answer and no request is open, it now waits up to 1 ms for the next requests in the same call. Before, it gave the sockets to the idle thread at once, and each return to Dart cost 2 thread wake-ups. Measured on 4 server cores with 64 connections: p99 goes from 2.4 ms to 0.3 ms, and requests a second go up 1% to 6%. With 256 connections, p99 goes from 2.8 ms to approximately 1 ms. On 2 server cores, the numbers do not change. There is no wait while a request or a streamed answer is open. A WebSocket message and a part of a streamed answer do not start a wait. The waits between 2 turns of the event loop are 1 ms in total, plus at most one more wait. Thus other work of the isolate (for example a timer) can start up to 2 ms later.
 - Fix: a gzip answer did not go out until other traffic came, when the gzip thread finished while the server waited for socket events. The wait used the wake-up of the gzip thread, and then the server did not look for the finished answer. Now the server sends the answer in the same call.
