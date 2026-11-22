@@ -44,8 +44,11 @@ void handle(HttpRequest req) async {
       }
       await res.addStream(parts(80));
     case '/drip':
-      // 200 small parts, each made in its own event-loop turn
+      // a real stream (the flush starts it), then 200 small parts, each
+      // made in its own event-loop turn
       res.headers.contentType = ContentType.binary;
+      res.add(const <int>[7]);
+      await res.flush();
       await res.addStream(drip(200));
     case '/liar':
       // a content length that is too small for the streamed body
@@ -628,23 +631,34 @@ void main() {
       await Future<void>.delayed(const Duration(milliseconds: 300));
       timer.cancel();
       expect(ticks, greaterThan(75), reason: '$ticks turns in 300 ms');
-      await done.first;
+      await done.first.timeout(const Duration(seconds: 10));
     },
   );
 
   test(
-    'a streamed answer with a slow source does not wait for requests',
+    'a streamed answer does not wait while other requests get answers',
     () async {
+      // The stream is open, and whole answers go out on another connection.
+      // A wait for requests after each of them would hold the next part.
       await get('/');
-      Stopwatch clock = Stopwatch()..start();
-      HttpClientRequest req = await client.get('127.0.0.1', port, '/drip');
-      HttpClientResponse res = await req.close();
-      int length = 0;
-      await for (List<int> part in res) {
-        length += part.length;
+      ReceivePort done = ReceivePort();
+      await Isolate.spawn(steady, <Object>[port, 1500, done.sendPort]);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      // the best of 5: one stall of the machine does not fail the test
+      int best = 1 << 30;
+      for (int run = 0; run < 5; run++) {
+        Stopwatch clock = Stopwatch()..start();
+        HttpClientRequest req = await client.get('127.0.0.1', port, '/drip');
+        HttpClientResponse res = await req.close();
+        int length = 0;
+        await for (List<int> part in res) {
+          length += part.length;
+        }
+        expect(length, 201);
+        best = min(best, clock.elapsedMilliseconds);
       }
-      expect(length, 200);
-      expect(clock.elapsedMilliseconds, lessThan(150));
+      expect(best, lessThan(100), reason: 'the best run took $best ms');
+      await done.first.timeout(const Duration(seconds: 10));
     },
   );
 

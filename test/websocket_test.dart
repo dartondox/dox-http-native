@@ -67,14 +67,19 @@ void main() {
   test('an answer that comes one event-loop turn later is not held', () async {
     WebSocket ws = await WebSocket.connect(url('/later'));
     StreamIterator<dynamic> answers = StreamIterator<dynamic>(ws);
-    Stopwatch clock = Stopwatch()..start();
-    for (int i = 0; i < 300; i++) {
-      ws.add('m$i');
-      expect(await answers.moveNext(), isTrue);
-      expect(answers.current, 'm$i');
+    // A wait for requests after each message would cost 1 ms each: 60 ms
+    // for a run. The best of 5 runs: one stall does not fail the test.
+    int best = 1 << 30;
+    for (int run = 0; run < 5; run++) {
+      Stopwatch clock = Stopwatch()..start();
+      for (int i = 0; i < 60; i++) {
+        ws.add('m$i');
+        expect(await answers.moveNext(), isTrue);
+        expect(answers.current, 'm$i');
+      }
+      if (clock.elapsedMilliseconds < best) best = clock.elapsedMilliseconds;
     }
-    // a wait for requests after each message would cost 1 ms each
-    expect(clock.elapsedMilliseconds, lessThan(200));
+    expect(best, lessThan(40), reason: 'the best run took $best ms');
     await ws.close();
   });
 
