@@ -1,7 +1,7 @@
 name: Release
 
 # Each package has its own tags: <package>-v<version>, eg.
-# dox_http_native-v3.2.4 or dox_http_client-v3.2.0. The version must be the
+# dox_http_native-v3.2.4 or dox_http_client-v0.0.1. The version must be the
 # one in packages/<folder>/pubspec.yaml, and the tag must be on main.
 #
 # 1. check the tag, then run all CI tests (ci.yaml). A red test stops
