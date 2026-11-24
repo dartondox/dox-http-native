@@ -511,6 +511,15 @@ class DoxHttpClient implements Finalizable {
   /// With [http2], an `https://` connection uses HTTP/2 when the server
   /// has it: the requests to one server then share one connection. With
   /// `http2: false`, the client speaks HTTP/1.1 only.
+  ///
+  /// [lookup] gives the addresses of a host name. The default is
+  /// `InternetAddress.lookup`. The client connects only to the addresses
+  /// that [lookup] gives, in their sequence, and keeps them for some
+  /// seconds. TLS still checks the certificate of the host name. When
+  /// [lookup] fails or gives no address, the request fails with
+  /// [DoxHttpFailure.lookupFailed]. The client does not call [lookup] for a
+  /// URL whose host is an IP address. Use it to refuse addresses, for
+  /// example those of your own network when a user gives the URL.
   DoxHttpClient({
     this.timeout = const Duration(seconds: 30),
     this.followRedirects = true,
@@ -520,7 +529,8 @@ class DoxHttpClient implements Finalizable {
     int maxConnectionsPerHost = 0,
     int maxResponseSize = 0,
     String? trustedCertificates,
-  }) {
+    Future<List<InternetAddress>> Function(String host)? lookup,
+  }) : _lookup = lookup ?? InternetAddress.lookup {
     _ensureAvailable();
     Uint8List ca = utf8.encode(trustedCertificates ?? '');
     Pointer<Uint8> caPtr = doxClientAlloc(ca.length);
@@ -570,6 +580,9 @@ class DoxHttpClient implements Finalizable {
 
   /// If an `https://` connection uses HTTP/2 when the server has it.
   final bool http2;
+
+  /// Gives the addresses of a host name.
+  final Future<List<InternetAddress>> Function(String host) _lookup;
 
   /// Closes the native client (sockets, helper thread, buffers) of a
   /// client that was collected or whose isolate ended.
@@ -1341,7 +1354,8 @@ class DoxHttpClient implements Finalizable {
         }
       }
       _Lookup fresh = _Lookup(now + _lookupTime.inMicroseconds);
-      fresh.pending = InternetAddress.lookup(host)
+      // sync: a lookup that throws is a failed lookup too
+      fresh.pending = Future<List<InternetAddress>>.sync(() => _lookup(host))
           .then((List<InternetAddress> addresses) {
             fresh.addresses = addresses;
             fresh.pending = null;

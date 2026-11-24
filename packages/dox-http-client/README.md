@@ -196,6 +196,46 @@ The rules:
 - The headers `content-length` and `transfer-encoding` are not allowed. Use `contentLength`.
 - `close()` fails open streams with `clientClosed`.
 
+## Use it with package:http
+
+Some packages take a `Client` of [package:http](https://pub.dev/packages/http). `DoxHttpPackageClient` is such a client. It sends each request through a `DoxHttpClient`:
+
+```dart
+import 'package:dox_http_client/http.dart';
+import 'package:http/http.dart' as http;
+
+final http.Client client = DoxHttpPackageClient();
+
+Future<String> rates() async {
+  http.Response res = await client.get(
+    Uri.parse('https://api.example.com/rates'),
+  );
+  return res.body;
+}
+```
+
+`Request`, `StreamedRequest`, `MultipartRequest` and `AbortableRequest` work. The answer body is a stream, so a large download does not fill the memory.
+
+The adapter makes a `DoxHttpClient` with no timeout, because the default client of `package:http` has none. To set a timeout or other options, give your own `DoxHttpClient`:
+
+```dart
+final DoxHttpClient native = DoxHttpClient(
+  timeout: const Duration(seconds: 10),
+);
+final http.Client client = DoxHttpPackageClient(client: native);
+```
+
+`close` of the adapter closes the native client only when the adapter made it. Close your own `DoxHttpClient` yourself.
+
+These things are different from the default client of `package:http`:
+
+- A request with a body does not follow redirects. You get the redirect answer.
+- `maxRedirects` and `persistentConnection` of a request have no effect. Set `maxRedirects` on the `DoxHttpClient`.
+- An answer has no `reasonPhrase`.
+- A failure is a `DoxHttpPackageClientException`. It is a `ClientException` of `package:http` and also a `DoxHttpClientException`, so `failure` gives the cause.
+
+The adapter does a small quantity of more work for each request than a direct call. In code where speed is important, call `DoxHttpClient` directly.
+
 ## Send a request again
 
 With HTTP/1.1, the client sends a request again one time when a kept connection closed before an answer byte came. It does this only for `GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS` and `TRACE`, and not for a request with a body stream. The rules for HTTP/2 are in the next section.
@@ -242,6 +282,29 @@ DoxHttpClient client = DoxHttpClient(
   trustedCertificates: File('ca.pem').readAsStringSync(),
 );
 ```
+
+## Host names
+
+The client finds the addresses of a host name with `InternetAddress.lookup`. It keeps them for some seconds. `lookup` changes this. The client connects only to the addresses that your function gives, in their sequence:
+
+```dart
+final DoxHttpClient client = DoxHttpClient(
+  lookup: (String host) async {
+    List<InternetAddress> found = await InternetAddress.lookup(host);
+    if (found.any((InternetAddress a) => a.isLoopback)) {
+      throw StateError('refused');
+    }
+    return found;
+  },
+);
+```
+
+- When the function fails or gives no address, the request fails with `lookupFailed`.
+- TLS checks the certificate of the host name, not of the address.
+- The client does not call the function when the host of the URL is an IP address. Check such a URL before you send the request.
+- A redirect to a different host name calls the function again.
+
+Use this when a user gives the URL. Then a request can not go to an address of your own network.
 
 ## Idle connections
 
