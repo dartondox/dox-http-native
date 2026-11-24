@@ -134,7 +134,8 @@ await client.send('GET', url, followRedirects: false);
 The client sends `accept-encoding: gzip, br` with each request. When the answer body is gzip or brotli, the client decodes it in Rust. You get the decoded body in `res.body` and `res.bodyBytes`.
 
 - A decoded answer has no `content-encoding` header and no `content-length` header. These headers are for the compressed body.
-- `maxResponseSize` is the limit for the decoded body. Thus a small compressed body can not fill the memory.
+- `maxResponseSize` is the limit for the decoded body. It is off by default. A small compressed body can decode to a very large body. Thus set `maxResponseSize` when you send requests to servers that you do not trust.
+- Bytes after the end of a gzip body that are not gzip are ignored.
 - A compressed body that is not correct fails the request with `badResponse`.
 - A body with a different encoding, for example `zstd`, stays as the server sent it.
 

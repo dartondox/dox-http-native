@@ -229,20 +229,37 @@ enum Coding {
 fn decode(coding: Coding, body: &[u8], max: usize) -> Result<Vec<u8>, u16> {
     let mut out = Vec::new();
     let limit = max as u64 + 1;
-    let read = match coding {
-        Coding::Raw => return Ok(body.to_vec()),
-        // a gzip body may have more than one member
-        Coding::Gzip => flate2::read::MultiGzDecoder::new(body)
-            .take(limit)
-            .read_to_end(&mut out),
-        Coding::Brotli => brotli_decompressor::Decompressor::new(body, 4096)
-            .take(limit)
-            .read_to_end(&mut out),
-    };
-    if out.len() > max {
-        return Err(E_BIG);
+    match coding {
+        Coding::Raw => Ok(body.to_vec()),
+        Coding::Gzip => {
+            // A gzip body may have more than one member. Bytes after the
+            // last member that are not gzip (padding) are dropped.
+            let mut rest = body;
+            loop {
+                let mut member = flate2::bufread::GzDecoder::new(rest);
+                let read = (&mut member)
+                    .take(limit - out.len() as u64)
+                    .read_to_end(&mut out);
+                if out.len() > max {
+                    return Err(E_BIG);
+                }
+                read.map_err(|_| E_BAD)?;
+                rest = member.into_inner();
+                if !rest.starts_with(&[0x1f, 0x8b]) {
+                    return Ok(out);
+                }
+            }
+        }
+        Coding::Brotli => {
+            let read = brotli_decompressor::Decompressor::new(body, 4096)
+                .take(limit)
+                .read_to_end(&mut out);
+            if out.len() > max {
+                return Err(E_BIG);
+            }
+            read.map(|_| out).map_err(|_| E_BAD)
+        }
     }
-    read.map(|_| out).map_err(|_| E_BAD)
 }
 
 /// The header lines without `content-encoding` and `content-length`: they
@@ -983,6 +1000,8 @@ impl Core {
                     lines = decoded_lines(&lines);
                     plain
                 }
+                // a redirect is read for its `location`, not for its body
+                Err(E_BAD) if (300..400).contains(&status) => body,
                 Err(error) => {
                     self.failed(id, error);
                     return self.pump(&key);

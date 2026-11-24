@@ -1119,6 +1119,13 @@ fn a_gzip_body_is_decoded() {
     let mut two = gzip(b"one ");
     two.extend(gzip(b"two"));
     assert_eq!(one(DECODE, 0, coded("x-gzip", &two)).body, b"one two");
+    // padding after the last member is dropped
+    two.extend_from_slice(&[0, 0, 0, b'\n']);
+    assert_eq!(one(DECODE, 0, coded("gzip", &two)).body, b"one two");
+    // a second member that is cut is a bad body
+    let mut cut = gzip(b"one ");
+    cut.extend_from_slice(&gzip(b"two")[..12]);
+    assert_eq!(one(DECODE, 0, coded("gzip", &cut)).error, E_BAD);
 }
 
 #[test]
@@ -1184,6 +1191,11 @@ fn a_bad_coded_body_fails_and_the_next_request_works() {
     assert_eq!((a.status, a.error), (0, E_BAD));
     let a = run_until(&mut core, &req(2), 1).remove(0);
     assert_eq!(a.body, b"good");
+    // a redirect with a bad body keeps it: only its location is of use
+    let moved = b"HTTP/1.1 302 Found\r\nlocation: /x\r\ncontent-encoding: gzip\r\ncontent-length: 5\r\n\r\nmoved";
+    let a = one(DECODE, 0, moved.to_vec());
+    assert_eq!((a.status, a.body.as_slice()), (302, &b"moved"[..]));
+    assert!(a.lines.contains("content-encoding:gzip\n"));
     // a cut gzip body is bad too
     let z = gzip(&b"long text ".repeat(50));
     let a = one(DECODE, 0, coded("gzip", &z[..z.len() - 9]));
