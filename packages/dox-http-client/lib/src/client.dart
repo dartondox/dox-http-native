@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
@@ -78,6 +79,10 @@ enum DoxHttpFailure {
 
   /// The answer was one more redirect after `maxRedirects` of them.
   tooManyRedirects,
+
+  /// The body stream of [DoxHttpClient.sendStreamed] gave more or fewer
+  /// bytes than its `contentLength`.
+  badRequestBody,
 }
 
 /// A request of a [DoxHttpClient] that got no answer.
@@ -94,14 +99,9 @@ class DoxHttpClientException implements IOException {
   String toString() => 'DoxHttpClientException: ${failure.name}, url = $url';
 }
 
-/// The answer to a request of a [DoxHttpClient].
-class DoxHttpClientResponse {
-  DoxHttpClientResponse._(
-    this.url,
-    this.statusCode,
-    this._lines,
-    this.bodyBytes,
-  );
+/// The status and the headers of an answer. The body is in the subclasses.
+abstract class DoxHttpClientResponseHead {
+  DoxHttpClientResponseHead._(this.url, this.statusCode, this._lines);
 
   /// The URL that gave this answer. After a redirect, it is not the URL
   /// of the request.
@@ -109,14 +109,8 @@ class DoxHttpClientResponse {
 
   final int statusCode;
 
-  /// The body as bytes.
-  final Uint8List bodyBytes;
-
   /// The header lines from Rust: `name:value\n`, names in lower case.
   final Uint8List _lines;
-
-  /// The body as text (UTF-8).
-  late final String body = utf8.decode(bodyBytes, allowMalformed: true);
 
   /// The headers. The names are in lower case. A header that comes more
   /// than once has its values joined with `, `.
@@ -139,8 +133,49 @@ class DoxHttpClientResponse {
   }
 }
 
+/// The answer to a request of a [DoxHttpClient].
+class DoxHttpClientResponse extends DoxHttpClientResponseHead {
+  DoxHttpClientResponse._(
+    super.url,
+    super.statusCode,
+    super.lines,
+    this.bodyBytes,
+  ) : super._();
+
+  /// The body as bytes.
+  final Uint8List bodyBytes;
+
+  /// The body as text (UTF-8).
+  late final String body = utf8.decode(bodyBytes, allowMalformed: true);
+}
+
+/// The answer to a request of [DoxHttpClient.sendStreamed]. The future of
+/// the request completes with it when the head of the answer is there. The
+/// body comes later, in [body].
+class DoxHttpClientStreamedResponse extends DoxHttpClientResponseHead {
+  DoxHttpClientStreamedResponse._(
+    super.url,
+    super.statusCode,
+    super.lines,
+    this.body,
+  ) : super._();
+
+  /// The body as it comes. A stream with one subscription.
+  ///
+  /// You must listen to it or cancel it. A body that nobody uses keeps its
+  /// connection open. The client reads at most about 512 KiB ahead: when the
+  /// listener pauses, the client stops to read the connection.
+  ///
+  /// A failure after the head (the connection closes, a chunk or the gzip
+  /// data is not correct, the body is over `maxResponseSize`) is an error
+  /// event with a [DoxHttpClientException]. Then the stream closes. When the
+  /// subscription is canceled before the end, the client closes the
+  /// connection.
+  final Stream<Uint8List> body;
+}
+
 /// A request that waits for its answer.
-class _Pending {
+abstract class _Pending {
   _Pending(this.url, this.request, this.flags, this.deadline);
 
   final Uri url;
@@ -152,12 +187,272 @@ class _Pending {
   /// When the request fails with a timeout, in microseconds of
   /// [DoxHttpClient._clock]. 0: never.
   final int deadline;
-  final Completer<DoxHttpClientResponse> completer =
-      Completer<DoxHttpClientResponse>();
 
   /// The addresses of the host, and the one in use.
   List<InternetAddress> addresses = const <InternetAddress>[];
   int index = 0;
+
+  /// The whole timeout of a request with a body stream, in microseconds.
+  /// 0: none, or not such a request.
+  int uploadWait = 0;
+
+  /// The id of the record in Rust.
+  int id = 0;
+
+  void fail(Object error, StackTrace trace);
+}
+
+/// A request with the whole answer in one record.
+class _WholePending extends _Pending {
+  _WholePending(super.url, super.request, super.flags, super.deadline);
+
+  final Completer<DoxHttpClientResponse> completer =
+      Completer<DoxHttpClientResponse>();
+
+  @override
+  void fail(Object error, StackTrace trace) {
+    completer.completeError(error, trace);
+  }
+}
+
+/// A request of [DoxHttpClient.sendStreamed]: its answer comes in parts,
+/// and its body can come in parts.
+class _StreamPending extends _Pending {
+  _StreamPending(
+    this.client,
+    super.url,
+    super.request,
+    super.flags,
+    super.deadline,
+    this.upload,
+    this.contentLength,
+  ) {
+    controller = StreamController<Uint8List>(
+      sync: true,
+      onListen: _onListen,
+      onPause: pump,
+      onResume: pump,
+      onCancel: _onCancel,
+    );
+  }
+
+  final DoxHttpClient client;
+
+  /// The request body, and its length (null: chunked).
+  final Stream<List<int>>? upload;
+  final int? contentLength;
+
+  final Completer<DoxHttpClientStreamedResponse> head =
+      Completer<DoxHttpClientStreamedResponse>();
+  late final StreamController<Uint8List> controller;
+
+  // the answer body
+  /// Parts from Rust that the listener did not get yet.
+  final Queue<Uint8List> queue = Queue<Uint8List>();
+  bool gotHead = false;
+  bool listened = false;
+
+  /// Rust has sent the end, or the failure.
+  bool streamEnded = false;
+  Object? failure;
+  StackTrace? failureTrace;
+
+  /// The stream is closed, or the request is canceled.
+  bool finished = false;
+  bool _pumping = false;
+
+  /// Bytes that went to the listener, and bytes of that Rust knows.
+  int consumed = 0;
+  int credited = 0;
+
+  // the request body
+  StreamSubscription<List<int>>? _sub;
+  bool _started = false;
+
+  /// The upload ended, or it was stopped.
+  bool uploadOver = false;
+  bool _paused = false;
+
+  /// Bytes given to Rust, with the head and with the chunked framing, and
+  /// bytes that went out.
+  int handed = 0;
+  int wrote = 0;
+
+  /// Bytes of the body as the caller gave them.
+  int given = 0;
+
+  bool get chunked => upload != null && contentLength == null;
+
+  @override
+  void fail(Object error, StackTrace trace) {
+    _stopUpload();
+    if (!gotHead) {
+      finished = true;
+      head.completeError(error, trace);
+      return;
+    }
+    failure = error;
+    failureTrace = trace;
+    streamEnded = true;
+    pump();
+  }
+
+  void onHead(int status, Uint8List lines) {
+    gotHead = true;
+    Stream<Uint8List> body = controller.stream;
+    head.complete(DoxHttpClientStreamedResponse._(url, status, lines, body));
+    // the server answered before it had the whole request
+    if (upload != null && !uploadOver) _abortUpload();
+  }
+
+  void onPart(Uint8List data) {
+    queue.addLast(data);
+  }
+
+  void onEnd() {
+    streamEnded = true;
+  }
+
+  void _onListen() {
+    listened = true;
+    pump();
+  }
+
+  void _onCancel() {
+    client._cancelStream(this);
+  }
+
+  /// Gives the parts to the listener while it does not pause, and tells
+  /// Rust how many bytes went there.
+  void pump() {
+    if (_pumping || finished) return;
+    _pumping = true;
+    try {
+      while (queue.isNotEmpty &&
+          controller.hasListener &&
+          !controller.isPaused) {
+        Uint8List part = queue.removeFirst();
+        consumed += part.length;
+        controller.add(part);
+        if (finished) return;
+      }
+      if (streamEnded && queue.isEmpty) {
+        finished = true;
+        Object? error = failure;
+        if (error != null) controller.addError(error, failureTrace);
+        controller.close();
+        return;
+      }
+      if (!streamEnded && consumed - credited >= DoxHttpClient._creditStep) {
+        credited = consumed;
+        client._sendCredit(this);
+      }
+    } finally {
+      _pumping = false;
+    }
+  }
+
+  /// Rust says that [total] bytes of the request went out.
+  void onProgress(int total) {
+    if (total > wrote) wrote = total;
+    if (upload == null || uploadOver) return;
+    if (!_started) {
+      _started = true;
+      try {
+        _sub = upload!.listen(
+          _onData,
+          onError: _onUploadError,
+          onDone: _onUploadDone,
+          cancelOnError: true,
+        );
+      } on Object catch (error, trace) {
+        _uploadFailed(error, trace);
+      }
+    } else if (_paused && handed - wrote <= DoxHttpClient._lowWater) {
+      _paused = false;
+      _sub?.resume();
+    }
+  }
+
+  void _onData(List<int> data) {
+    int n = data.length;
+    if (n == 0) return;
+    int? length = contentLength;
+    if (length != null && given + n > length) {
+      _uploadFailed(
+        DoxHttpClientException(DoxHttpFailure.badRequestBody, url),
+        StackTrace.current,
+      );
+      return;
+    }
+    given += n;
+    client._sendBody(this, data is Uint8List ? data : Uint8List.fromList(data));
+    if (!_paused && handed - wrote > DoxHttpClient._highWater) {
+      _paused = true;
+      _sub?.pause();
+    }
+  }
+
+  void _onUploadDone() {
+    _sub = null;
+    int? length = contentLength;
+    if (length != null && given != length) {
+      _uploadFailed(
+        DoxHttpClientException(DoxHttpFailure.badRequestBody, url),
+        StackTrace.current,
+      );
+      return;
+    }
+    uploadOver = true;
+    if (chunked) client._sendLastChunk(this);
+    client._sendEnd(this, false);
+  }
+
+  void _onUploadError(Object error, StackTrace trace) {
+    _sub = null;
+    _uploadFailed(error, trace);
+  }
+
+  /// The request body failed: the request fails with [error].
+  void _uploadFailed(Object error, StackTrace trace) {
+    if (finished) return;
+    client._forget(this);
+    if (!gotHead) {
+      finished = true;
+      head.completeError(error, trace);
+      return;
+    }
+    failure = error;
+    failureTrace = trace;
+    streamEnded = true;
+    pump();
+  }
+
+  /// Stops the upload with no word to Rust: the request is over there.
+  void _stopUpload() {
+    uploadOver = true;
+    StreamSubscription<List<int>>? sub = _sub;
+    _sub = null;
+    sub?.cancel();
+  }
+
+  /// Stops the upload and tells Rust: the connection is not used again.
+  void _abortUpload() {
+    _stopUpload();
+    client._sendEnd(this, true);
+  }
+}
+
+/// The request that a redirect asks for.
+class _Hop {
+  _Hop(this.url, this.method, this.headers, this.toGet);
+
+  final Uri url;
+  final String method;
+  final Map<String, String>? headers;
+
+  /// The method changed to GET: the body goes.
+  final bool toGet;
 }
 
 /// The addresses of a host name, kept for [DoxHttpClient._lookupTime].
@@ -295,7 +590,7 @@ class DoxHttpClient implements Finalizable {
   }
 
   static const int _reqHead = 40;
-  static const int _resHead = 20;
+  static const int _resHead = 24;
   static const int _outSize = 1 << 16;
   static const int _inSize = 1 << 18;
 
@@ -307,6 +602,35 @@ class DoxHttpClient implements Finalizable {
   static const int _again = 2;
   static const int _tls = 4;
   static const int _decode = 8;
+  static const int _stream = 16;
+  static const int _upload = 32;
+
+  /// Request kinds and answer kinds, see native/src/client.rs.
+  static const int _qPart = 1;
+  static const int _qEnd = 2;
+  static const int _qCredit = 3;
+  static const int _qCancel = 4;
+  static const int _rWhole = 0;
+  static const int _rHead = 1;
+  static const int _rPart = 2;
+  static const int _rEnd = 3;
+  static const int _rProgress = 4;
+
+  /// A request body stream is paused while more than [_highWater] bytes
+  /// that it gave did not go out. It goes on at [_lowWater].
+  static const int _highWater = 256 * 1024;
+  static const int _lowWater = _highWater ~/ 2;
+
+  /// Dart tells Rust how many answer body bytes it used at each step of
+  /// this size, so Rust may read on. Rust stops to read at 256 KiB.
+  static const int _creditStep = 64 * 1024;
+
+  /// The most bytes of a request body in one record.
+  static const int _partMax = 256 * 1024;
+
+  /// The most bytes of a redirect body that the client reads to keep the
+  /// connection. After them it closes the connection.
+  static const int _redirectBody = 64 * 1024;
 
   /// How long the addresses of a host name are kept.
   static const Duration _lookupTime = Duration(seconds: 30);
@@ -492,6 +816,72 @@ class DoxHttpClient implements Finalizable {
     return _follow(first, method, headers, body, bodyBytes, deadline);
   }
 
+  /// Sends a request and gives the answer when its head is there. The body
+  /// of the answer comes in [DoxHttpClientStreamedResponse.body], and the
+  /// request body can be a stream: both are never whole in memory.
+  ///
+  /// [body] is the request body. [contentLength] is its length: the client
+  /// sends it as `content-length`. With no [contentLength], the client
+  /// sends the body with `transfer-encoding: chunked`. A [body] that gives
+  /// more or fewer bytes than [contentLength] fails the request with
+  /// [DoxHttpFailure.badRequestBody]. A [body] that fails with an error
+  /// fails the request with that error and closes the connection. Your
+  /// headers must not have `content-length` or `transfer-encoding`.
+  ///
+  /// The client listens to [body] when the connection to the server works.
+  /// It pauses the subscription while more than 256 KiB wait to go out, and
+  /// so the memory stays small. When the server answers before the whole
+  /// body went out (for example 401 or 413), the client cancels the
+  /// subscription, gives you that answer and does not use the connection
+  /// again.
+  ///
+  /// You must listen to the answer body or cancel it, also when you do not
+  /// need it. A body that nobody uses keeps its connection open until
+  /// [close].
+  ///
+  /// [timeout] is for the time until the head of the answer is there. After
+  /// it, there is no timeout: a big body can take long. With a [body], the
+  /// timeout starts again each time bytes of the body go out. Thus a big
+  /// body can go out, and a server that does not read fails the request.
+  ///
+  /// With [followRedirects], a request with no [body] goes to the new
+  /// address of a redirect like [send]. A request with a [body] never
+  /// follows: the stream can not be read again, so you get the redirect
+  /// answer. The client sends a request with a [body] only once.
+  ///
+  /// The future fails with a [DoxHttpClientException] when no head comes.
+  Future<DoxHttpClientStreamedResponse> sendStreamed(
+    String method,
+    Uri url, {
+    Map<String, String>? headers,
+    Stream<List<int>>? body,
+    int? contentLength,
+    Duration? timeout,
+    bool? followRedirects,
+  }) {
+    if (body == null && contentLength != null) {
+      throw ArgumentError.value(contentLength, 'contentLength', 'needs a body');
+    }
+    if (contentLength != null && contentLength < 0) {
+      throw ArgumentError.value(contentLength, 'contentLength');
+    }
+    int wait = (timeout ?? this.timeout).inMicroseconds;
+    int deadline = wait > 0 ? _clock.elapsedMicroseconds + wait : 0;
+    Future<DoxHttpClientStreamedResponse> first = _streamOnce(
+      method,
+      url,
+      headers,
+      body,
+      contentLength,
+      deadline,
+      wait > 0 ? wait : 0,
+    );
+    if (body != null || !(followRedirects ?? this.followRedirects)) {
+      return first;
+    }
+    return _followStreamed(first, method, headers, deadline);
+  }
+
   /// Gives the answer of [first], or of the address its redirects go to.
   Future<DoxHttpClientResponse> _follow(
     Future<DoxHttpClientResponse> first,
@@ -503,52 +893,133 @@ class DoxHttpClient implements Finalizable {
   ) async {
     DoxHttpClientResponse res = await first;
     for (int hop = 0; ; hop++) {
-      String? location = res.header('location');
-      if (location == null ||
-          location.isEmpty ||
-          !_redirects.contains(res.statusCode)) {
-        return res;
-      }
-      Uri url = res.url;
-      Uri next;
-      try {
-        next = url.resolve(location);
-      } on FormatException {
-        return res;
-      }
-      bool tls = next.scheme == 'https';
-      if ((!tls && next.scheme != 'http') || next.host.isEmpty) return res;
-      if (hop >= maxRedirects) {
-        throw DoxHttpClientException(DoxHttpFailure.tooManyRedirects, next);
-      }
-      if (_closed) {
-        throw DoxHttpClientException(DoxHttpFailure.clientClosed, next);
-      }
-      // RFC 9110 15.4: a 303 answer is read with GET. For 301 and 302,
-      // clients change POST to GET.
-      int status = res.statusCode;
-      bool toGet =
-          (status == 303 && method != 'GET' && method != 'HEAD') ||
-          ((status == 301 || status == 302) && method == 'POST');
-      bool sameServer =
-          next.scheme == url.scheme &&
-          next.host == url.host &&
-          next.port == url.port;
-      if (toGet) {
-        method = 'GET';
+      _Hop? next = _hop(res, method, headers, hop);
+      if (next == null) return res;
+      method = next.method;
+      headers = next.headers;
+      if (next.toGet) {
         body = null;
         bodyBytes = null;
       }
-      if (headers != null && (toGet || !sameServer)) {
-        headers = <String, String>{
-          for (MapEntry<String, String> header in headers.entries)
-            if (!(toGet && _aboutBody.contains(header.key.toLowerCase())) &&
-                !(!sameServer && _private.contains(header.key.toLowerCase())))
-              header.key: header.value,
-        };
-      }
-      res = await _once(method, next, headers, body, bodyBytes, deadline);
+      res = await _once(method, next.url, headers, body, bodyBytes, deadline);
     }
+  }
+
+  /// Like [_follow], for a streamed request with no body.
+  Future<DoxHttpClientStreamedResponse> _followStreamed(
+    Future<DoxHttpClientStreamedResponse> first,
+    String method,
+    Map<String, String>? headers,
+    int deadline,
+  ) async {
+    DoxHttpClientStreamedResponse res = await first;
+    for (int hop = 0; ; hop++) {
+      _Hop? next;
+      try {
+        next = _hop(res, method, headers, hop);
+      } on Object {
+        unawaited(_discard(res, deadline));
+        rethrow;
+      }
+      if (next == null) return res;
+      method = next.method;
+      headers = next.headers;
+      await _discard(res, deadline);
+      res = await _streamOnce(
+        method,
+        next.url,
+        headers,
+        null,
+        null,
+        deadline,
+        0,
+      );
+    }
+  }
+
+  /// Reads the body of a redirect that the client follows, so its connection
+  /// can be used again. A body that is big or slow is canceled: that closes
+  /// the connection.
+  static Future<void> _discard(
+    DoxHttpClientStreamedResponse res,
+    int deadline,
+  ) {
+    Completer<void> done = Completer<void>();
+    int left = _redirectBody;
+    late StreamSubscription<Uint8List> sub;
+    sub = res.body.listen(
+      (Uint8List part) {
+        left -= part.length;
+        if (left < 0) {
+          sub.cancel();
+          if (!done.isCompleted) done.complete();
+        }
+      },
+      onError: (Object _) {
+        if (!done.isCompleted) done.complete();
+      },
+      onDone: () {
+        if (!done.isCompleted) done.complete();
+      },
+      cancelOnError: true,
+    );
+    return done.future.timeout(
+      const Duration(seconds: 10),
+      onTimeout: () {
+        sub.cancel();
+      },
+    );
+  }
+
+  /// The request that a redirect asks for, or null when [res] is not a
+  /// redirect that the client follows. [hop] counts the redirects so far.
+  _Hop? _hop(
+    DoxHttpClientResponseHead res,
+    String method,
+    Map<String, String>? headers,
+    int hop,
+  ) {
+    String? location = res.header('location');
+    if (location == null ||
+        location.isEmpty ||
+        !_redirects.contains(res.statusCode)) {
+      return null;
+    }
+    Uri url = res.url;
+    Uri next;
+    try {
+      next = url.resolve(location);
+    } on FormatException {
+      return null;
+    }
+    bool tls = next.scheme == 'https';
+    if ((!tls && next.scheme != 'http') || next.host.isEmpty) return null;
+    if (hop >= maxRedirects) {
+      throw DoxHttpClientException(DoxHttpFailure.tooManyRedirects, next);
+    }
+    if (_closed) {
+      throw DoxHttpClientException(DoxHttpFailure.clientClosed, next);
+    }
+    // RFC 9110 15.4: a 303 answer is read with GET. For 301 and 302,
+    // clients change POST to GET.
+    int status = res.statusCode;
+    bool toGet =
+        (status == 303 && method != 'GET' && method != 'HEAD') ||
+        ((status == 301 || status == 302) && method == 'POST');
+    bool sameServer =
+        next.scheme == url.scheme &&
+        next.host == url.host &&
+        next.port == url.port;
+    if (toGet) method = 'GET';
+    if (headers != null && (toGet || !sameServer)) {
+      headers = <String, String>{
+        for (MapEntry<String, String> header in headers.entries)
+          if (!(toGet && _aboutBody.contains(header.key.toLowerCase())) &&
+              !(!sameServer && _private.contains(header.key.toLowerCase())))
+            header.key: header.value,
+      };
+    }
+    return _Hop(next, method, headers, toGet);
   }
 
   /// Sends one request. [deadline] is in microseconds of [_clock], 0 is
@@ -591,16 +1062,80 @@ class DoxHttpClient implements Finalizable {
     if (request.length > _maxRequest) {
       throw ArgumentError('the request is too big (over 2 GiB)');
     }
-    _Pending pending = _Pending(url, request, flags, deadline);
+    _WholePending pending = _WholePending(url, request, flags, deadline);
+    _start(pending);
+    return pending.completer.future;
+  }
 
-    InternetAddress? address = InternetAddress.tryParse(url.host);
+  /// Sends one streamed request, see [sendStreamed].
+  Future<DoxHttpClientStreamedResponse> _streamOnce(
+    String method,
+    Uri url,
+    Map<String, String>? headers,
+    Stream<List<int>>? body,
+    int? contentLength,
+    int deadline,
+    int wait,
+  ) {
+    if (_closed) throw StateError('the client is closed');
+    bool tls = url.scheme == 'https';
+    if ((!tls && url.scheme != 'http') || url.host.isEmpty) {
+      throw ArgumentError.value(
+        url,
+        'url',
+        'must be an http:// or https:// URL',
+      );
+    }
+    if (!_token.hasMatch(method)) {
+      throw ArgumentError.value(method, 'method');
+    }
+    int flags = _stream;
+    // a request with a body stream can not be sent again
+    if (body != null) {
+      flags |= _upload;
+    } else if (_idempotent.contains(method)) {
+      flags |= _again;
+    }
+    if (method == 'HEAD') flags |= _headOnly;
+    if (tls) flags |= _tls;
+    // see [_once]
+    bool coded =
+        !_hasHeader(headers, 'accept-encoding') &&
+        !_hasHeader(headers, 'range');
+    if (coded) flags |= _decode;
+    Uint8List request = _encode(
+      method,
+      url,
+      headers,
+      null,
+      null,
+      coded,
+      stream: body != null,
+      streamLength: contentLength,
+    );
+    _StreamPending pending = _StreamPending(
+      this,
+      url,
+      request,
+      flags,
+      deadline,
+      body,
+      contentLength,
+    );
+    if (body != null) pending.uploadWait = wait;
+    _start(pending);
+    return pending.head.future;
+  }
+
+  /// Looks up the host of [pending] and sends it.
+  void _start(_Pending pending) {
+    InternetAddress? address = InternetAddress.tryParse(pending.url.host);
     if (address != null) {
       pending.addresses = <InternetAddress>[address];
       _submit(pending);
     } else {
       _resolve(pending);
     }
-    return pending.completer.future;
   }
 
   /// Closes all connections. Requests with no answer yet fail with
@@ -621,6 +1156,110 @@ class DoxHttpClient implements Finalizable {
     }
   }
 
+  /// Rust forgets the request of [pending], and the client does too.
+  void _forget(_StreamPending pending) {
+    _open.remove(pending.id);
+    pending._stopUpload();
+    if (_closed) return;
+    _record(pending.id, _qCancel, 0);
+    _idleCheck();
+  }
+
+  /// The listener canceled the answer body, or nobody could listen to it.
+  void _cancelStream(_StreamPending pending) {
+    if (pending.finished) return;
+    pending.finished = true;
+    pending.queue.clear();
+    _forget(pending);
+  }
+
+  /// No request is open: the isolate may end.
+  void _idleCheck() {
+    if (_open.isEmpty) {
+      _receive.keepIsolateAlive = false;
+      _busy.remove(this);
+    }
+  }
+
+  /// Writes a record of [kind] for request [id], with [payload] bytes of
+  /// data after its head. Returns the start of the data in [_out].
+  int _record(int id, int kind, int payload) {
+    int size = _reqHead + payload;
+    if (_len + size > _outCap) {
+      int cap = _outCap;
+      while (cap < _len + size) {
+        cap *= 2;
+      }
+      _sizeOut(cap);
+    }
+    int at = _len;
+    _out.fillRange(at, at + _reqHead, 0);
+    ByteData data = ByteData.sublistView(_out, at, at + _reqHead);
+    data.setUint32(0, size, Endian.little);
+    data.setUint64(4, id, Endian.little);
+    data.setUint8(38, kind);
+    _len += size;
+    if (!_queued) {
+      // one call for all records of this turn of the event loop
+      _queued = true;
+      scheduleMicrotask(_run);
+    }
+    return at + _reqHead;
+  }
+
+  /// Gives Rust bytes of the request body of [pending], in parts. Chunked
+  /// framing is done here.
+  void _sendBody(_StreamPending pending, Uint8List bytes) {
+    if (_closed) return;
+    for (int at = 0; at < bytes.length; at += _partMax) {
+      int end = at + _partMax < bytes.length ? at + _partMax : bytes.length;
+      int n = end - at;
+      Uint8List frame = pending.chunked
+          ? ascii.encode('${n.toRadixString(16)}\r\n')
+          : _noName;
+      int tail = pending.chunked ? 2 : 0;
+      int payload = frame.length + n + tail;
+      int start = _record(pending.id, _qPart, payload);
+      _out.setRange(start, start + frame.length, frame);
+      _out.setRange(start + frame.length, start + frame.length + n, bytes, at);
+      if (tail > 0) {
+        _out[start + payload - 2] = 13;
+        _out[start + payload - 1] = 10;
+      }
+      pending.handed += payload;
+    }
+  }
+
+  /// The end of a chunked request body.
+  void _sendLastChunk(_StreamPending pending) {
+    if (_closed) return;
+    Uint8List last = ascii.encode('0\r\n\r\n');
+    int start = _record(pending.id, _qPart, last.length);
+    _out.setRange(start, start + last.length, last);
+    pending.handed += last.length;
+  }
+
+  /// The request body is whole, or the caller stops it ([aborted]).
+  void _sendEnd(_StreamPending pending, bool aborted) {
+    if (_closed) return;
+    _record(pending.id, _qEnd, 0);
+    // the flag is in the head of the record
+    int at = _len - _reqHead;
+    _out[at + 16] = aborted ? 1 : 0;
+  }
+
+  /// Tells Rust how many answer body bytes the listener got.
+  void _sendCredit(_StreamPending pending) {
+    if (_closed) return;
+    _record(pending.id, _qCredit, 0);
+    int at = _len - _reqHead;
+    ByteData.sublistView(
+      _out,
+      at,
+      at + _reqHead,
+    ).setUint64(16, pending.consumed, Endian.little);
+  }
+
   static bool _hasHeader(Map<String, String>? headers, String name) {
     if (headers == null) return false;
     return headers.keys.any((String key) => key.toLowerCase() == name);
@@ -633,8 +1272,10 @@ class DoxHttpClient implements Finalizable {
     Map<String, String>? headers,
     String? body,
     Uint8List? bodyBytes,
-    bool coded,
-  ) {
+    bool coded, {
+    bool stream = false,
+    int? streamLength,
+  }) {
     String target = url.path.isEmpty ? '/' : url.path;
     if (url.hasQuery) target = '$target?${url.query}';
     StringBuffer head = StringBuffer('$method $target HTTP/1.1\r\n');
@@ -670,12 +1311,21 @@ class DoxHttpClient implements Finalizable {
       payload = utf8.encode(body);
       if (!hasType) head.write('content-type: text/plain; charset=utf-8\r\n');
     }
-    bool hasBody =
-        payload != null ||
-        method == 'POST' ||
-        method == 'PUT' ||
-        method == 'PATCH';
-    if (hasBody) head.write('content-length: ${payload?.length ?? 0}\r\n');
+    if (stream) {
+      // the body goes in later records
+      head.write(
+        streamLength == null
+            ? 'transfer-encoding: chunked\r\n'
+            : 'content-length: $streamLength\r\n',
+      );
+    } else {
+      bool hasBody =
+          payload != null ||
+          method == 'POST' ||
+          method == 'PUT' ||
+          method == 'PATCH';
+      if (hasBody) head.write('content-length: ${payload?.length ?? 0}\r\n');
+    }
     head.write('\r\n');
     Uint8List start = utf8.encode(head.toString());
     if (payload == null || payload.isEmpty) return start;
@@ -736,7 +1386,7 @@ class DoxHttpClient implements Finalizable {
   }
 
   void _fail(_Pending pending, DoxHttpFailure failure) {
-    pending.completer.completeError(
+    pending.fail(
       DoxHttpClientException(failure, pending.url),
       StackTrace.current,
     );
@@ -754,6 +1404,9 @@ class DoxHttpClient implements Finalizable {
       int left = pending.deadline - _clock.elapsedMicroseconds;
       if (left <= 0) return _fail(pending, DoxHttpFailure.timeout);
       timeoutMs = _ceilMs(left);
+      // The timeout of an upload starts again each time bytes go out, so
+      // Rust needs all of it, not what a lookup left.
+      if (pending.uploadWait != 0) timeoutMs = _ceilMs(pending.uploadWait);
     }
     InternetAddress address = pending.addresses[pending.index];
     Uint8List request = pending.request;
@@ -771,6 +1424,8 @@ class DoxHttpClient implements Finalizable {
     }
 
     int id = _nextId++;
+    pending.id = id;
+    if (pending is _StreamPending) pending.handed = request.length;
     Uint8List raw = address.rawAddress;
     ByteData data = ByteData.sublistView(_out, _len, _len + _reqHead);
     data.setUint32(0, size, Endian.little);
@@ -783,6 +1438,7 @@ class DoxHttpClient implements Finalizable {
     _out.setRange(_len + 16, _len + 16 + raw.length, raw);
     data.setUint32(32, timeoutMs, Endian.little);
     data.setUint16(36, name.length, Endian.little);
+    // a new request: kind 0
     data.setUint16(38, 0);
     int at = _len + _reqHead;
     _out.setRange(at, at + name.length, name);
@@ -834,14 +1490,18 @@ class DoxHttpClient implements Finalizable {
     if (n <= 0) return;
     ByteData data = ByteData.sublistView(_in, 0, n);
     int p = 0;
+    // the streams that got parts: their listeners get them after the loop,
+    // when the buffer is not needed any more
+    Set<_StreamPending> touched = <_StreamPending>{};
     while (p < n) {
       int size = data.getUint32(p, Endian.little);
       int id = data.getUint64(p + 4, Endian.little);
       int status = data.getUint16(p + 12, Endian.little);
       int error = data.getUint16(p + 14, Endian.little);
       int lines = data.getUint32(p + 16, Endian.little);
-      _Pending? pending = _open.remove(id);
-      if (pending != null) {
+      int kind = data.getUint8(p + 20);
+      _Pending? pending = kind == _rWhole ? _open.remove(id) : _open[id];
+      if (pending is _WholePending) {
         if (status != 0) {
           Uint8List copy = Uint8List.fromList(
             Uint8List.sublistView(_in, p + _resHead, p + size),
@@ -857,10 +1517,38 @@ class DoxHttpClient implements Finalizable {
         } else {
           _failed(pending, error);
         }
+      } else if (pending is _StreamPending) {
+        switch (kind) {
+          case _rHead:
+            pending.onHead(
+              status,
+              Uint8List.fromList(
+                Uint8List.sublistView(_in, p + _resHead, p + _resHead + lines),
+              ),
+            );
+          case _rPart:
+            pending.onPart(
+              Uint8List.fromList(
+                Uint8List.sublistView(_in, p + _resHead + lines, p + size),
+              ),
+            );
+          case _rProgress:
+            pending.onProgress(data.getUint64(p + _resHead, Endian.little));
+          case _rEnd:
+            _open.remove(id);
+            pending.onEnd();
+          case _:
+            // the request failed
+            _failed(pending, error);
+        }
+        touched.add(pending);
       }
       p += size;
     }
     if (_inCap > _keepSize) _sizeIn(_inSize);
+    for (_StreamPending pending in touched) {
+      pending.pump();
+    }
     if (_open.isEmpty) {
       _receive.keepIsolateAlive = false;
       _busy.remove(this);
