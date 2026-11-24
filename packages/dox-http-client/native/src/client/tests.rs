@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 use super::*;
 
+mod h2;
+
 struct Answer {
     id: u64,
     kind: u8,
@@ -53,7 +55,13 @@ fn named(
 }
 
 fn new_core(max_per_host: usize, max_body: usize) -> Core {
-    Core::new(max_per_host, max_body, None, tls_config(&[]).unwrap()).unwrap()
+    Core::new(
+        max_per_host,
+        max_body,
+        None,
+        tls_config(&[], false).unwrap(),
+    )
+    .unwrap()
 }
 
 fn get(id: u64, addr: SocketAddr) -> Vec<u8> {
@@ -586,7 +594,7 @@ fn tls_get(id: u64, addr: SocketAddr, name: &str) -> Vec<u8> {
 }
 
 fn tls_core(pem: &str) -> Core {
-    Core::new(0, 0, None, tls_config(pem.as_bytes()).unwrap()).unwrap()
+    Core::new(0, 0, None, tls_config(pem.as_bytes(), false).unwrap()).unwrap()
 }
 
 #[test]
@@ -738,12 +746,12 @@ fn https_a_port_with_no_server_fails_to_connect() {
 
 #[test]
 fn extra_root_certificates_must_be_pem() {
-    assert!(tls_config(&[]).is_some());
-    assert!(tls_config(b"not a certificate").is_none());
+    assert!(tls_config(&[], false).is_some());
+    assert!(tls_config(b"not a certificate", false).is_none());
     let broken = b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
-    assert!(tls_config(broken).is_none());
+    assert!(tls_config(broken, false).is_none());
     let made = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-    assert!(tls_config(made.cert.pem().as_bytes()).is_some());
+    assert!(tls_config(made.cert.pem().as_bytes(), false).is_some());
 }
 
 #[test]
@@ -808,7 +816,7 @@ fn a_kept_connection_that_closes_on_the_request_sends_it_again() {
 fn an_idle_connection_closes_after_the_idle_timeout() {
     let (addr, count) = keep_alive(HELLO);
     let idle = Some(Duration::from_millis(50));
-    let mut core = Core::new(0, 0, idle, tls_config(&[]).unwrap()).unwrap();
+    let mut core = Core::new(0, 0, idle, tls_config(&[], false).unwrap()).unwrap();
     let mut inb = vec![0u8; 4096];
     assert_eq!(run_until(&mut core, &get(1, addr), 1)[0].status, 200);
     // not idle for long enough: the connection stays
@@ -1319,7 +1327,13 @@ impl Reader {
         let start = Instant::now();
         let mut out = first.to_vec();
         while !done(self) {
-            assert!(start.elapsed() < Duration::from_secs(20), "stuck");
+            assert!(
+                start.elapsed() < Duration::from_secs(20),
+                "stuck: {:?} {:?} {}",
+                self.status,
+                self.error,
+                self.body.len()
+            );
             if credit && self.used < self.body.len() as u64 {
                 self.used = self.body.len() as u64;
                 out.extend(q_credit(self.id, self.used));
@@ -1846,7 +1860,8 @@ fn upload(
 ) -> (usize, Reader) {
     let mut r = Reader::new(1);
     let head = format!("POST / HTTP/1.1\r\nhost: x\r\n{head}\r\n");
-    let mut out = record(1, addr, STREAM | UPLOAD, 10_000, head.as_bytes());
+    let flags = STREAM | UPLOAD | if chunked { CHUNKED } else { 0 };
+    let mut out = record(1, addr, flags, 10_000, head.as_bytes());
     let mut handed = head.len();
     let (mut at, mut ended, mut most) = (0, false, 0);
     let data = pattern(size);
@@ -1857,25 +1872,13 @@ fn upload(
         if r.wrote > 0 {
             while at < size && handed - r.wrote as usize <= HIGH {
                 let n = (size - at).min(PART_MAX);
-                let part = &data[at..at + n];
-                let wire = if chunked {
-                    let mut w = format!("{n:x}\r\n").into_bytes();
-                    w.extend_from_slice(part);
-                    w.extend_from_slice(b"\r\n");
-                    w
-                } else {
-                    part.to_vec()
-                };
-                handed += wire.len();
-                out.extend(q_part(1, &wire));
+                // Rust makes the chunks
+                handed += n;
+                out.extend(q_part(1, &data[at..at + n]));
                 at += n;
             }
             if at == size && !ended {
                 ended = true;
-                if chunked {
-                    handed += 5;
-                    out.extend(q_part(1, b"0\r\n\r\n"));
-                }
                 out.extend(q_end(1, false));
             }
         }

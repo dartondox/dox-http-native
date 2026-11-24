@@ -273,15 +273,13 @@ class _StreamPending extends _Pending {
   bool uploadOver = false;
   bool _paused = false;
 
-  /// Bytes given to Rust, with the head and with the chunked framing, and
+  /// Bytes given to Rust (the head and the body), and
   /// bytes that went out.
   int handed = 0;
   int wrote = 0;
 
   /// Bytes of the body as the caller gave them.
   int given = 0;
-
-  bool get chunked => upload != null && contentLength == null;
 
   @override
   void fail(Object error, StackTrace trace) {
@@ -404,7 +402,6 @@ class _StreamPending extends _Pending {
       return;
     }
     uploadOver = true;
-    if (chunked) client._sendLastChunk(this);
     client._sendEnd(this, false);
   }
 
@@ -469,7 +466,7 @@ class _Lookup {
   final int until;
 }
 
-/// A fast HTTP/1.1 client. Rust owns the sockets and parses the answers,
+/// A fast HTTP client. Rust owns the sockets and parses the answers,
 /// on the thread of the isolate.
 ///
 /// ```dart
@@ -485,14 +482,17 @@ class _Lookup {
 /// open (keep-alive) and uses them again. Each isolate needs its own
 /// client.
 ///
-/// It speaks HTTP/1.1 over `http://` and `https://`. It follows
-/// redirects and decodes a gzip or brotli answer body.
+/// It speaks HTTP/1.1, and HTTP/2 over `https://` when the server has it.
+/// It follows redirects and decodes a gzip or brotli answer body.
 class DoxHttpClient implements Finalizable {
   /// A request with no whole answer in [timeout] fails. `Duration.zero`
   /// is no timeout.
   ///
   /// With [maxConnectionsPerHost] > 0, the client holds at most that many
   /// connections open to one address. More requests wait for a free one.
+  /// An HTTP/2 connection that takes no new requests (the server closes
+  /// it, or it gave no answer in the timeout) does not count while it ends
+  /// its requests.
   ///
   /// With [maxResponseSize] > 0, a request whose answer body has more
   /// bytes fails.
@@ -507,10 +507,15 @@ class DoxHttpClient implements Finalizable {
   /// With [followRedirects], the client goes to the new address of a
   /// redirect (301, 302, 303, 307, 308), at most [maxRedirects] times for
   /// one request.
+  ///
+  /// With [http2], an `https://` connection uses HTTP/2 when the server
+  /// has it: the requests to one server then share one connection. With
+  /// `http2: false`, the client speaks HTTP/1.1 only.
   DoxHttpClient({
     this.timeout = const Duration(seconds: 30),
     this.followRedirects = true,
     this.maxRedirects = 5,
+    this.http2 = true,
     Duration idleTimeout = const Duration(seconds: 15),
     int maxConnectionsPerHost = 0,
     int maxResponseSize = 0,
@@ -532,6 +537,7 @@ class DoxHttpClient implements Finalizable {
       _ceilMs(idleTimeout.inMicroseconds),
       caPtr,
       ca.length,
+      http2 ? 1 : 0,
     );
     doxClientFree(caPtr, ca.length);
     if (_handle <= 0) {
@@ -561,6 +567,9 @@ class DoxHttpClient implements Finalizable {
   /// The most redirects of one request. One more fails the request with
   /// [DoxHttpFailure.tooManyRedirects].
   final int maxRedirects;
+
+  /// If an `https://` connection uses HTTP/2 when the server has it.
+  final bool http2;
 
   /// Closes the native client (sockets, helper thread, buffers) of a
   /// client that was collected or whose isolate ended.
@@ -604,6 +613,7 @@ class DoxHttpClient implements Finalizable {
   static const int _decode = 8;
   static const int _stream = 16;
   static const int _upload = 32;
+  static const int _chunked = 64;
 
   /// Request kinds and answer kinds, see native/src/client.rs.
   static const int _qPart = 1;
@@ -1093,6 +1103,8 @@ class DoxHttpClient implements Finalizable {
     // a request with a body stream can not be sent again
     if (body != null) {
       flags |= _upload;
+      // no length: HTTP/1.1 sends the body in chunks
+      if (contentLength == null) flags |= _chunked;
     } else if (_idempotent.contains(method)) {
       flags |= _again;
     }
@@ -1207,36 +1219,16 @@ class DoxHttpClient implements Finalizable {
     return at + _reqHead;
   }
 
-  /// Gives Rust bytes of the request body of [pending], in parts. Chunked
-  /// framing is done here.
+  /// Gives Rust bytes of the request body of [pending], in parts. Rust
+  /// does the framing: it knows if the connection is HTTP/1.1 or HTTP/2.
   void _sendBody(_StreamPending pending, Uint8List bytes) {
     if (_closed) return;
     for (int at = 0; at < bytes.length; at += _partMax) {
       int end = at + _partMax < bytes.length ? at + _partMax : bytes.length;
-      int n = end - at;
-      Uint8List frame = pending.chunked
-          ? ascii.encode('${n.toRadixString(16)}\r\n')
-          : _noName;
-      int tail = pending.chunked ? 2 : 0;
-      int payload = frame.length + n + tail;
-      int start = _record(pending.id, _qPart, payload);
-      _out.setRange(start, start + frame.length, frame);
-      _out.setRange(start + frame.length, start + frame.length + n, bytes, at);
-      if (tail > 0) {
-        _out[start + payload - 2] = 13;
-        _out[start + payload - 1] = 10;
-      }
-      pending.handed += payload;
+      int start = _record(pending.id, _qPart, end - at);
+      _out.setRange(start, start + end - at, bytes, at);
+      pending.handed += end - at;
     }
-  }
-
-  /// The end of a chunked request body.
-  void _sendLastChunk(_StreamPending pending) {
-    if (_closed) return;
-    Uint8List last = ascii.encode('0\r\n\r\n');
-    int start = _record(pending.id, _qPart, last.length);
-    _out.setRange(start, start + last.length, last);
-    pending.handed += last.length;
   }
 
   /// The request body is whole, or the caller stops it ([aborted]).

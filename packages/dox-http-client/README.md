@@ -1,6 +1,6 @@
 # dox_http_client
 
-Fast native HTTP/1.1 client for Dart. It sends requests to other servers, for example when a handler calls an API.
+Fast native HTTP client for Dart, with HTTP/1.1 and HTTP/2. It sends requests to other servers, for example when a handler calls an API.
 
 [![pub package](https://img.shields.io/pub/v/dox_http_client.svg)](https://pub.dev/packages/dox_http_client)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/dartondox/dox-http-native/blob/main/LICENSE)
@@ -22,6 +22,7 @@ dart pub add dox_http_client
 - The socket work runs on the thread of your isolate. This makes the client faster than `HttpClient` of `dart:io`.
 - HTTPS uses [rustls](https://github.com/rustls/rustls).
 - The client keeps its connections open (keep-alive) and uses them again.
+- On `https://`, the client uses HTTP/2 when the server has it. Then the requests to one server share one connection.
 
 ## The native library
 
@@ -164,7 +165,7 @@ await sink.addStream(res.body);
 await sink.close();
 ```
 
-Upload a file. With `contentLength`, the client sends a `content-length` header. Without it, the client sends the body with `transfer-encoding: chunked`:
+Upload a file. With `contentLength`, the client sends a `content-length` header. Without it, the client sends the body in chunks (HTTP/1.1) or in frames with no length (HTTP/2):
 
 ```dart
 File file = File('big.iso');
@@ -194,6 +195,30 @@ The rules:
 - The server can answer before the whole `body` went out, for example with 401 or 413. The client cancels the `body` subscription and gives you that answer. The connection is not used again. This also applies to an answer with status 200: the client does not send a body and read the answer body at the same time.
 - The headers `content-length` and `transfer-encoding` are not allowed. Use `contentLength`.
 - `close()` fails open streams with `clientClosed`.
+
+## Send a request again
+
+With HTTP/1.1, the client sends a request again one time when a kept connection closed before an answer byte came. It does this only for `GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS` and `TRACE`, and not for a request with a body stream. The rules for HTTP/2 are in the next section.
+
+## HTTP/2
+
+On an `https://` URL, the client asks the server for HTTP/2 during the TLS handshake (ALPN). If the server has HTTP/2, the client uses it. If not, the client uses HTTP/1.1. You do not change your code: `get`, `send`, `sendStreamed` and the others work the same with the two protocols.
+
+- With HTTP/2, the requests to one server share one connection. Each request is a stream on it. When many requests to a new server start at the same time, each of them can open a connection. The connections that are not necessary close when they are idle.
+- A request that fails or gets a timeout stops only its stream. The other requests on the connection continue. If no byte came from the server for a request that got a timeout, the client does not give that connection a new request. The next request opens a new connection.
+- If the server permits no more streams on the connection, the client opens more connections. A request that starts while a new connection is not ready opens its own connection. With `maxConnectionsPerHost`, the request waits for a free stream when the limit of connections is reached.
+- A connection that takes no new requests does not count for `maxConnectionsPerHost` while it ends its requests. This is a connection that the server closes with a GOAWAY frame, or one that gave no answer in the timeout. Thus, for a short time, there can be more connections than the limit, but not more than two times the limit.
+- If the server tells the client that it did not work on a request (a refused stream, or a GOAWAY frame for an earlier stream), the client sends the request again one time. This is safe for each method. It does not apply to a request with a body stream.
+- If the connection closes before the head of an answer comes, the client sends the request again one time, and only for `GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS` and `TRACE`. The server can have received the first one.
+- The headers `connection`, `keep-alive`, `proxy-connection`, `transfer-encoding`, `upgrade` and `te` of a request do not go to an HTTP/2 server. They are only for HTTP/1.1.
+- With HTTP/2, a request body that you give as `body` or `bodyBytes` is in memory two times until the head of the answer comes. For a large body, use `sendStreamed`.
+- An `http://` URL always uses HTTP/1.1.
+
+To use HTTP/1.1 only, set `http2` to `false`:
+
+```dart
+DoxHttpClient client = DoxHttpClient(http2: false);
+```
 
 ## Timeout
 
@@ -243,15 +268,16 @@ Call `close()` when the client is not necessary any more. If you do not, the con
 
 ## What the client does not do
 
-- It speaks HTTP/1.1 only.
+- It does not speak HTTP/3.
+- It speaks HTTP/2 only on `https://`. An `http://` URL uses HTTP/1.1.
 - `send` keeps each request body and each answer body in memory. `sendStreamed` does not.
-- It sends a request again only when a kept connection closed before an answer byte came, and only for `GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS` and `TRACE`.
+- It sends a request again one time only, and only in the cases that the sections "Send a request again" and "HTTP/2" give.
 
 ## Fuzz tests
 
 The fuzz target is in `native/fuzz/`. CI runs it for 60 seconds when `native/` changes.
 
-- `client_response`: random bytes as the answer of a server. The parser and the gzip and brotli decoders must not panic. A chunked body must give the same result in one piece and byte by byte.
+- `client_response`: random bytes as the answer of a server. The HTTP/1.1 parser, the HTTP/2 connection, the HPACK decoder and the gzip and brotli decoders must not panic. A chunked body and the frames of HTTP/2 must give the same result in one piece and byte by byte.
 
 To run it on your computer:
 
