@@ -37,7 +37,7 @@ The Dart tests of `dox_http_client` need `openssl` on the PATH.
 ## Releases
 
 Each package has its own version and its own tags: `<package>-v<version>`,
-for example `dox_http_native-v3.2.4` or `dox_http_client-v3.2.0`. A tag on
+for example `dox_http_native-v3.2.4` or `dox_http_client-v0.0.1`. A tag on
 `main` runs `.github/workflows/release.yaml`. It runs the tests first, and
 publishes the package to pub.dev only when they pass.
 

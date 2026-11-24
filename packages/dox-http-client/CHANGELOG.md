@@ -1,4 +1,4 @@
-## Unreleased
+## 0.0.1
 
 - First version. `DoxHttpClient` is an HTTP client for calls to other servers. Rust owns the sockets and reads the answers on the thread of the isolate.
   - `get`, `head`, `post`, `put`, `patch`, `delete` and `send` return a `DoxHttpClientResponse` with `statusCode`, `body`, `bodyBytes`, `headers` and `header(name)`.
