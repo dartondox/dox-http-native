@@ -279,6 +279,35 @@ void main() {
     );
   });
 
+  test('a timeout below 1 millisecond is a timeout, not no timeout', () async {
+    await expectLater(
+      client.get(
+        base.resolve('/slow'),
+        timeout: const Duration(microseconds: 300),
+      ),
+      failsWith(DoxHttpFailure.timeout),
+    );
+  });
+
+  test('an idle connection closes after idleTimeout', () async {
+    DoxHttpClient short = DoxHttpClient(
+      idleTimeout: const Duration(milliseconds: 100),
+    );
+    addTearDown(short.close);
+    expect((await short.get(base)).statusCode, 200);
+    expect(server.connectionsInfo().total, 1);
+    // no request and no call into Rust: the helper thread closes it
+    await Future<void>.delayed(const Duration(milliseconds: 600));
+    expect(server.connectionsInfo().total, 0);
+    expect((await short.get(base)).statusCode, 200);
+    expect(connections.length, 2);
+    // the default keeps a connection for longer than this test
+    expect((await client.get(base)).statusCode, 200);
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    expect((await client.get(base)).statusCode, 200);
+    expect(connections.length, 3);
+  });
+
   test('a port with no server fails to connect', () async {
     ServerSocket socket = await ServerSocket.bind('127.0.0.1', 0);
     int port = socket.port;

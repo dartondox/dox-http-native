@@ -52,7 +52,7 @@ fn named(
 }
 
 fn new_core(max_per_host: usize, max_body: usize) -> Core {
-    Core::new(max_per_host, max_body, tls_config(&[]).unwrap()).unwrap()
+    Core::new(max_per_host, max_body, None, tls_config(&[]).unwrap()).unwrap()
 }
 
 fn get(id: u64, addr: SocketAddr) -> Vec<u8> {
@@ -584,7 +584,7 @@ fn tls_get(id: u64, addr: SocketAddr, name: &str) -> Vec<u8> {
 }
 
 fn tls_core(pem: &str) -> Core {
-    Core::new(0, 0, tls_config(pem.as_bytes()).unwrap()).unwrap()
+    Core::new(0, 0, None, tls_config(pem.as_bytes()).unwrap()).unwrap()
 }
 
 #[test]
@@ -742,4 +742,169 @@ fn extra_root_certificates_must_be_pem() {
     assert!(tls_config(broken).is_none());
     let made = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     assert!(tls_config(made.cert.pem().as_bytes()).is_some());
+}
+
+#[test]
+fn head_one_close_wins_over_keep_alive() {
+    let h = head(
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nConnection: keep-alive\r\ncontent-length: 0\r\n\r\n",
+    );
+    assert!(!h.unwrap().unwrap().keep);
+    let h = head("HTTP/1.0 200 OK\r\nConnection: keep-alive, close\r\ncontent-length: 0\r\n\r\n");
+    assert!(!h.unwrap().unwrap().keep);
+}
+
+#[test]
+fn bytes_on_an_idle_connection_are_not_the_next_answer() {
+    // after its answer, the first connection sends one more answer that
+    // nobody asked for
+    let (addr, count) = server(|mut s, n| {
+        while read_head(&mut s) {
+            let _ = s.write_all(HELLO);
+            if n == 0 {
+                thread::sleep(Duration::from_millis(10));
+                let _ = s.write_all(b"HTTP/1.1 500 Stray\r\nContent-Length: 5\r\n\r\nstray");
+            }
+        }
+    });
+    let mut core = new_core(0, 0);
+    assert_eq!(run_until(&mut core, &get(1, addr), 1)[0].status, 200);
+    // the stray answer arrives, and no call looks at the socket
+    thread::sleep(Duration::from_millis(60));
+    let a = run_until(&mut core, &get(2, addr), 1);
+    assert_eq!(
+        (a[0].status, a[0].body.as_slice()),
+        (200, b"hello".as_slice())
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn a_kept_connection_that_closes_on_the_request_sends_it_again() {
+    // the first connection answers one request, then reads the next one
+    // and closes with no answer. Each later connection answers.
+    let (addr, count) = server(|mut s, n| {
+        if n == 0 {
+            if read_head(&mut s) {
+                let _ = s.write_all(HELLO);
+                read_head(&mut s);
+            }
+            return;
+        }
+        while read_head(&mut s) {
+            let _ = s.write_all(HELLO);
+        }
+    });
+    let mut core = new_core(0, 0);
+    assert_eq!(run_until(&mut core, &get(1, addr), 1)[0].status, 200);
+    let a = run_until(&mut core, &get(2, addr), 1);
+    assert_eq!((a[0].status, a[0].error), (200, 0));
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn an_idle_connection_closes_after_the_idle_timeout() {
+    let (addr, count) = keep_alive(HELLO);
+    let idle = Some(Duration::from_millis(50));
+    let mut core = Core::new(0, 0, idle, tls_config(&[]).unwrap()).unwrap();
+    let mut inb = vec![0u8; 4096];
+    assert_eq!(run_until(&mut core, &get(1, addr), 1)[0].status, 200);
+    // not idle for long enough: the connection stays
+    thread::sleep(Duration::from_millis(10));
+    core.run(&[], &mut inb).unwrap();
+    assert_eq!(core.conns.len(), 1);
+    thread::sleep(Duration::from_millis(120));
+    core.run(&[], &mut inb).unwrap();
+    assert!(core.conns.is_empty());
+    assert!(core.hosts.is_empty());
+    // the next request gets a new connection
+    assert_eq!(run_until(&mut core, &get(2, addr), 1)[0].status, 200);
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn a_failed_connect_leaves_no_entry() {
+    let addr = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let mut core = new_core(1, 0);
+    let mut out = get(1, addr);
+    out.extend(get(2, addr));
+    let a = run_until(&mut core, &out, 2);
+    assert!(a.iter().all(|a| (a.status, a.error) == (0, E_CONNECT)));
+    assert!(core.hosts.is_empty());
+    assert_eq!(core.open, 0);
+    let a = run_until(&mut core, &tls_get(3, addr, "not a name"), 1);
+    assert_eq!(a[0].error, E_TLS);
+    assert!(core.hosts.is_empty());
+}
+
+#[test]
+fn https_a_closed_kept_connection_is_not_used_again() {
+    // each connection answers one request and closes
+    let made = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let pem = made.cert.pem();
+    let key = rustls::pki_types::PrivateKeyDer::try_from(made.signing_key.serialize_der()).unwrap();
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![made.cert.der().clone()], key)
+        .unwrap();
+    let config = Arc::new(config);
+    let (addr, count) = server(move |s, _| {
+        let conn = rustls::ServerConnection::new(config.clone()).unwrap();
+        let mut tls = rustls::StreamOwned::new(conn, s);
+        if read_head(&mut tls) {
+            let _ = tls.write_all(HELLO);
+            tls.conn.send_close_notify();
+            let _ = tls.flush();
+        }
+    });
+    let mut core = tls_core(&pem);
+    for id in 1..=3 {
+        thread::sleep(Duration::from_millis(30));
+        let a = run_until(&mut core, &tls_get(id, addr, "localhost"), 1);
+        assert_eq!((a[0].status, a[0].error), (200, 0));
+    }
+    assert_eq!(count.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn https_a_whole_answer_before_a_failure_is_an_answer() {
+    // the server answers, then sends bytes that are not TLS
+    let made = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let pem = made.cert.pem();
+    let key = rustls::pki_types::PrivateKeyDer::try_from(made.signing_key.serialize_der()).unwrap();
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![made.cert.der().clone()], key)
+        .unwrap();
+    let config = Arc::new(config);
+    let (addr, _) = server(move |s, _| {
+        let conn = rustls::ServerConnection::new(config.clone()).unwrap();
+        let mut tls = rustls::StreamOwned::new(conn, s);
+        if read_head(&mut tls) {
+            // the answer and the bad bytes go out in one write, so the
+            // client reads them together
+            let _ = tls.conn.writer().write_all(HELLO);
+            let mut wire = Vec::new();
+            let _ = tls.conn.write_tls(&mut wire);
+            wire.extend_from_slice(&[0xff; 64]);
+            let _ = tls.sock.write_all(&wire);
+            thread::sleep(Duration::from_millis(300));
+        }
+    });
+    let mut core = tls_core(&pem);
+    let a = run_until(&mut core, &tls_get(1, addr, "localhost"), 1);
+    assert_eq!(
+        (a[0].status, a[0].body.as_slice()),
+        (200, b"hello".as_slice())
+    );
+    assert!(core.conns.is_empty());
 }

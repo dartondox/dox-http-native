@@ -200,7 +200,7 @@ When no answer comes, the future fails with a `DoxHttpClientException`. Its `fai
 | --- | --- |
 | `lookupFailed` | The host name has no address. |
 | `connectionFailed` | The server did not accept the connection. Nothing was sent. |
-| `timeout` | The full answer did not come in the timeout. |
+| `timeout` | The full answer did not come in the timeout. The timeout includes the lookup of the host name. |
 | `connectionClosed` | The connection closed before the answer was complete. |
 | `badResponse` | The answer is not correct HTTP. |
 | `responseTooBig` | The body is larger than `maxResponseSize`. |
@@ -230,6 +230,16 @@ DoxHttpClient client = DoxHttpClient(
 );
 ```
 
+### Idle connections
+
+A connection with no request for 15 seconds closes. Change this with `idleTimeout`. `Duration.zero` keeps idle connections open:
+
+```dart
+DoxHttpClient client = DoxHttpClient(
+  idleTimeout: const Duration(minutes: 1),
+);
+```
+
 ### Limits
 
 Each limit is off by default:
@@ -240,6 +250,8 @@ Each limit is off by default:
 ### Close the client
 
 `close()` closes all connections. Open requests fail with `clientClosed`.
+
+Call `close()` when the client is not necessary any more. If you do not, the connections close when Dart collects the client object.
 
 ### What the client does not do
 

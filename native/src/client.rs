@@ -76,6 +76,9 @@ const MAX_HEADERS: usize = 100;
 const CHUNK_LINE: usize = 1024;
 /// The biggest body when Dart gives no limit: a record length is a u32.
 const MAX_BODY: usize = u32::MAX as usize - MAX_HEAD - RES_HEAD;
+/// How often idle connections are checked against the idle timeout, at
+/// the most.
+const SWEEP: Duration = Duration::from_secs(1);
 /// How often the helper looks at the stop flag while it waits.
 const TICK: Duration = Duration::from_millis(100);
 
@@ -245,6 +248,7 @@ fn parse_head(buf: &[u8], head_only: bool, max: usize) -> Result<Option<Head>, u
             continue;
         }
         let mut keep = res.version == Some(1);
+        let mut close = false;
         let mut length: Option<usize> = None;
         let mut encoded = false;
         let mut chunked = false;
@@ -277,12 +281,14 @@ fn parse_head(buf: &[u8], head_only: bool, max: usize) -> Result<Option<Head>, u
                     .is_some_and(|t| t.trim_ascii().eq_ignore_ascii_case(b"chunked"));
             } else if h.name.eq_ignore_ascii_case("connection") {
                 if has_token(h.value, "close") {
-                    keep = false;
+                    close = true;
                 } else if has_token(h.value, "keep-alive") {
                     keep = true;
                 }
             }
         }
+        // one `close` wins over each `keep-alive`
+        keep = keep && !close;
         let start = skip + n;
         let body = if head_only || status == 204 || status == 304 {
             Body::Len(0)
@@ -352,6 +358,8 @@ struct Conn {
     connected: bool,
     /// it answered a request before
     reused: bool,
+    /// when its last answer was whole (for an idle connection)
+    idle_since: Instant,
 }
 
 impl Conn {
@@ -424,6 +432,7 @@ impl Conn {
     fn tls_io(&mut self, tls: &mut ClientConnection) -> (Option<u16>, bool, bool) {
         let bytes: &[u8] = self.req.as_ref().map_or(&[], |r| &r.bytes);
         let closed = |connected: bool| Some(if connected { E_CLOSED } else { E_CONNECT });
+        let mut fail: Option<u16> = None;
         let mut eof = false;
         let mut cut = false;
         loop {
@@ -435,12 +444,12 @@ impl Conn {
                         self.sent += n;
                         progress |= n > 0;
                     }
-                    Err(_) => return (Some(E_TLS), eof, cut),
+                    Err(_) => fail = Some(E_TLS),
                 }
             }
-            while tls.wants_write() {
+            while fail.is_none() && tls.wants_write() {
                 match tls.write_tls(&mut self.stream) {
-                    Ok(0) => return (closed(self.connected), eof, cut),
+                    Ok(0) => fail = closed(self.connected),
                     Ok(_) => {
                         self.connected = true;
                         progress = true;
@@ -448,11 +457,11 @@ impl Conn {
                     Err(e) => match e.kind() {
                         ErrorKind::Interrupted => {}
                         ErrorKind::WouldBlock | ErrorKind::NotConnected => break,
-                        _ => return (closed(self.connected), eof, cut),
+                        _ => fail = closed(self.connected),
                     },
                 }
             }
-            if !eof {
+            if fail.is_none() && !eof {
                 match tls.read_tls(&mut self.stream) {
                     Ok(0) => eof = true,
                     Ok(_) => {
@@ -461,16 +470,17 @@ impl Conn {
                         if tls.process_new_packets().is_err() {
                             // tell the server why (a TLS alert), if it fits
                             let _ = tls.write_tls(&mut self.stream);
-                            return (Some(E_TLS), eof, cut);
+                            fail = Some(E_TLS);
                         }
                     }
                     Err(e) => match e.kind() {
                         ErrorKind::Interrupted => progress = true,
                         ErrorKind::WouldBlock | ErrorKind::NotConnected => {}
-                        _ => return (closed(self.connected), eof, cut),
+                        _ => fail = closed(self.connected),
                     },
                 }
             }
+            // also after a failure: the answer may be whole before it
             loop {
                 room(&mut self.buf, self.filled);
                 match tls.reader().read(&mut self.buf[self.filled..]) {
@@ -492,12 +502,15 @@ impl Conn {
                             cut = true;
                             break;
                         }
-                        _ => return (Some(E_TLS), eof, cut),
+                        _ => {
+                            fail = fail.or(Some(E_TLS));
+                            break;
+                        }
                     },
                 }
             }
-            if !progress || (eof && !tls.wants_write()) {
-                return (None, eof, cut);
+            if fail.is_some() || !progress || (eof && !tls.wants_write()) {
+                return (fail, eof, cut);
             }
         }
     }
@@ -539,11 +552,24 @@ struct Core {
     now: Instant,
     max_per_host: usize,
     max_body: usize,
+    /// an idle connection closes after this time. None: never.
+    idle_timeout: Option<Duration>,
+    /// when `run` next looks for idle connections to close
+    next_sweep: Instant,
     tls: Arc<ClientConfig>,
+    /// The 2 buffers of Dart for `dox_client_run`: the requests and the
+    /// answers. They live here, so they are freed with the client, also
+    /// when Dart never closes it. See `dox_client_buffer`.
+    bufs: [Vec<u8>; 2],
 }
 
 impl Core {
-    fn new(max_per_host: usize, max_body: usize, tls: Arc<ClientConfig>) -> std::io::Result<Core> {
+    fn new(
+        max_per_host: usize,
+        max_body: usize,
+        idle_timeout: Option<Duration>,
+        tls: Arc<ClientConfig>,
+    ) -> std::io::Result<Core> {
         Ok(Core {
             poll: Poll::new()?,
             events: Events::with_capacity(256),
@@ -561,7 +587,10 @@ impl Core {
             } else {
                 max_body.min(MAX_BODY)
             },
+            idle_timeout,
+            next_sweep: Instant::now(),
             tls,
+            bufs: [Vec::new(), Vec::new()],
         })
     }
 
@@ -627,6 +656,17 @@ impl Core {
                 .is_none_or(|h| h.count < self.max_per_host)
     }
 
+    /// Drops the entry of `key` when it has no connection and no request.
+    fn forget(&mut self, key: &Key) {
+        if self
+            .hosts
+            .get(key)
+            .is_some_and(|h| h.count == 0 && h.queue.is_empty())
+        {
+            self.hosts.remove(key);
+        }
+    }
+
     fn connect(&mut self, key: Key, req: Req) {
         let tls = match &key.name {
             Some(name) => {
@@ -634,6 +674,7 @@ impl Core {
                     .ok()
                     .and_then(|name| ClientConnection::new(self.tls.clone(), name).ok());
                 let Some(tls) = made else {
+                    self.forget(&key);
                     return self.failed(req.id, E_TLS);
                 };
                 Some(Box::new(tls))
@@ -641,6 +682,7 @@ impl Core {
             None => None,
         };
         let Ok(mut stream) = TcpStream::connect(key.addr) else {
+            self.forget(&key);
             return self.failed(req.id, E_CONNECT);
         };
         let _ = stream.set_nodelay(true);
@@ -656,6 +698,7 @@ impl Core {
             )
             .is_err()
         {
+            self.forget(&key);
             return self.failed(req.id, E_CONNECT);
         }
         entry.insert(Conn {
@@ -669,6 +712,7 @@ impl Core {
             head: None,
             connected: false,
             reused: false,
+            idle_since: self.now,
         });
         self.hosts.entry(key).or_default().count += 1;
     }
@@ -676,14 +720,23 @@ impl Core {
     /// Sends a request on an idle connection for `key` or on a new one, or
     /// lets it wait when `max_per_host` connections are open.
     fn start(&mut self, key: Key, req: Req) {
-        let host = self.hosts.entry(key.clone()).or_default();
-        while let Some(idx) = host.idle.pop() {
-            if let Some(c) = self.conns.get_mut(idx) {
-                c.req = Some(req);
-                c.sent = 0;
-                return self.drive(idx);
+        while let Some(idx) = self.hosts.get_mut(&key).and_then(|h| h.idle.pop()) {
+            let Some(c) = self.conns.get_mut(idx) else {
+                continue;
+            };
+            // Read first. The server may have closed the connection, or
+            // sent bytes nobody asked for: they must not become the answer
+            // to this request.
+            let (fail, eof, _) = c.io();
+            if fail.is_some() || eof || c.filled > 0 {
+                self.close(idx);
+                continue;
             }
+            c.req = Some(req);
+            c.sent = 0;
+            return self.drive(idx);
         }
+        let host = self.hosts.entry(key.clone()).or_default();
         if self.max_per_host == 0 || host.count < self.max_per_host {
             self.connect(key, req);
         } else {
@@ -732,17 +785,16 @@ impl Core {
             }
             return;
         };
-        if let Some(error) = fail {
-            return self.fail(idx, error);
-        }
+        // A connection that failed is at its end too. The bytes that came
+        // before may be a whole answer: then the request is done.
+        let eof = eof || fail.is_some();
+        let cut = cut || fail.is_some();
+        let ended = fail.unwrap_or(if c.connected { E_CLOSED } else { E_CONNECT });
         if c.head.is_none() {
             match parse_head(&c.buf[..c.filled], req.flags & HEAD_ONLY != 0, max) {
                 Ok(Some(head)) => c.head = Some(head),
                 Ok(None) if c.filled > MAX_HEAD => return self.fail(idx, E_BAD),
-                Ok(None) if eof => {
-                    let error = if c.connected { E_CLOSED } else { E_CONNECT };
-                    return self.fail(idx, error);
-                }
+                Ok(None) if eof => return self.fail(idx, ended),
                 Ok(None) => return,
                 Err(error) => return self.fail(idx, error),
             }
@@ -755,14 +807,14 @@ impl Core {
                 if c.filled >= end {
                     Ok(Some((c.buf[head.start..end].to_vec(), end)))
                 } else if eof {
-                    Err(E_CLOSED)
+                    Err(ended)
                 } else {
                     Ok(None)
                 }
             }
             Body::Chunked(ch) => match ch.step(&c.buf[..c.filled], max) {
                 Ok(Some(end)) => Ok(Some((std::mem::take(&mut ch.out), end))),
-                Ok(None) if eof => Err(E_CLOSED),
+                Ok(None) if eof => Err(ended),
                 Ok(None) => {
                     // the bytes before `pos` are in `out`: use the room again
                     c.buf.copy_within(ch.pos..c.filled, 0);
@@ -777,8 +829,8 @@ impl Core {
                     Err(E_BIG)
                 } else if cut {
                     // the end of the body is the end of the connection: an
-                    // end with no TLS close may be a cut body
-                    Err(E_CLOSED)
+                    // end with no TLS close, or a failure, may be a cut body
+                    Err(ended)
                 } else if eof {
                     Ok(Some((c.buf[head.start..c.filled].to_vec(), c.filled)))
                 } else {
@@ -803,6 +855,7 @@ impl Core {
             c.sent = 0;
             c.filled = 0;
             c.reused = true;
+            c.idle_since = self.now;
             if c.buf.len() > KEEP_BUF {
                 c.buf = Vec::new();
             }
@@ -821,6 +874,26 @@ impl Core {
         self.tokens.extend(self.events.iter().map(|e| e.token().0));
         for i in 0..self.tokens.len() {
             self.drive(self.tokens[i]);
+        }
+    }
+
+    /// Closes the connections that are idle for `idle_timeout` or longer.
+    fn sweep(&mut self) {
+        let Some(limit) = self.idle_timeout else {
+            return;
+        };
+        let now = self.now;
+        self.next_sweep = now + limit.min(SWEEP);
+        let old: Vec<usize> = self
+            .conns
+            .iter()
+            .filter(|(_, c)| c.req.is_none() && now.duration_since(c.idle_since) >= limit)
+            .map(|(idx, _)| idx)
+            .collect();
+        for idx in old {
+            if let Some(conn) = self.close(idx) {
+                self.forget(&conn.key);
+            }
         }
     }
 
@@ -919,6 +992,9 @@ impl Core {
         if self.due.is_some_and(|d| d <= self.now) {
             self.expire();
         }
+        if self.now >= self.next_sweep {
+            self.sweep();
+        }
         let mut n = 0;
         while let Some(d) = self.ready.front() {
             let size = RES_HEAD + d.lines.len() + d.body.len();
@@ -969,10 +1045,26 @@ struct Client {
     kick: Mutex<bool>,
     cv: Condvar,
     stopped: AtomicBool,
+    /// No request is open, but connections are: Dart does not call, so
+    /// the helper closes the connections that are idle for too long.
+    quiet: AtomicBool,
+    /// how often the helper looks for them
+    sweep_every: Duration,
     dart_port: i64,
 }
 
 impl Client {
+    /// Closes the idle connections that are over the idle timeout, while
+    /// Dart does not call.
+    fn sweep(&self) {
+        let mut core = self.core.lock().unwrap();
+        core.now = Instant::now();
+        core.sweep();
+        if core.conns.is_empty() {
+            self.quiet.store(false, Ordering::Release);
+        }
+    }
+
     fn set_due(&self, at: Option<Instant>) {
         let ns = at.map_or(u64::MAX, |t| {
             t.saturating_duration_since(self.base)
@@ -1027,7 +1119,19 @@ impl Client {
             {
                 let mut k = self.kick.lock().unwrap();
                 while !*k && !self.stopped.load(Ordering::Acquire) {
-                    k = self.cv.wait(k).unwrap();
+                    if !self.quiet.load(Ordering::Acquire) {
+                        k = self.cv.wait(k).unwrap();
+                        continue;
+                    }
+                    let (guard, time) = self.cv.wait_timeout(k, self.sweep_every).unwrap();
+                    k = guard;
+                    if time.timed_out() && !*k {
+                        // never hold `kick` and wait for the core: Dart
+                        // takes the core first, then `kick`
+                        drop(k);
+                        self.sweep();
+                        k = self.kick.lock().unwrap();
+                    }
                 }
                 *k = false;
             }
@@ -1088,8 +1192,9 @@ fn tls_config(extra: &[u8]) -> Option<Arc<ClientConfig>> {
 /// Makes a client. Its idle helper posts `[1]` to `send_port` when a
 /// socket has data for a waiting request. With `max_per_host` > 0 it holds
 /// at most that many connections open to one address. With `max_body` > 0,
-/// a request whose answer body is bigger fails. `ca` (`ca_len` bytes, PEM)
-/// has more root certificates to trust for `https://`. Returns a handle
+/// a request whose answer body is bigger fails. With `idle_ms` > 0, a
+/// connection with no request for that long closes. `ca` (`ca_len` bytes,
+/// PEM) has more root certificates to trust for `https://`. Returns a handle
 /// (> 0), or < 0: -1 not initialized, -2 no poller or thread, -3 `ca` is
 /// not correct.
 ///
@@ -1100,6 +1205,7 @@ pub unsafe extern "C" fn dox_client_new(
     send_port: i64,
     max_per_host: i64,
     max_body: i64,
+    idle_ms: i64,
     ca: *const u8,
     ca_len: i64,
 ) -> i64 {
@@ -1114,7 +1220,13 @@ pub unsafe extern "C" fn dox_client_new(
     let Some(tls) = tls_config(ca) else {
         return -3;
     };
-    let Ok(core) = Core::new(max_per_host.max(0) as usize, max_body.max(0) as usize, tls) else {
+    let idle = (idle_ms > 0).then(|| Duration::from_millis(idle_ms as u64));
+    let Ok(core) = Core::new(
+        max_per_host.max(0) as usize,
+        max_body.max(0) as usize,
+        idle,
+        tls,
+    ) else {
         return -2;
     };
     #[cfg(unix)]
@@ -1132,6 +1244,8 @@ pub unsafe extern "C" fn dox_client_new(
         kick: Mutex::new(false),
         cv: Condvar::new(),
         stopped: AtomicBool::new(false),
+        quiet: AtomicBool::new(false),
+        sweep_every: idle.map_or(SWEEP, |d| d.min(SWEEP)),
         dart_port: send_port,
     });
     let for_helper = client.clone();
@@ -1155,7 +1269,8 @@ pub unsafe extern "C" fn dox_client_new(
 /// # Safety
 /// `handle` must come from `dox_client_new` and not be closed. `out` must
 /// point to `out_len` readable bytes, `inb` to `in_cap` writable bytes.
-/// Only one call per handle at a time (one isolate).
+/// They can be the buffers of `dox_client_buffer`: this call does not
+/// change those. Only one call per handle at a time (one isolate).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dox_client_run(
     handle: i64,
@@ -1173,7 +1288,20 @@ pub unsafe extern "C" fn dox_client_run(
         &[]
     };
     let inb = unsafe { std::slice::from_raw_parts_mut(inb, in_cap.max(0) as usize) };
-    match core.run(out, inb) {
+    let got = core.run(out, inb);
+    // No request is open: Dart may not call for a long time. The helper
+    // then closes the connections that stay idle for too long.
+    let mut wake = false;
+    if core.open == 0 && core.idle_timeout.is_some() && !core.conns.is_empty() {
+        wake = !s.quiet.swap(true, Ordering::AcqRel);
+    }
+    match got {
+        Ok(n) if wake => {
+            drop(core);
+            *s.kick.lock().unwrap() = true;
+            s.cv.notify_one();
+            n as i64
+        }
         Ok(0) if core.open > 0 => {
             s.set_due(core.due);
             s.armed.store(true, Ordering::Release);
@@ -1185,6 +1313,31 @@ pub unsafe extern "C" fn dox_client_run(
         Ok(n) => n as i64,
         Err(size) => -(size as i64),
     }
+}
+
+/// Gives buffer `which` (0: the requests for `dox_client_run`, 1: its
+/// answers) a size of `size` bytes and returns it. A buffer that grows
+/// keeps its bytes. The buffer is freed with the client. Null: `which` is
+/// not 0 or 1.
+///
+/// # Safety
+/// `handle` must come from `dox_client_new` and not be closed. The last
+/// pointer of the same buffer is not valid after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dox_client_buffer(handle: i64, which: i32, size: i64) -> *mut u8 {
+    let s = unsafe { &*(handle as *const Client) };
+    let mut core = s.core.lock().unwrap();
+    let Some(buf) = core.bufs.get_mut(which as usize) else {
+        return std::ptr::null_mut();
+    };
+    let size = size.max(1) as usize;
+    if size < buf.len() {
+        // a smaller buffer: give the memory back
+        *buf = vec![0u8; size];
+    } else {
+        buf.resize(size, 0);
+    }
+    buf.as_mut_ptr()
 }
 
 /// Closes a client: its connections close and the handle is freed. Open

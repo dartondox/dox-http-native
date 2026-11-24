@@ -6,10 +6,12 @@
   - HTTPS with TLS 1.2 and TLS 1.3 ([rustls](https://github.com/rustls/rustls)). The client trusts the root certificates of Mozilla, which are in the library. `trustedCertificates` adds your own certificates as PEM text.
   - A request fails with a `DoxHttpClientException` when no answer comes. `failure` gives the cause as a `DoxHttpFailure`.
   - The default timeout of a request is 30 seconds. Set `timeout` for the client or for one request. `Duration.zero` is no timeout.
+  - A connection with no request for `idleTimeout` (default 15 seconds) closes. `Duration.zero` keeps idle connections open.
   - `maxConnectionsPerHost` and `maxResponseSize` are off by default.
+  - Before a kept connection gets the next request, the client reads it. If the server closed it or sent bytes that nobody asked for, the client closes it and uses a different connection.
   - The client does not do these things: HTTP/2, redirects, compressed bodies and streamed bodies.
   - New fuzz target `client_response` for the answer parser.
-- The library has 3 new FFI functions: `dox_client_new`, `dox_client_run` and `dox_client_close`. The ABI version goes up at the next release.
+- The library has 4 new FFI functions: `dox_client_new`, `dox_client_run`, `dox_client_buffer` and `dox_client_close`. The ABI version goes up at the next release.
 - The library is larger because of TLS. The macOS arm64 library goes from approximately 0.55 MB to approximately 1.5 MB.
 - A build from source now needs a C compiler, because the TLS library compiles C code and assembly code. The ready-built libraries from pub.dev do not need one.
 - The ready-built Linux libraries do not need `libgcc_s.so.1`. They need only glibc 2.34 or newer, as before. A `FROM scratch` Docker image with the Dart `/runtime/` files does not need a copy of `libgcc_s.so.1` for this package. The release build now links the Linux libraries with `cargo zigbuild`, and CI does a check of each library.

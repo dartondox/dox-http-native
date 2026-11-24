@@ -88,14 +88,17 @@ class DoxHttpClientResponse {
 
 /// A request that waits for its answer.
 class _Pending {
-  _Pending(this.url, this.request, this.flags, this.timeoutMs);
+  _Pending(this.url, this.request, this.flags, this.deadline);
 
   final Uri url;
 
   /// The HTTP request: head and body.
   final Uint8List request;
   final int flags;
-  final int timeoutMs;
+
+  /// When the request fails with a timeout, in microseconds of
+  /// [DoxHttpClient._clock]. 0: never.
+  final int deadline;
   final Completer<DoxHttpClientResponse> completer =
       Completer<DoxHttpClientResponse>();
 
@@ -106,9 +109,13 @@ class _Pending {
 
 /// The addresses of a host name, kept for [DoxHttpClient._lookupTime].
 class _Lookup {
-  _Lookup(this.addresses, this.until);
+  _Lookup(this.until);
 
-  final Future<List<InternetAddress>> addresses;
+  /// The addresses, when the lookup is done.
+  List<InternetAddress>? addresses;
+
+  /// The lookup, while it runs.
+  Future<List<InternetAddress>>? pending;
 
   /// In microseconds of [DoxHttpClient._clock].
   final int until;
@@ -145,8 +152,12 @@ class DoxHttpClient implements Finalizable {
   /// For `https://`, the client trusts the root certificates of Mozilla.
   /// [trustedCertificates] adds your own, as PEM text: for example the
   /// certificate authority of your company, or a self-signed certificate.
+  ///
+  /// A connection with no request for [idleTimeout] closes.
+  /// `Duration.zero` keeps idle connections open.
   DoxHttpClient({
     this.timeout = const Duration(seconds: 30),
+    Duration idleTimeout = const Duration(seconds: 15),
     int maxConnectionsPerHost = 0,
     int maxResponseSize = 0,
     String? trustedCertificates,
@@ -155,11 +166,16 @@ class DoxHttpClient implements Finalizable {
     Uint8List ca = utf8.encode(trustedCertificates ?? '');
     Pointer<Uint8> caPtr = doxAlloc(ca.length);
     caPtr.asTypedList(ca.length).setAll(0, ca);
-    _receive = RawReceivePort(_onWake)..keepIsolateAlive = false;
+    // The port must not hold the client: a client that nobody uses can
+    // then be collected, and the finalizers close it.
+    WeakReference<DoxHttpClient> weak = WeakReference<DoxHttpClient>(this);
+    _receive = RawReceivePort((Object? _) => weak.target?._onWake())
+      ..keepIsolateAlive = false;
     _handle = doxClientNew(
       _receive.sendPort.nativePort,
       maxConnectionsPerHost,
       maxResponseSize,
+      _ceilMs(idleTimeout.inMicroseconds),
       caPtr,
       ca.length,
     );
@@ -176,14 +192,37 @@ class DoxHttpClient implements Finalizable {
       throw StateError('dox_client_new failed ($_handle)');
     }
     _finalizer.attach(this, Pointer<Void>.fromAddress(_handle), detach: this);
+    _ports.attach(this, _receive, detach: this);
+    _sizeOut(_outSize);
+    _sizeIn(_inSize);
   }
 
   /// The timeout of a request that gives none.
   final Duration timeout;
 
+  /// Closes the native client (sockets, helper thread, buffers) of a
+  /// client that was collected or whose isolate ended.
   static final NativeFinalizer _finalizer = NativeFinalizer(
     Native.addressOf<NativeFinalizerFunction>(doxClientClose),
   );
+
+  /// Closes the port of a client that was collected.
+  static final Finalizer<RawReceivePort> _ports = Finalizer<RawReceivePort>(
+    (RawReceivePort port) => port.close(),
+  );
+
+  /// The clients with an open request. A client in this set is not
+  /// collected, so each of its requests gets its answer.
+  static final Set<DoxHttpClient> _busy = <DoxHttpClient>{};
+
+  /// The most host names with kept addresses before the old ones go.
+  static const int _maxLookups = 256;
+
+  /// [microseconds] in milliseconds for Rust, not below 1 when it is not 0.
+  static int _ceilMs(int microseconds) {
+    if (microseconds <= 0) return 0;
+    return ((microseconds + 999) ~/ 1000).clamp(1, 0xFFFFFFFF);
+  }
 
   static const int _reqHead = 40;
   static const int _resHead = 20;
@@ -220,14 +259,17 @@ class DoxHttpClient implements Finalizable {
   final Stopwatch _clock = Stopwatch()..start();
   bool _closed = false;
 
-  int _outCap = _outSize;
-  late Pointer<Uint8> _outPtr = doxAlloc(_outCap);
-  late Uint8List _out = _outPtr.asTypedList(_outCap);
+  /// The request records for the next [_run]. Rust owns the memory of
+  /// both buffers and frees it with the client.
+  int _outCap = 0;
+  late Pointer<Uint8> _outPtr;
+  late Uint8List _out;
   int _len = 0;
 
-  int _inCap = _inSize;
-  late Pointer<Uint8> _inPtr = doxAlloc(_inCap);
-  late Uint8List _in = _inPtr.asTypedList(_inCap);
+  /// The answer records of the last [_run].
+  int _inCap = 0;
+  late Pointer<Uint8> _inPtr;
+  late Uint8List _in;
 
   int _nextId = 1;
   bool _queued = false;
@@ -360,12 +402,12 @@ class DoxHttpClient implements Finalizable {
     int flags = _idempotent.contains(method) ? _again : 0;
     if (method == 'HEAD') flags |= _headOnly;
     if (tls) flags |= _tls;
-    int ms = (timeout ?? this.timeout).inMilliseconds.clamp(0, 0xFFFFFFFF);
+    int wait = (timeout ?? this.timeout).inMicroseconds;
     _Pending pending = _Pending(
       url,
       _encode(method, url, headers, body, bodyBytes),
       flags,
-      ms,
+      wait > 0 ? _clock.elapsedMicroseconds + wait : 0,
     );
 
     InternetAddress? address = InternetAddress.tryParse(url.host);
@@ -373,17 +415,7 @@ class DoxHttpClient implements Finalizable {
       pending.addresses = <InternetAddress>[address];
       _submit(pending);
     } else {
-      _lookup(url.host).then(
-        (List<InternetAddress> addresses) {
-          if (_closed) return _fail(pending, DoxHttpFailure.clientClosed);
-          pending.addresses = addresses;
-          _submit(pending);
-        },
-        onError: (Object _) {
-          _lookups.remove(url.host);
-          _fail(pending, DoxHttpFailure.lookupFailed);
-        },
-      );
+      _resolve(pending);
     }
     return pending.completer.future;
   }
@@ -394,10 +426,11 @@ class DoxHttpClient implements Finalizable {
     if (_closed) return;
     _closed = true;
     _finalizer.detach(this);
+    _ports.detach(this);
+    _busy.remove(this);
+    // Rust also frees the 2 buffers
     doxClientClose(Pointer<Void>.fromAddress(_handle));
     _receive.close();
-    doxFree(_outPtr, _outCap);
-    doxFree(_inPtr, _inCap);
     List<_Pending> open = _open.values.toList();
     _open.clear();
     for (_Pending pending in open) {
@@ -461,15 +494,51 @@ class DoxHttpClient implements Finalizable {
       ..setRange(start.length, start.length + payload.length, payload);
   }
 
-  /// The addresses of [host]. One lookup serves all requests of the next
-  /// [_lookupTime].
-  Future<List<InternetAddress>> _lookup(String host) {
+  /// Finds the addresses of the host of [pending], then sends it. One
+  /// lookup serves all requests of the next [_lookupTime].
+  void _resolve(_Pending pending) {
+    String host = pending.url.host;
     int now = _clock.elapsedMicroseconds;
     _Lookup? known = _lookups[host];
-    if (known != null && known.until > now) return known.addresses;
-    Future<List<InternetAddress>> addresses = InternetAddress.lookup(host);
-    _lookups[host] = _Lookup(addresses, now + _lookupTime.inMicroseconds);
-    return addresses;
+    if (known == null || known.until <= now) {
+      if (_lookups.length >= _maxLookups) {
+        _lookups.removeWhere((String _, _Lookup old) => old.until <= now);
+      }
+      _Lookup fresh = _Lookup(now + _lookupTime.inMicroseconds);
+      fresh.pending = InternetAddress.lookup(host)
+          .then((List<InternetAddress> addresses) {
+            fresh.addresses = addresses;
+            fresh.pending = null;
+            return addresses;
+          });
+      _lookups[host] = known = fresh;
+    }
+    List<InternetAddress>? addresses = known.addresses;
+    if (addresses != null) {
+      pending.addresses = addresses;
+      return _submit(pending);
+    }
+    _Lookup entry = known;
+    Future<List<InternetAddress>> lookup = entry.pending!;
+    if (pending.deadline != 0) {
+      // the timeout of the request also holds for the lookup
+      int left = pending.deadline - now;
+      lookup = lookup.timeout(Duration(microseconds: left < 1 ? 1 : left));
+    }
+    lookup.then(
+      (List<InternetAddress> addresses) {
+        if (_closed) return _fail(pending, DoxHttpFailure.clientClosed);
+        pending.addresses = addresses;
+        _submit(pending);
+      },
+      onError: (Object error) {
+        if (error is TimeoutException) {
+          return _fail(pending, DoxHttpFailure.timeout);
+        }
+        if (identical(_lookups[host], entry)) _lookups.remove(host);
+        _fail(pending, DoxHttpFailure.lookupFailed);
+      },
+    );
   }
 
   void _fail(_Pending pending, DoxHttpFailure failure) {
@@ -484,6 +553,14 @@ class DoxHttpClient implements Finalizable {
     if (pending.index >= pending.addresses.length) {
       return _fail(pending, DoxHttpFailure.lookupFailed);
     }
+    // what is left of the timeout: a lookup or an address with no server
+    // took a part of it
+    int timeoutMs = 0;
+    if (pending.deadline != 0) {
+      int left = pending.deadline - _clock.elapsedMicroseconds;
+      if (left <= 0) return _fail(pending, DoxHttpFailure.timeout);
+      timeoutMs = _ceilMs(left);
+    }
     InternetAddress address = pending.addresses[pending.index];
     Uint8List request = pending.request;
     // the server name, to check the certificate against
@@ -491,7 +568,13 @@ class DoxHttpClient implements Finalizable {
         ? utf8.encode(pending.url.host)
         : _noName;
     int size = _reqHead + name.length + request.length;
-    if (_len + size > _outCap) _growOut(_len + size);
+    if (_len + size > _outCap) {
+      int cap = _outCap;
+      while (cap < _len + size) {
+        cap *= 2;
+      }
+      _sizeOut(cap);
+    }
 
     int id = _nextId++;
     Uint8List raw = address.rawAddress;
@@ -504,7 +587,7 @@ class DoxHttpClient implements Finalizable {
     data.setUint64(16, 0);
     data.setUint64(24, 0);
     _out.setRange(_len + 16, _len + 16 + raw.length, raw);
-    data.setUint32(32, pending.timeoutMs, Endian.little);
+    data.setUint32(32, timeoutMs, Endian.little);
     data.setUint16(36, name.length, Endian.little);
     data.setUint16(38, 0);
     int at = _len + _reqHead;
@@ -512,7 +595,10 @@ class DoxHttpClient implements Finalizable {
     _out.setRange(at + name.length, _len + size, request);
     _len += size;
 
-    if (_open.isEmpty) _receive.keepIsolateAlive = true;
+    if (_open.isEmpty) {
+      _receive.keepIsolateAlive = true;
+      _busy.add(this);
+    }
     _open[id] = pending;
     if (!_queued) {
       // one call for all requests of this turn of the event loop
@@ -521,28 +607,21 @@ class DoxHttpClient implements Finalizable {
     }
   }
 
-  void _growOut(int need) {
-    int cap = _outCap;
-    while (cap < need) {
-      cap *= 2;
-    }
-    Pointer<Uint8> ptr = doxAlloc(cap);
-    Uint8List list = ptr.asTypedList(cap);
-    list.setRange(0, _len, _out);
-    doxFree(_outPtr, _outCap);
-    _outPtr = ptr;
-    _out = list;
-    _outCap = cap;
+  /// Gives the request buffer [size] bytes. It keeps its records.
+  void _sizeOut(int size) {
+    _outPtr = doxClientBuffer(_handle, 0, size);
+    _outCap = size;
+    _out = _outPtr.asTypedList(size);
   }
 
-  void _resizeIn(int size) {
-    doxFree(_inPtr, _inCap);
+  /// Gives the answer buffer [size] bytes.
+  void _sizeIn(int size) {
+    _inPtr = doxClientBuffer(_handle, 1, size);
     _inCap = size;
-    _inPtr = doxAlloc(size);
     _in = _inPtr.asTypedList(size);
   }
 
-  void _onWake(Object? _) {
+  void _onWake() {
     if (!_queued) _run();
   }
 
@@ -551,15 +630,10 @@ class DoxHttpClient implements Finalizable {
     if (_closed) return;
     int n = doxClientRun(_handle, _outPtr, _len, _inPtr, _inCap);
     _len = 0;
-    if (_outCap > _keepSize) {
-      doxFree(_outPtr, _outCap);
-      _outCap = _outSize;
-      _outPtr = doxAlloc(_outCap);
-      _out = _outPtr.asTypedList(_outCap);
-    }
+    if (_outCap > _keepSize) _sizeOut(_outSize);
     if (n < 0) {
       // one answer needs a bigger buffer
-      _resizeIn(-n);
+      _sizeIn(-n);
       n = doxClientRun(_handle, _outPtr, 0, _inPtr, _inCap);
     }
     // 0: Rust posts to the port when there is an answer
@@ -591,9 +665,10 @@ class DoxHttpClient implements Finalizable {
       }
       p += size;
     }
-    if (_inCap > _keepSize) _resizeIn(_inSize);
+    if (_inCap > _keepSize) _sizeIn(_inSize);
     if (_open.isEmpty) {
       _receive.keepIsolateAlive = false;
+      _busy.remove(this);
     } else if (!_queued) {
       // more answers may wait: look again after a turn of the event loop
       _queued = true;

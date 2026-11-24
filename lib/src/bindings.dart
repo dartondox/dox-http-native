@@ -137,19 +137,29 @@ external int doxAesGcmOpen(
 
 /// Makes an HTTP client (see native/src/client.rs). Its idle helper posts
 /// to [sendPort]. [maxPerHost] 0 is no limit of connections to one address.
-/// [maxBody] 0 is no limit of an answer body. [ca] ([caLength] bytes, PEM)
-/// has more root certificates to trust for `https://`. Returns a handle
-/// for [doxClientRun], or -3 when [ca] is not correct.
-@Native<Int64 Function(Int64, Int64, Int64, Pointer<Uint8>, Int64)>(
+/// [maxBody] 0 is no limit of an answer body. A connection with no request
+/// for [idleMs] closes (0: never). [ca] ([caLength] bytes, PEM) has more
+/// root certificates to trust for `https://`. Returns a handle for
+/// [doxClientRun], or -3 when [ca] is not correct.
+@Native<Int64 Function(Int64, Int64, Int64, Int64, Pointer<Uint8>, Int64)>(
   symbol: 'dox_client_new',
 )
 external int doxClientNew(
   int sendPort,
   int maxPerHost,
   int maxBody,
+  int idleMs,
   Pointer<Uint8> ca,
   int caLength,
 );
+
+/// Gives buffer [which] of a client (0: the requests for [doxClientRun],
+/// 1: its answers) a size of [size] bytes and returns it. A buffer that
+/// grows keeps its bytes. Rust frees the buffers with the client.
+@Native<Pointer<Uint8> Function(Int64, Int32, Int64)>(
+  symbol: 'dox_client_buffer',
+)
+external Pointer<Uint8> doxClientBuffer(int handle, int which, int size);
 
 /// Sends the request records in [out], reads the finished answers into
 /// [inBuf]. Never waits. Returns the answer bytes, 0 for none (Rust then
