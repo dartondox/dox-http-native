@@ -1,5 +1,6 @@
 ## 0.0.2
 
+- `DoxHttpClient(lookup: ...)` gives the addresses of a host name to the client. The client connects only to these addresses. Use it to refuse addresses, for example those of your own network when a user gives the URL.
 - New library `package:dox_http_client/http.dart` with `DoxHttpPackageClient`. It is a `Client` of [package:http](https://pub.dev/packages/http) that sends its requests through a `DoxHttpClient`. Give it to a package that takes an `http.Client`.
   - `Request`, `StreamedRequest`, `MultipartRequest` and `AbortableRequest` work. The answer body is a stream.
   - A failure is a `DoxHttpPackageClientException`: a `ClientException` of `package:http` that is also a `DoxHttpClientException`.

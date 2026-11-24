@@ -189,6 +189,34 @@ void main() {
     expect(res.header('nope'), isNull);
   });
 
+  test('lookup gives the addresses of a host name', () async {
+    List<String> asked = <String>[];
+    DoxHttpClient mine = DoxHttpClient(
+      lookup: (String host) async {
+        asked.add(host);
+        if (host == 'refused.invalid') throw StateError('refused');
+        if (host == 'none.invalid') return <InternetAddress>[];
+        return <InternetAddress>[InternetAddress.loopbackIPv4];
+      },
+    );
+    addTearDown(mine.close);
+    Uri url = Uri.parse('http://app.invalid:${server.port}/echo');
+    DoxHttpClientResponse res = await mine.get(url);
+    Map<String, Object?> echo = jsonDecode(res.body) as Map<String, Object?>;
+    expect(echo['host'], 'app.invalid:${server.port}');
+    await expectLater(
+      mine.get(Uri.parse('http://refused.invalid:${server.port}/')),
+      failsWith(DoxHttpFailure.lookupFailed),
+    );
+    await expectLater(
+      mine.get(Uri.parse('http://none.invalid:${server.port}/')),
+      failsWith(DoxHttpFailure.lookupFailed),
+    );
+    // an IP address needs no lookup
+    expect((await mine.get(base)).statusCode, 200);
+    expect(asked, <String>['app.invalid', 'refused.invalid', 'none.invalid']);
+  });
+
   test('an error status is an answer, not an exception', () async {
     expect((await client.get(base.resolve('/status/404'))).statusCode, 404);
     expect((await client.get(base.resolve('/status/500'))).statusCode, 500);

@@ -284,6 +284,29 @@ DoxHttpClient client = DoxHttpClient(
 );
 ```
 
+## Host names
+
+The client finds the addresses of a host name with `InternetAddress.lookup`. It keeps them for some seconds. `lookup` changes this. The client connects only to the addresses that your function gives, in their sequence:
+
+```dart
+final DoxHttpClient client = DoxHttpClient(
+  lookup: (String host) async {
+    List<InternetAddress> found = await InternetAddress.lookup(host);
+    if (found.any((InternetAddress a) => a.isLoopback)) {
+      throw StateError('refused');
+    }
+    return found;
+  },
+);
+```
+
+- When the function fails or gives no address, the request fails with `lookupFailed`.
+- TLS checks the certificate of the host name, not of the address.
+- The client does not call the function when the host of the URL is an IP address. Check such a URL before you send the request.
+- A redirect to a different host name calls the function again.
+
+Use this when a user gives the URL. Then a request can not go to an address of your own network.
+
 ## Idle connections
 
 A connection with no request for 15 seconds closes. Change this with `idleTimeout`. `Duration.zero` keeps idle connections open:
