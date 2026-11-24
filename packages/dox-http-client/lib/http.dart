@@ -35,19 +35,18 @@ class DoxHttpPackageClientException extends http.ClientException
 ///
 /// What is different from the default client of `package:http`:
 ///
-/// - A request with no head of an answer in the timeout of the
-///   [DoxHttpClient] (default 30 seconds) fails.
 /// - A request with a body does not follow redirects.
 /// - `maxRedirects` and `persistentConnection` of a request have no effect:
 ///   set `maxRedirects` on the [DoxHttpClient].
 /// - An answer has no `reasonPhrase`.
 /// - A failure is a [DoxHttpPackageClientException].
 class DoxHttpPackageClient extends http.BaseClient {
-  /// With no [client], the adapter makes a [DoxHttpClient] and [close]
+  /// With no [client], the adapter makes a [DoxHttpClient] with no
+  /// timeout, like the default client of `package:http`, and [close]
   /// closes it. A [client] that you give stays open: close it yourself.
   DoxHttpPackageClient({DoxHttpClient? client})
     : _owned = client == null,
-      _client = client ?? DoxHttpClient();
+      _client = client ?? DoxHttpClient(timeout: Duration.zero);
 
   final DoxHttpClient _client;
   final bool _owned;

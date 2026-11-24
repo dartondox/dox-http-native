@@ -216,7 +216,7 @@ Future<String> rates() async {
 
 `Request`, `StreamedRequest`, `MultipartRequest` and `AbortableRequest` work. The answer body is a stream, so a large download does not fill the memory.
 
-To set the options of the native client, give your own `DoxHttpClient`:
+The adapter makes a `DoxHttpClient` with no timeout, because the default client of `package:http` has none. To set a timeout or other options, give your own `DoxHttpClient`:
 
 ```dart
 final DoxHttpClient native = DoxHttpClient(
@@ -229,7 +229,6 @@ final http.Client client = DoxHttpPackageClient(client: native);
 
 These things are different from the default client of `package:http`:
 
-- A request fails when the head of the answer does not come in the timeout of the `DoxHttpClient`. The default is 30 seconds.
 - A request with a body does not follow redirects. You get the redirect answer.
 - `maxRedirects` and `persistentConnection` of a request have no effect. Set `maxRedirects` on the `DoxHttpClient`.
 - An answer has no `reasonPhrase`.
