@@ -1497,3 +1497,52 @@ fn h2_a_connection_is_idle_from_the_end_of_its_last_request() {
     core.run(&[], &mut inb).unwrap();
     assert!(core.conns.is_empty());
 }
+
+#[test]
+fn h2_a_whole_coded_answer_stays_when_the_connection_closes() {
+    let text: Vec<u8> = (0..2 << 20).map(|i| b'a' + (i % 7) as u8).collect();
+    let want = text.clone();
+    let z = gzip(&text);
+    // all of it fits in the window of the stream
+    assert!(z.len() < WINDOW as usize);
+    let s = h2_server(&[], move |peer, _| {
+        let Some((stream, _, _)) = peer.request() else {
+            return;
+        };
+        peer.head(stream, "200", &[("content-encoding", "gzip")], false);
+        peer.data(stream, &z, true);
+        // GOAWAY, then the connection closes
+        peer.put(7, 0, 0, &[0, 0, 0, 1, 0, 0, 0, 0]);
+    });
+    let config = tls_config(s.pem.as_bytes(), true).unwrap();
+    let mut core = Core::new(1, 0, None, config).unwrap();
+    let mut r = Reader::new(1);
+    let out = req(
+        1,
+        s.addr,
+        STREAM | DECODE,
+        5000,
+        "GET / HTTP/1.1\r\nhost: localhost\r\n\r\n",
+    );
+    // a slow reader: the decoder holds the rest
+    r.until(&mut core, &out, false, |r| r.body.len() >= HIGH);
+    thread::sleep(Duration::from_millis(100));
+    for _ in 0..20 {
+        r.run(&mut core, &[]);
+    }
+    assert_eq!((r.error, r.body.len()), (None, HIGH));
+    // a new request does not wait for it, also with a limit of 1 connection
+    let a = run_until(&mut core, &get_path(2, s.addr, "/"), 1);
+    assert_eq!((a[0].status, a[0].error), (200, 0));
+    assert_eq!(s.count.load(Ordering::SeqCst), 2);
+    r.until(&mut core, &[], true, |r| r.over());
+    assert!(r.ended, "{:?}", r.error);
+    assert!(r.body == want);
+    assert_eq!(core.open, 0);
+    // the closed connection went with its answer
+    assert!(
+        core.conns
+            .iter()
+            .all(|(_, c)| c.h2.as_ref().is_some_and(|m| !m.gone))
+    );
+}

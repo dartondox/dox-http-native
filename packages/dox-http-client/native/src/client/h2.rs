@@ -61,7 +61,7 @@ const FRAME: usize = 16_384;
 /// No more request body is framed while `out` has this many bytes.
 const OUT_HIGH: usize = 256 * 1024;
 /// A server that makes us answer (PING, SETTINGS) and does not read: the
-/// connection closes when `out` is over this.
+/// connection closes when the answers in `out` are over this.
 const OUT_MAX: usize = 4 << 20;
 /// Most open streams before the SETTINGS frame of the server came.
 const EARLY_STREAMS: u32 = 100;
@@ -142,6 +142,9 @@ pub(super) struct H2 {
     pub(super) goaway: bool,
     /// A connection error: the caller closes the connection.
     dead: bool,
+    /// Bytes in `out` that answer frames of the server (ACK,
+    /// WINDOW_UPDATE, RST_STREAM), since `out` was empty.
+    replies: usize,
 }
 
 pub(super) fn frame(out: &mut Vec<u8>, ty: u8, flags: u8, stream: u32, payload: &[u8]) {
@@ -198,6 +201,7 @@ impl H2 {
             block_end: false,
             goaway: false,
             dead: false,
+            replies: 0,
         }
     }
 
@@ -397,6 +401,10 @@ impl H2 {
         if self.dead {
             return Err(());
         }
+        // the socket took all that was there
+        if self.out.is_empty() {
+            self.replies = 0;
+        }
         let mut p = 0;
         while input.len() - p >= 9 {
             let len =
@@ -412,10 +420,13 @@ impl H2 {
             let stream = be32(&input[p + 5..p + 9]) & 0x7fff_ffff;
             let payload = &input[p + 9..p + 9 + len];
             p += 9 + len;
+            let before = self.out.len();
             if let Err(code) = self.on_frame(ty, flags, stream, payload) {
                 return self.die(code);
             }
-            if self.out.len() > OUT_MAX {
+            // only the bytes that the server made us write count
+            self.replies += self.out.len() - before;
+            if self.replies > OUT_MAX {
                 return self.die(ENHANCE_YOUR_CALM);
             }
         }

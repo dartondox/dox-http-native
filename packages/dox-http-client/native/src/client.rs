@@ -37,7 +37,8 @@
 //!   stops the upload before its end: the connection is not used again.
 //! - [Q_CREDIT]: u64 at 16: the total bytes of the answer body of request
 //!   `id` that Dart has used so far.
-//! - [Q_CANCEL]: close the connection of request `id` and forget it.
+//! - [Q_CANCEL]: forget request `id`. HTTP/1.1 closes its connection,
+//!   HTTP/2 closes its stream.
 //!
 //! Only [Q_NEW] uses the address, the flags, the timeout and the name.
 //!
@@ -781,6 +782,9 @@ struct Mux {
     /// it has no request, and `idle_since` of the connection says since
     /// when
     idle: bool,
+    /// The connection is closed. It stays for the answers that are whole
+    /// and that Dart did not read to their end yet.
+    gone: bool,
 }
 
 /// One request on an HTTP/2 connection.
@@ -1421,6 +1425,32 @@ impl Core {
     /// connection was a kept one with no answer byte, else Dart gets
     /// `error`.
     fn fail(&mut self, idx: usize, error: u16) {
+        if let Some(c) = self.conns.get_mut(idx)
+            && let Some(mux) = c.h2.as_mut()
+            && mux.subs.values().any(|sub| sub.ended)
+        {
+            // A streamed answer that is whole needs no connection: only
+            // Dart has to use its bytes. It stays, the other requests fail.
+            mux.gone = true;
+            mux.proto.goaway = true;
+            let _ = self.poll.registry().deregister(&mut c.stream);
+            let key = c.key.clone();
+            let mut lost: Vec<u32> = mux
+                .subs
+                .iter()
+                .filter(|(_, sub)| !sub.ended)
+                .map(|(&stream, _)| stream)
+                .collect();
+            lost.sort_unstable_by_key(|&stream| std::cmp::Reverse(stream));
+            let lost: Vec<Sub> = lost
+                .iter()
+                .filter_map(|stream| mux.subs.remove(stream))
+                .collect();
+            for sub in lost {
+                self.h2_lost(&key, sub, error, false, error == E_CLOSED);
+            }
+            return self.pump(&key);
+        }
         let Some(conn) = self.close(idx) else { return };
         let key = conn.key;
         if let Some(mux) = conn.h2 {
@@ -1566,8 +1596,9 @@ impl Core {
             c.told = 0;
             return self.drive(idx);
         }
+        let leaving = self.leaving(&key);
         let host = self.hosts.entry(key.clone()).or_default();
-        if self.max_per_host == 0 || host.count < self.max_per_host {
+        if self.max_per_host == 0 || host.count - leaving < self.max_per_host {
             self.connect(key, req);
         } else {
             host.queue.push_back(req);
@@ -1596,6 +1627,7 @@ impl Core {
     fn pump_one(&mut self, key: &Key) {
         loop {
             let shared = self.h2_free(key).is_some();
+            let leaving = self.leaving(key);
             let Some(host) = self.hosts.get_mut(key) else {
                 return;
             };
@@ -1605,7 +1637,7 @@ impl Core {
                 }
                 return;
             }
-            let full = self.max_per_host != 0 && host.count >= self.max_per_host;
+            let full = self.max_per_host != 0 && host.count - leaving >= self.max_per_host;
             if !shared && host.idle.is_empty() && full {
                 return;
             }
@@ -1621,7 +1653,7 @@ impl Core {
     /// in the next one.
     fn drive(&mut self, idx: usize) {
         self.step(idx);
-        if self.conns.get(idx).is_some_and(|c| c.more) {
+        if self.conns.get(idx).is_some_and(|c| c.more) && !self.again.contains(&idx) {
             self.again.push(idx);
         }
     }
@@ -1902,6 +1934,21 @@ impl Core {
         self.pump(&key);
     }
 
+    /// The HTTP/2 connections for `key` that take no new request (GOAWAY)
+    /// and only end the ones they have. They do not count for
+    /// `max_per_host`: else one long answer on such a connection makes all
+    /// other requests wait.
+    fn leaving(&self, key: &Key) -> usize {
+        let Some(host) = self.hosts.get(key) else {
+            return 0;
+        };
+        let leaves = |idx: &&usize| {
+            let mux = self.conns.get(**idx).and_then(|c| c.h2.as_ref());
+            mux.is_some_and(|mux| mux.proto.goaway)
+        };
+        host.h2.iter().filter(leaves).count()
+    }
+
     /// An HTTP/2 connection for `key` that can take one more request.
     fn h2_free(&self, key: &Key) -> Option<usize> {
         let free = |idx: &usize| {
@@ -1925,6 +1972,7 @@ impl Core {
             proto: h2::H2::new(),
             subs: HashMap::new(),
             idle: false,
+            gone: false,
         }));
         self.hosts.entry(key.clone()).or_default().h2.push(idx);
         if let Some(req) = req {
@@ -1986,6 +2034,14 @@ impl Core {
             let Some(c) = self.conns.get_mut(idx) else {
                 return;
             };
+            if c.h2.as_ref().is_some_and(|mux| mux.gone) {
+                // no socket any more: it goes with its last answer
+                let key = c.key.clone();
+                if c.h2.as_ref().is_some_and(|mux| mux.subs.is_empty()) {
+                    self.close(idx);
+                }
+                break key;
+            }
             let (fail, eof, _) = c.io(READ_MAX);
             let Some(mux) = c.h2.as_mut() else { return };
             // what went out
@@ -2617,14 +2673,19 @@ impl Core {
         let mut steps = RUN_MAX / READ_MAX;
         while steps > 0 && !self.again.is_empty() {
             let list = std::mem::take(&mut self.again);
+            let mut later = Vec::new();
             for idx in list {
                 if steps > 0 {
                     steps -= 1;
                     self.drive(idx);
                 } else {
-                    self.again.push(idx);
+                    later.push(idx);
                 }
             }
+            // the ones that got no step are first in the next call
+            later.retain(|idx| !self.again.contains(idx));
+            later.append(&mut self.again);
+            self.again = later;
         }
         if self.due.is_some_and(|d| d <= self.now) {
             self.expire();

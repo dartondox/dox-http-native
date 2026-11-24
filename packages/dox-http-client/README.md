@@ -210,6 +210,7 @@ On an `https://` URL, the client asks the server for HTTP/2 during the TLS hands
 - If the server tells the client that it did not work on a request (a refused stream, or a GOAWAY frame for an earlier stream), the client sends the request again one time. This is safe for each method. It does not apply to a request with a body stream.
 - If the connection closes before the head of an answer comes, the client sends the request again one time, and only for `GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS` and `TRACE`. The server can have received the first one.
 - The headers `connection`, `keep-alive`, `proxy-connection`, `transfer-encoding`, `upgrade` and `te` of a request do not go to an HTTP/2 server. They are only for HTTP/1.1.
+- With HTTP/2, a request body that you give as `body` or `bodyBytes` is in memory two times until the head of the answer comes. For a large body, use `sendStreamed`.
 - An `http://` URL always uses HTTP/1.1.
 
 To use HTTP/1.1 only, set `http2` to `false`:
