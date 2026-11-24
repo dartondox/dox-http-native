@@ -75,6 +75,9 @@ enum DoxHttpFailure {
 
   /// [DoxHttpClient.close] was called before the answer came.
   clientClosed,
+
+  /// The answer was one more redirect after `maxRedirects` of them.
+  tooManyRedirects,
 }
 
 /// A request of a [DoxHttpClient] that got no answer.
@@ -93,7 +96,16 @@ class DoxHttpClientException implements IOException {
 
 /// The answer to a request of a [DoxHttpClient].
 class DoxHttpClientResponse {
-  DoxHttpClientResponse._(this.statusCode, this._lines, this.bodyBytes);
+  DoxHttpClientResponse._(
+    this.url,
+    this.statusCode,
+    this._lines,
+    this.bodyBytes,
+  );
+
+  /// The URL that gave this answer. After a redirect, it is not the URL
+  /// of the request.
+  final Uri url;
 
   final int statusCode;
 
@@ -178,8 +190,8 @@ class _Lookup {
 /// open (keep-alive) and uses them again. Each isolate needs its own
 /// client.
 ///
-/// It speaks HTTP/1.1 over `http://` and `https://`. It does not follow
-/// redirects, and it does not unzip a body.
+/// It speaks HTTP/1.1 over `http://` and `https://`. It follows
+/// redirects. It does not unzip a body.
 class DoxHttpClient implements Finalizable {
   /// A request with no whole answer in [timeout] fails. `Duration.zero`
   /// is no timeout.
@@ -196,8 +208,14 @@ class DoxHttpClient implements Finalizable {
   ///
   /// A connection with no request for [idleTimeout] closes.
   /// `Duration.zero` keeps idle connections open.
+  ///
+  /// With [followRedirects], the client goes to the new address of a
+  /// redirect (301, 302, 303, 307, 308), at most [maxRedirects] times for
+  /// one request.
   DoxHttpClient({
     this.timeout = const Duration(seconds: 30),
+    this.followRedirects = true,
+    this.maxRedirects = 5,
     Duration idleTimeout = const Duration(seconds: 15),
     int maxConnectionsPerHost = 0,
     int maxResponseSize = 0,
@@ -240,6 +258,14 @@ class DoxHttpClient implements Finalizable {
 
   /// The timeout of a request that gives none.
   final Duration timeout;
+
+  /// If the client goes to the new address of a redirect, for a request
+  /// that does not say.
+  final bool followRedirects;
+
+  /// The most redirects of one request. One more fails the request with
+  /// [DoxHttpFailure.tooManyRedirects].
+  final int maxRedirects;
 
   /// Closes the native client (sockets, helper thread, buffers) of a
   /// client that was collected or whose isolate ended.
@@ -292,6 +318,25 @@ class DoxHttpClient implements Finalizable {
     'DELETE',
     'OPTIONS',
     'TRACE',
+  };
+
+  /// The statuses that send the client to a new address.
+  static const Set<int> _redirects = <int>{301, 302, 303, 307, 308};
+
+  /// Headers that must not go to a different server after a redirect.
+  static const Set<String> _private = <String>{
+    'authorization',
+    'cookie',
+    'host',
+    'proxy-authorization',
+  };
+
+  /// Headers that describe a body. They go when a redirect drops the body.
+  static const Set<String> _aboutBody = <String>{
+    'content-encoding',
+    'content-language',
+    'content-location',
+    'content-type',
   };
 
   static final Uint8List _noName = Uint8List(0);
@@ -416,7 +461,8 @@ class DoxHttpClient implements Finalizable {
   ///
   /// The body is [body] (text, sent as UTF-8) or [bodyBytes], not both.
   /// The client sets `host` and `content-length`. [timeout] is for this
-  /// request only: `Duration.zero` is no timeout.
+  /// request only: `Duration.zero` is no timeout. It includes the
+  /// redirects. [followRedirects] is for this request only.
   ///
   /// The future fails with a [DoxHttpClientException] when no answer
   /// comes.
@@ -427,7 +473,91 @@ class DoxHttpClient implements Finalizable {
     String? body,
     Uint8List? bodyBytes,
     Duration? timeout,
+    bool? followRedirects,
   }) {
+    int wait = (timeout ?? this.timeout).inMicroseconds;
+    int deadline = wait > 0 ? _clock.elapsedMicroseconds + wait : 0;
+    Future<DoxHttpClientResponse> first = _once(
+      method,
+      url,
+      headers,
+      body,
+      bodyBytes,
+      deadline,
+    );
+    if (!(followRedirects ?? this.followRedirects)) return first;
+    return _follow(first, method, headers, body, bodyBytes, deadline);
+  }
+
+  /// Gives the answer of [first], or of the address its redirects go to.
+  Future<DoxHttpClientResponse> _follow(
+    Future<DoxHttpClientResponse> first,
+    String method,
+    Map<String, String>? headers,
+    String? body,
+    Uint8List? bodyBytes,
+    int deadline,
+  ) async {
+    DoxHttpClientResponse res = await first;
+    for (int hop = 0; ; hop++) {
+      String? location = res.header('location');
+      if (location == null ||
+          location.isEmpty ||
+          !_redirects.contains(res.statusCode)) {
+        return res;
+      }
+      Uri url = res.url;
+      Uri next;
+      try {
+        next = url.resolve(location);
+      } on FormatException {
+        return res;
+      }
+      bool tls = next.scheme == 'https';
+      if ((!tls && next.scheme != 'http') || next.host.isEmpty) return res;
+      if (hop >= maxRedirects) {
+        throw DoxHttpClientException(DoxHttpFailure.tooManyRedirects, next);
+      }
+      if (_closed) {
+        throw DoxHttpClientException(DoxHttpFailure.clientClosed, next);
+      }
+      // RFC 9110 15.4: a 303 answer is read with GET. For 301 and 302,
+      // clients change POST to GET.
+      int status = res.statusCode;
+      bool toGet =
+          (status == 303 && method != 'GET' && method != 'HEAD') ||
+          ((status == 301 || status == 302) && method == 'POST');
+      bool sameServer =
+          next.scheme == url.scheme &&
+          next.host == url.host &&
+          next.port == url.port;
+      if (toGet) {
+        method = 'GET';
+        body = null;
+        bodyBytes = null;
+      }
+      if (headers != null && (toGet || !sameServer)) {
+        headers = <String, String>{
+          for (MapEntry<String, String> header in headers.entries)
+            if (!(toGet && _aboutBody.contains(header.key.toLowerCase())) &&
+                !(!sameServer && _private.contains(header.key.toLowerCase())))
+              header.key: header.value,
+        };
+      }
+      res = await _once(method, next, headers, body, bodyBytes, deadline);
+    }
+  }
+
+  /// Sends one request. [deadline] is in microseconds of [_clock], 0 is
+  /// none.
+  Future<DoxHttpClientResponse> _once(
+    String method,
+    Uri url,
+    Map<String, String>? headers,
+    String? body,
+    Uint8List? bodyBytes,
+    int deadline,
+  ) {
     if (_closed) throw StateError('the client is closed');
     bool tls = url.scheme == 'https';
     if ((!tls && url.scheme != 'http') || url.host.isEmpty) {
@@ -446,18 +576,12 @@ class DoxHttpClient implements Finalizable {
     int flags = _idempotent.contains(method) ? _again : 0;
     if (method == 'HEAD') flags |= _headOnly;
     if (tls) flags |= _tls;
-    int wait = (timeout ?? this.timeout).inMicroseconds;
     Uint8List request = _encode(method, url, headers, body, bodyBytes);
     // the length of a request record is 32 bits
     if (request.length > _maxRequest) {
       throw ArgumentError('the request is too big (over 2 GiB)');
     }
-    _Pending pending = _Pending(
-      url,
-      request,
-      flags,
-      wait > 0 ? _clock.elapsedMicroseconds + wait : 0,
-    );
+    _Pending pending = _Pending(url, request, flags, deadline);
 
     InternetAddress? address = InternetAddress.tryParse(url.host);
     if (address != null) {
@@ -707,6 +831,7 @@ class DoxHttpClient implements Finalizable {
           );
           pending.completer.complete(
             DoxHttpClientResponse._(
+              pending.url,
               status,
               Uint8List.sublistView(copy, 0, lines),
               Uint8List.sublistView(copy, lines),
