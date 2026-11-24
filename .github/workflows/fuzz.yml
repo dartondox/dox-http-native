@@ -1,18 +1,19 @@
 name: Fuzz
 
-# Runs each fuzz target in native/fuzz for 60 s (inputs up to 32 KB, so
-# the 16 KB head and trailer limits are reached): the HTTP request parser,
-# the chunked body reader, a whole connection, the cookie decryption,
-# the HTTP/2 header decoder (HPACK) and a whole HTTP/2 connection.
-# See the README. A crash or a failed check fails the run and uploads the
-# input that caused it.
+# Runs each fuzz target for 60 s (inputs up to 32 KB, so the 16 KB head
+# and trailer limits are reached). In packages/dox-http-native/native/fuzz:
+# the HTTP request parser, the chunked body reader, a whole connection,
+# the cookie decryption, the HTTP/2 header decoder (HPACK) and a whole
+# HTTP/2 connection. In packages/dox-http-client/native/fuzz: the answer
+# parser of the HTTP client. See the README of each package. A crash or a
+# failed check fails the run and uploads the input that caused it.
 
 on:
   push:
     branches: [main]
-    paths: ['native/**', '.github/workflows/fuzz.yml']
+    paths: ['packages/*/native/**', '.github/workflows/fuzz.yml']
   pull_request:
-    paths: ['native/**', '.github/workflows/fuzz.yml']
+    paths: ['packages/*/native/**', '.github/workflows/fuzz.yml']
 
 permissions:
   contents: read
@@ -28,15 +29,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [parse_head, chunked_body, conn, aead_open, hpack, h2_conn]
+        include:
+          - { crate: packages/dox-http-native/native, target: parse_head }
+          - { crate: packages/dox-http-native/native, target: chunked_body }
+          - { crate: packages/dox-http-native/native, target: conn }
+          - { crate: packages/dox-http-native/native, target: aead_open }
+          - { crate: packages/dox-http-native/native, target: hpack }
+          - { crate: packages/dox-http-native/native, target: h2_conn }
+          - { crate: packages/dox-http-client/native, target: client_response }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       # the fuzz crate builds the same source, so it must use the same
-      # dependencies as native/Cargo.toml (dependabot only updates that one)
+      # dependencies as native/Cargo.toml of its package (dependabot only
+      # updates that one)
       - name: Check that the fuzz dependencies match
-        working-directory: native
+        working-directory: ${{ matrix.crate }}
         run: |
           # the check reads `[dependencies]` style sections only, not
           # `[dependencies.name]` tables
@@ -52,7 +61,7 @@ jobs:
           diff <(deps Cargo.toml) <(deps fuzz/Cargo.toml)
       # use the lock file of native/, so the versions are the same too
       - name: Copy the lock file
-        working-directory: native
+        working-directory: ${{ matrix.crate }}
         run: cp Cargo.lock fuzz/Cargo.lock
       # cargo fuzz needs nightly (sanitizer flags)
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -60,14 +69,14 @@ jobs:
           toolchain: nightly
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          workspaces: native/fuzz
+          workspaces: ${{ matrix.crate }}/fuzz
       # a prebuilt cargo-fuzz, no build from source
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-fuzz
       # new inputs go to a temp folder, the seeds in fuzz/corpus stay as they are
       - name: Fuzz ${{ matrix.target }}
-        working-directory: native
+        working-directory: ${{ matrix.crate }}
         env:
           TARGET: ${{ matrix.target }}
         run: |
@@ -81,4 +90,4 @@ jobs:
         if: failure()
         with:
           name: fuzz-${{ matrix.target }}
-          path: native/fuzz/artifacts
+          path: ${{ matrix.crate }}/fuzz/artifacts

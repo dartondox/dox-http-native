@@ -14,4 +14,17 @@ void main() {
       expect(shouldRetryStatus(status), isFalse, reason: '$status');
     }
   });
+
+  test('the download uses the tag of this package', () {
+    expect(
+      releaseUrls(
+        '3.2.0',
+        'dox_http_client-linux-x64.so',
+      ).map((Uri url) => url.toString()).toList(),
+      <String>[
+        'https://github.com/dartondox/dox-http-native/releases/download/'
+            'dox_http_client-v3.2.0/dox_http_client-linux-x64.so',
+      ],
+    );
+  });
 }

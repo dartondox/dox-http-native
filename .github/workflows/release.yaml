@@ -1,0 +1,170 @@
+name: Release
+
+# Each package has its own tags: <package>-v<version>, eg.
+# dox_http_native-v3.2.4 or dox_http_client-v3.2.0. The version must be the
+# one in packages/<folder>/pubspec.yaml, and the tag must be on main.
+#
+# 1. check the tag, then run all CI tests (ci.yaml). A red test stops
+#    everything after it.
+# 2. build the library of the package for the 5 targets (in ci.yaml),
+# 3. upload them to the GitHub release of the tag, with SHA256SUMS (and
+#    THIRD_PARTY_NOTICES for dox_http_client),
+# 4. fill `_sha256` in hook/build.dart from SHA256SUMS, publish the package
+#    to pub.dev, and push the new hashes to main.
+#    The hook downloads these files, so users do not need Rust.
+
+on:
+  push:
+    tags:
+      - 'dox_http_native-v*'
+      - 'dox_http_client-v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      package: ${{ steps.tag.outputs.package }}
+      folder: ${{ steps.tag.outputs.folder }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check the tag
+        id: tag
+        run: |
+          package=${GITHUB_REF_NAME%%-v*}
+          version=${GITHUB_REF_NAME#*-v}
+          case "$package" in
+            dox_http_native|dox_http_client) ;;
+            *) echo "::error::unknown package $package"; exit 1 ;;
+          esac
+          folder="packages/${package//_/-}"
+          pubspec="$folder/pubspec.yaml"
+          # the tag must be on main, so the published code is what main has
+          git merge-base --is-ancestor "$GITHUB_SHA" HEAD || { echo "::error::tag $GITHUB_REF_NAME is not on main"; exit 1; }
+          spec=$(git show "$GITHUB_SHA:$pubspec") || { echo "::error::no $pubspec"; exit 1; }
+          v=$(sed -nE 's/^version:[[:space:]]*([^[:space:]]+).*/\1/p' <<< "$spec")
+          [ "$v" = "$version" ] || { echo "::error::tag $GITHUB_REF_NAME, $pubspec has $v"; exit 1; }
+          echo "package=$package" >> "$GITHUB_OUTPUT"
+          echo "folder=$folder" >> "$GITHUB_OUTPUT"
+
+  # Read access only. The tests run a lot of other code, so they must not
+  # get the pub.dev token.
+  test:
+    needs: check
+    uses: ./.github/workflows/ci.yaml
+    permissions:
+      contents: read
+    with:
+      package: ${{ needs.check.outputs.package }}
+
+  release:
+    needs: [check, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      LIB: ${{ needs.check.outputs.package }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      # the licenses of the code and data in the libraries go next to them
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.check.outputs.package == 'dox_http_client'
+        with:
+          persist-credentials: false
+          path: src
+          sparse-checkout: packages/dox-http-client/THIRD_PARTY_NOTICES
+          sparse-checkout-cone-mode: false
+      - name: Add the third party notices
+        if: needs.check.outputs.package == 'dox_http_client'
+        run: cp src/packages/dox-http-client/THIRD_PARTY_NOTICES dist/
+      - name: Upload to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        working-directory: dist
+        run: |
+          sha256sum "$LIB"-* > SHA256SUMS
+          cat SHA256SUMS
+          notes="Ready-built $LIB libraries. See SHA256SUMS."
+          if [ -f THIRD_PARTY_NOTICES ]; then
+            notes="$notes Licenses: THIRD_PARTY_NOTICES."
+          fi
+          # a version with "-" in it is a prerelease
+          pre=()
+          case "${TAG#*-v}" in *-*) pre=(--prerelease) ;; esac
+          # a re-run replaces the files of the release
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" ./* --clobber --repo "$GITHUB_REPOSITORY"
+            # a deleted and pushed again tag leaves the release as a draft
+            gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" ./* --repo "$GITHUB_REPOSITORY" ${pre[@]+"${pre[@]}"} \
+              --title "$TAG" --notes "$notes"
+          fi
+
+  publish:
+    needs: [check, release]
+    runs-on: ubuntu-latest
+    environment: pub.dev
+    permissions:
+      id-token: write # pub.dev automated publishing (OIDC)
+      contents: write # push the hashes to main
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+      # the check job made sure the tag is on main
+      - run: git checkout "$GITHUB_SHA"
+      - uses: dart-lang/setup-dart@2286a0c042b44434fe26d292bbce8d34f7ec662b # v1.8.2
+        with:
+          sdk: stable
+      - name: Fill the hashes
+        working-directory: ${{ needs.check.outputs.folder }}
+        run: dart run tool/native_hashes.dart "$GITHUB_REF_NAME"
+      - name: Publish to pub.dev
+        working-directory: ${{ needs.check.outputs.folder }}
+        run: dart pub publish --force
+      - name: Push the hashes to main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # no change at all: stash would save nothing and pop would fail
+          if git diff --quiet; then
+            echo "The hashes did not change."
+            exit 0
+          fi
+          git stash
+          # the newest main: the release of the other package can push its
+          # hashes while this job runs
+          git fetch origin main
+          git checkout -B main origin/main
+          git stash pop
+          # a rerun of the same tag: main has these hashes already
+          if git diff --quiet; then
+            echo "The hashes on main are up to date."
+            exit 0
+          fi
+          git commit -am "Hashes of the $GITHUB_REF_NAME libraries"
+          # main moved after the fetch: put the commit on top and try again
+          for _ in 1 2 3; do
+            if git push origin main; then
+              exit 0
+            fi
+            git pull --rebase origin main
+          done
+          echo "::error::could not push the hashes to main"
+          exit 1

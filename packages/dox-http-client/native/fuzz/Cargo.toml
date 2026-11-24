@@ -1,0 +1,43 @@
+[package]
+name = "dox_http_client-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# The library source of native/ is built here as an rlib. native/ itself
+# stays a cdylib only, so fuzzing does not change the shipped library.
+# Keep these dependencies the same as in native/Cargo.toml.
+[lib]
+name = "dox_http_client"
+path = "../src/lib.rs"
+test = false
+doc = false
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+httparse = "1.10.1"
+mio = { version = "1.2.4", features = ["os-poll", "net"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+slab = "0.4.12"
+webpki-roots = "1.0.12"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191"
+
+# the source of native/ has `#[cfg(fuzzing)]`, which cargo fuzz sets
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
+# its own workspace, so it is not part of the main build
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "client_response"
+path = "fuzz_targets/client_response.rs"
+test = false
+doc = false
+bench = false

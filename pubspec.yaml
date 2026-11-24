@@ -1,18 +1,12 @@
-name: dox_http_native
-description: Fast native HTTP/1.1 server for Dart and the Dox framework. Rust parses HTTP, your handlers stay in Dart. Implements the dart:io HttpServer API.
-version: 3.2.3
-repository: https://github.com/dartondox/dox-http-native
-homepage: https://dartondox.dev
+name: dox_http_native_workspace
+publish_to: 'none'
 
 environment:
   sdk: ^3.13.0
 
-dependencies:
-  code_assets: ^2.1.0
-  crypto: ^3.0.7
-  hooks: ^2.2.0
-
-dev_dependencies:
-  http2: ^3.2.0
-  lints: ^6.1.0
-  test: ^1.33.0
+# Dart pub workspace: one `dart pub get` at the root links all packages
+# and writes one pubspec.lock. Each package has its own version and its
+# own release tag (<package>-v<version>).
+workspace:
+  - packages/dox-http-native
+  - packages/dox-http-client

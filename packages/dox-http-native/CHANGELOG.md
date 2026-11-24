@@ -1,5 +1,6 @@
 ## Unreleased
 
+- New releases have the tag `dox_http_native-v<version>`, because the repository now holds more than one package. The build hook downloads the library from this tag first. When it is not there, the hook uses the old tag form `v<version>`.
 - The ready-built Linux libraries do not need `libgcc_s.so.1`. They need only glibc 2.34 or newer, as before. A `FROM scratch` Docker image with the Dart `/runtime/` files does not need a copy of `libgcc_s.so.1` for this package. The release build now links the Linux libraries with `cargo zigbuild`, and CI does a check of each library.
 
 ## 3.2.3
