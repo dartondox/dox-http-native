@@ -1,5 +1,16 @@
 ## Unreleased
 
+- `DoxHttpClient.sendStreamed` sends a request with a body stream and gives the answer body as a stream. The memory stays small for bodies of many GB.
+  - The answer body is `DoxHttpClientStreamedResponse.body`. The new base class `DoxHttpClientResponseHead` has `url`, `statusCode`, `headers` and `header(name)`.
+  - The client reads a maximum of about 256 KiB ahead. When the listener pauses, the client stops to read the connection. When you cancel the body, the client closes the connection.
+  - The request `body` is a `Stream<List<int>>`. `contentLength` sets the `content-length` header. Without it, the client sends the body chunked. The client pauses the stream while more than 256 KiB wait to go out.
+  - `timeout` is for the time until the head of the answer is there.
+  - A gzip or brotli body is decoded in parts. `maxResponseSize` is the limit for the decoded bytes.
+  - A failure after the head is an error event on the body stream.
+  - A request with no body follows redirects. A request with a body stream does not follow them and is sent only once.
+  - If the server answers before the whole body went out, the client cancels the upload and does not use the connection again.
+  - New `DoxHttpFailure.badRequestBody`: the body stream gave more or fewer bytes than `contentLength`.
+  - The ABI version of the native library is 3. The records have a kind, so the answers of requests that are not streamed are as cheap as before.
 - The client follows redirects (status 301, 302, 303, 307 and 308). One request follows a maximum of 5 redirects, then it fails with the new `DoxHttpFailure.tooManyRedirects`.
   - `followRedirects` (for the client or for one `send` call) and `maxRedirects` change this.
   - A 303 redirect changes the method to `GET`. A 301 or 302 redirect changes `POST` to `GET`. A 307 or 308 redirect keeps the method and the body.
@@ -10,7 +21,7 @@
   - A decoded answer has no `content-encoding` header and no `content-length` header.
   - `maxResponseSize` is the limit for the decoded body.
   - A request with its own `accept-encoding` header or with a `range` header gets the body as the server sent it.
-  - The native library has two more crates: [flate2](https://github.com/rust-lang/flate2-rs) and [brotli-decompressor](https://github.com/dropbox/rust-brotli-decompressor). The ABI version of the library is 2.
+  - The native library has two more crates: [flate2](https://github.com/rust-lang/flate2-rs) and [brotli-decompressor](https://github.com/dropbox/rust-brotli-decompressor).
 
 ## 0.0.1
 

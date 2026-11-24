@@ -7,4 +7,6 @@ export 'src/client.dart'
         DoxHttpClient,
         DoxHttpClientException,
         DoxHttpClientResponse,
+        DoxHttpClientResponseHead,
+        DoxHttpClientStreamedResponse,
         DoxHttpFailure;

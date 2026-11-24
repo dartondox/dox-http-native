@@ -11,7 +11,7 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::OnceLock;
 
 /// Bump when the FFI functions or the record layout change.
-const ABI_VERSION: i32 = 2;
+const ABI_VERSION: i32 = 3;
 
 // ---- Dart API DL -------------------------------------------------------
 // `NativeApi.initializeApiDLData` points to this table. We only need
@@ -63,6 +63,13 @@ fn post(port: i64, data: &[u8]) -> bool {
 
 fn rd32(b: &[u8], p: usize) -> usize {
     u32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as usize
+}
+
+/// 0 when the bytes are not there.
+fn rd64(b: &[u8], p: usize) -> u64 {
+    b.get(p..p + 8)
+        .and_then(|s| <[u8; 8]>::try_from(s).ok())
+        .map_or(0, u64::from_le_bytes)
 }
 
 // ---- FFI ---------------------------------------------------------------

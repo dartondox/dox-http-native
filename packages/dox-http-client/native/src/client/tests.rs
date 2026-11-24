@@ -9,6 +9,7 @@ use super::*;
 
 struct Answer {
     id: u64,
+    kind: u8,
     status: u16,
     error: u16,
     lines: String,
@@ -68,6 +69,7 @@ fn answers(inb: &[u8]) -> Vec<Answer> {
         let lines = rd32(rec, 16);
         list.push(Answer {
             id: u64::from_le_bytes(rec[4..12].try_into().unwrap()),
+            kind: rec[20],
             status: u16::from_le_bytes(rec[12..14].try_into().unwrap()),
             error: u16::from_le_bytes(rec[14..16].try_into().unwrap()),
             lines: String::from_utf8(rec[RES_HEAD..RES_HEAD + lines].to_vec()).unwrap(),
@@ -1213,4 +1215,883 @@ fn the_body_limit_is_for_the_decoded_bytes() {
     assert_eq!(a.body.len(), 1 << 19);
     let a = one(DECODE, (1 << 19) - 1, coded("gzip", &z));
     assert_eq!((a.status, a.error), (0, E_BIG));
+}
+
+// ---- streamed bodies -----------------------------------------------------
+
+fn q_rec(id: u64, kind: u8, payload: &[u8]) -> Vec<u8> {
+    let mut r = vec![0u8; REQ_HEAD];
+    r[0..4].copy_from_slice(&((REQ_HEAD + payload.len()) as u32).to_le_bytes());
+    r[4..12].copy_from_slice(&id.to_le_bytes());
+    r[38] = kind;
+    r.extend_from_slice(payload);
+    r
+}
+
+fn q_part(id: u64, data: &[u8]) -> Vec<u8> {
+    q_rec(id, Q_PART, data)
+}
+
+fn q_end(id: u64, aborted: bool) -> Vec<u8> {
+    let mut r = q_rec(id, Q_END, &[]);
+    r[16] = aborted as u8;
+    r
+}
+
+fn q_credit(id: u64, total: u64) -> Vec<u8> {
+    let mut r = q_rec(id, Q_CREDIT, &[]);
+    r[16..24].copy_from_slice(&total.to_le_bytes());
+    r
+}
+
+fn q_cancel(id: u64) -> Vec<u8> {
+    q_rec(id, Q_CANCEL, &[])
+}
+
+fn sget(id: u64, addr: SocketAddr, flags: u8, timeout_ms: u32) -> Vec<u8> {
+    let request = b"GET / HTTP/1.1\r\nhost: x\r\n\r\n";
+    record(id, addr, flags | STREAM, timeout_ms, request)
+}
+
+/// The Dart side of one streamed request, for the tests.
+struct Reader {
+    id: u64,
+    inb: Vec<u8>,
+    status: Option<u16>,
+    lines: String,
+    body: Vec<u8>,
+    ended: bool,
+    error: Option<u16>,
+    wrote: u64,
+    /// the bytes of the body that the test gave back as credit
+    used: u64,
+}
+
+impl Reader {
+    fn new(id: u64) -> Reader {
+        Reader {
+            id,
+            inb: vec![0u8; 1 << 18],
+            status: None,
+            lines: String::new(),
+            body: Vec::new(),
+            ended: false,
+            error: None,
+            wrote: 0,
+            used: 0,
+        }
+    }
+
+    /// One call of `run`. Returns the bytes it wrote.
+    fn run(&mut self, core: &mut Core, out: &[u8]) -> usize {
+        let n = core.run(out, &mut self.inb).unwrap();
+        for a in answers(&self.inb[..n]) {
+            if a.id != self.id {
+                continue;
+            }
+            match a.kind {
+                R_HEAD => {
+                    self.status = Some(a.status);
+                    self.lines = a.lines;
+                }
+                R_PART => self.body.extend_from_slice(&a.body),
+                R_END => self.ended = true,
+                R_PROGRESS => self.wrote = u64::from_le_bytes(a.body[..8].try_into().unwrap()),
+                _ if a.status == 0 => self.error = Some(a.error),
+                _ => panic!("a whole answer for a streamed request"),
+            }
+        }
+        n
+    }
+
+    fn over(&self) -> bool {
+        self.ended || self.error.is_some()
+    }
+
+    /// Runs until `done`. `credit`: the test uses each byte at once.
+    fn until(
+        &mut self,
+        core: &mut Core,
+        first: &[u8],
+        credit: bool,
+        done: impl Fn(&Reader) -> bool,
+    ) {
+        let start = Instant::now();
+        let mut out = first.to_vec();
+        while !done(self) {
+            assert!(start.elapsed() < Duration::from_secs(20), "stuck");
+            if credit && self.used < self.body.len() as u64 {
+                self.used = self.body.len() as u64;
+                out.extend(q_credit(self.id, self.used));
+            }
+            let n = self.run(core, &out);
+            out.clear();
+            if n == 0 && core.again.is_empty() {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+fn pattern(n: usize) -> Vec<u8> {
+    (0..n).map(|i| (i % 251) as u8).collect()
+}
+
+/// A server that answers a GET with `head` and then `size` bytes of
+/// [pattern], as fast as the client takes them.
+fn big_server(head: String, size: usize) -> SocketAddr {
+    let (addr, _) = server(move |mut s, _| {
+        while read_head(&mut s) {
+            if s.write_all(head.as_bytes()).is_err() {
+                return;
+            }
+            let mut at = 0;
+            while at < size {
+                let n = (size - at).min(1 << 16);
+                let part: Vec<u8> = (at..at + n).map(|i| (i % 251) as u8).collect();
+                if s.write_all(&part).is_err() {
+                    return;
+                }
+                at += n;
+            }
+        }
+    });
+    addr
+}
+
+/// Runs a reader that uses no byte until its body is at the bound, and
+/// then reads on. Rust has at most [HIGH] bytes, and the socket has the
+/// rest.
+fn paused_then_read(core: &mut Core, first: Vec<u8>, size: usize) -> Reader {
+    let mut r = Reader::new(1);
+    let mut out = first;
+    let start = Instant::now();
+    let (mut same, mut last) = (0, 0);
+    while same < 60 {
+        assert!(start.elapsed() < Duration::from_secs(10), "no body");
+        let n = r.run(core, &out);
+        out.clear();
+        let held: usize = core.conns.iter().map(|(_, c)| c.filled).sum();
+        let queued: usize = core.ready.iter().map(|d| d.body.len()).sum();
+        assert!(
+            r.body.len() + held + queued <= HIGH,
+            "{} {held}",
+            r.body.len()
+        );
+        assert!(core.conns.iter().all(|(_, c)| c.buf.len() <= 1 << 20));
+        same = if !r.body.is_empty() && r.body.len() == last {
+            same + 1
+        } else {
+            0
+        };
+        last = r.body.len();
+        if n == 0 {
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+    assert!(r.body.len() > HIGH - PART_MAX, "{}", r.body.len());
+    assert!(!r.over());
+    // now the reader uses the bytes
+    r.until(core, &[], true, |r| r.over());
+    assert!(r.ended, "{:?}", r.error);
+    assert_eq!(r.body.len(), size);
+    assert!(r.body == pattern(size));
+    r
+}
+
+#[test]
+fn a_paused_reader_leaves_the_socket_alone() {
+    const SIZE: usize = 8 << 20;
+    let addr = big_server(
+        format!("HTTP/1.1 200 OK\r\nContent-Length: {SIZE}\r\n\r\n"),
+        SIZE,
+    );
+    let mut core = new_core(0, 0);
+    let r = paused_then_read(&mut core, sget(1, addr, AGAIN, 5000), SIZE);
+    assert_eq!(r.status, Some(200));
+    assert_eq!(r.lines, format!("content-length:{SIZE}\n"));
+    // the connection is kept
+    assert_eq!(core.open, 0);
+    assert_eq!(core.conns.len(), 1);
+    assert!(core.conns.iter().all(|(_, c)| c.req.is_none()));
+}
+
+#[test]
+fn a_paused_reader_of_a_chunked_answer_leaves_the_socket_alone() {
+    const SIZE: usize = 4 << 20;
+    let (addr, _) = server(|mut s, _| {
+        read_head(&mut s);
+        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+        let mut at = 0;
+        while at < SIZE {
+            let n = (SIZE - at).min(50_000);
+            let part: Vec<u8> = (at..at + n).map(|i| (i % 251) as u8).collect();
+            let mut chunk = format!("{n:x}\r\n").into_bytes();
+            chunk.extend_from_slice(&part);
+            chunk.extend_from_slice(b"\r\n");
+            if s.write_all(&chunk).is_err() {
+                return;
+            }
+            at += n;
+        }
+        let _ = s.write_all(b"0\r\n\r\n");
+        thread::sleep(Duration::from_millis(200));
+    });
+    let mut core = new_core(0, 0);
+    paused_then_read(&mut core, sget(1, addr, 0, 5000), SIZE);
+}
+
+#[test]
+fn a_paused_reader_of_a_body_with_no_length_leaves_the_socket_alone() {
+    const SIZE: usize = 4 << 20;
+    let (addr, _) = server(|mut s, _| {
+        read_head(&mut s);
+        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n");
+        for at in (0..SIZE).step_by(1 << 16) {
+            let part: Vec<u8> = (at..at + (1 << 16)).map(|i| (i % 251) as u8).collect();
+            if s.write_all(&part).is_err() {
+                return;
+            }
+        }
+    });
+    let mut core = new_core(0, 0);
+    paused_then_read(&mut core, sget(1, addr, 0, 5000), SIZE);
+    // the body ended with the connection
+    assert!(core.conns.is_empty());
+}
+
+#[test]
+fn a_paused_reader_of_a_tls_answer_leaves_the_socket_alone() {
+    const SIZE: usize = 3 << 20;
+    let mut answer = format!("HTTP/1.1 200 OK\r\nContent-Length: {SIZE}\r\n\r\n").into_bytes();
+    answer.extend(pattern(SIZE));
+    let (addr, pem, _) = tls_server(&["localhost"], answer);
+    let mut core = tls_core(&pem);
+    let request = b"GET / HTTP/1.1\r\nhost: x\r\n\r\n";
+    let out = named(1, addr, "localhost", TLS | STREAM, 5000, request);
+    paused_then_read(&mut core, out, SIZE);
+}
+
+#[test]
+fn streamed_answers_of_each_kind() {
+    // a chunked answer in parts
+    let (addr, _) = server(|mut s, _| {
+        read_head(&mut s);
+        let parts: [&[u8]; 4] = [
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nab",
+            b"c\r\n",
+            b"2\r\nde\r",
+            b"\n0\r\n\r\n",
+        ];
+        for part in parts {
+            let _ = s.write_all(part);
+            thread::sleep(Duration::from_millis(5));
+        }
+    });
+    let mut core = new_core(0, 0);
+    let mut r = Reader::new(1);
+    r.until(&mut core, &sget(1, addr, AGAIN, 5000), true, |r| r.over());
+    assert_eq!((r.status, r.body.as_slice()), (Some(200), &b"abcde"[..]));
+    assert_eq!(r.lines, "transfer-encoding:chunked\n");
+    // content-length answers use one connection again
+    let (addr, count) = keep_alive(HELLO);
+    for id in 2..=3 {
+        let mut r = Reader::new(id);
+        r.until(&mut core, &sget(id, addr, AGAIN, 5000), true, |r| r.over());
+        assert_eq!((r.status, r.body.as_slice()), (Some(200), &b"hello"[..]));
+        assert_eq!(r.lines, "content-length:5\nx-a:1\n");
+    }
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    // a body that ends with the connection
+    let (addr, _) = server(|mut s, _| {
+        read_head(&mut s);
+        let _ = s.write_all(b"HTTP/1.1 200 OK\r\n\r\nto the ");
+        thread::sleep(Duration::from_millis(5));
+        let _ = s.write_all(b"end");
+    });
+    let mut r = Reader::new(4);
+    r.until(&mut core, &sget(4, addr, 0, 5000), true, |r| r.over());
+    assert_eq!(r.body, b"to the end");
+    assert!(r.ended);
+    // an empty body, and a HEAD answer
+    let (addr, _) = keep_alive(b"HTTP/1.1 204 No Content\r\n\r\n");
+    let mut r = Reader::new(5);
+    r.until(&mut core, &sget(5, addr, 0, 5000), true, |r| r.over());
+    assert_eq!((r.status, r.body.len(), r.ended), (Some(204), 0, true));
+    let (addr, _) = keep_alive(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n");
+    let mut r = Reader::new(6);
+    let head = sget(6, addr, HEAD_ONLY, 5000);
+    r.until(&mut core, &head, true, |r| r.over());
+    assert_eq!((r.status, r.body.len(), r.ended), (Some(200), 0, true));
+}
+
+#[test]
+fn streamed_answers_that_fail() {
+    // over the limit: the head comes, then the failure
+    let (addr, _) = keep_alive(HELLO);
+    let mut core = new_core(0, 4);
+    let mut r = Reader::new(1);
+    r.until(&mut core, &sget(1, addr, 0, 5000), true, |r| r.over());
+    assert_eq!((r.status, r.error), (Some(200), Some(E_BIG)));
+    assert!(r.body.len() <= 4);
+    assert!(core.conns.is_empty());
+    assert_eq!(core.open, 0);
+    // a bad chunk
+    let (addr, _) = keep_alive(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcXX");
+    let mut core = new_core(0, 0);
+    let mut r = Reader::new(1);
+    r.until(&mut core, &sget(1, addr, 0, 5000), true, |r| r.over());
+    assert_eq!((r.status, r.error), (Some(200), Some(E_BAD)));
+    assert!(core.conns.is_empty());
+    // a cut body
+    let (addr, _) = server(|mut s, _| {
+        read_head(&mut s);
+        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort");
+    });
+    let mut r = Reader::new(1);
+    r.until(&mut core, &sget(1, addr, 0, 5000), true, |r| r.over());
+    assert_eq!((r.status, r.error), (Some(200), Some(E_CLOSED)));
+    assert_eq!(r.body, b"short");
+    assert_eq!(core.open, 0);
+    // no head at all
+    let (addr, _) = server(|mut s, _| {
+        read_head(&mut s);
+        let _ = s.write_all(b"nonsense\r\n\r\n");
+    });
+    let mut r = Reader::new(1);
+    r.until(&mut core, &sget(1, addr, 0, 5000), true, |r| r.over());
+    assert_eq!((r.status, r.error), (None, Some(E_BAD)));
+}
+
+#[test]
+fn a_streamed_gzip_answer_is_decoded_in_parts() {
+    let text = pattern(300_000);
+    let mut z = gzip(&text);
+    z.extend(gzip(b" and more"));
+    // padding after the last member is dropped
+    z.extend_from_slice(&[0, 0, 0, b'\n']);
+    let mut expect = text.clone();
+    expect.extend_from_slice(b" and more");
+    let (addr, _) = server(move |mut s, _| {
+        read_head(&mut s);
+        let head = b"HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\nx-a: 1\r\ntransfer-encoding: chunked\r\n\r\n";
+        let _ = s.write_all(head);
+        // the coded bytes come in small chunks
+        for piece in z.chunks(7) {
+            let mut chunk = format!("{:x}\r\n", piece.len()).into_bytes();
+            chunk.extend_from_slice(piece);
+            chunk.extend_from_slice(b"\r\n");
+            if s.write_all(&chunk).is_err() {
+                return;
+            }
+        }
+        let _ = s.write_all(b"0\r\n\r\n");
+        thread::sleep(Duration::from_millis(100));
+    });
+    let mut core = new_core(0, 0);
+    let mut r = Reader::new(1);
+    r.until(&mut core, &sget(1, addr, DECODE, 5000), true, |r| r.over());
+    assert!(r.ended, "{:?} {} {}", r.error, r.body.len(), expect.len());
+    assert_eq!(r.lines, "x-a:1\ntransfer-encoding:chunked\n");
+    assert!(r.body == expect);
+}
+
+#[test]
+fn a_streamed_brotli_answer_is_decoded() {
+    let mut a = format!(
+        "HTTP/1.1 200 OK\r\nContent-Encoding: br\r\nContent-Length: {}\r\n\r\n",
+        BROTLI.len()
+    )
+    .into_bytes();
+    a.extend_from_slice(BROTLI);
+    // one piece, and one byte at a time
+    let whole: &'static [u8] = a.leak();
+    let (addr, _) = keep_alive(whole);
+    let mut core = new_core(0, 0);
+    let mut r = Reader::new(1);
+    r.until(&mut core, &sget(1, addr, DECODE, 5000), true, |r| r.over());
+    assert_eq!(r.body, b"Hello Hello Hello Hello");
+    assert_eq!(r.lines, "");
+    let (addr, _) = server(move |mut s, _| {
+        read_head(&mut s);
+        for byte in whole {
+            if s.write_all(&[*byte]).is_err() {
+                return;
+            }
+            thread::sleep(Duration::from_micros(300));
+        }
+        thread::sleep(Duration::from_millis(100));
+    });
+    let mut r = Reader::new(2);
+    r.until(&mut core, &sget(2, addr, DECODE, 5000), true, |r| r.over());
+    assert_eq!(r.body, b"Hello Hello Hello Hello");
+    // a bad brotli body is an error after the head
+    let bad = coded("br", b"this is not brotli, no");
+    let (addr, _) = keep_alive(bad.leak());
+    let mut r = Reader::new(3);
+    r.until(&mut core, &sget(3, addr, DECODE, 5000), true, |r| r.over());
+    assert_eq!((r.status, r.error), (Some(200), Some(E_BAD)));
+}
+
+#[test]
+fn a_streamed_decoded_body_has_a_limit_and_a_bounded_memory() {
+    // 64 MB of zeros are under 100 kB of gzip
+    let z = gzip(&vec![0u8; 64 << 20]);
+    assert!(z.len() < 100_000);
+    let answer: &'static [u8] = coded("gzip", &z).leak();
+    let (addr, _) = keep_alive(answer);
+    // with a limit of 1 MB the body fails at 1 MB
+    let mut core = new_core(0, 1 << 20);
+    let mut r = Reader::new(1);
+    r.until(&mut core, &sget(1, addr, DECODE, 5000), true, |r| r.over());
+    assert_eq!((r.status, r.error), (Some(200), Some(E_BIG)));
+    assert!(r.body.len() <= 1 << 20);
+    assert!(core.conns.is_empty());
+    // with no limit and a reader that does not use bytes, Rust holds a
+    // bounded part of the 64 MB
+    let mut core = new_core(0, 0);
+    let mut r = Reader::new(2);
+    let mut out = sget(2, addr, DECODE, 5000);
+    for _ in 0..200 {
+        r.run(&mut core, &out);
+        out.clear();
+        assert!(r.body.len() <= HIGH);
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(r.body.len() > HIGH - PART_MAX);
+    r.until(&mut core, &[], true, |r| r.over());
+    assert!(r.ended, "{:?}", r.error);
+    assert_eq!(r.body.len(), 64 << 20);
+    assert!(r.body.iter().all(|&b| b == 0));
+}
+
+#[test]
+fn a_streamed_bad_body_of_a_redirect_ends_quietly() {
+    let moved = b"HTTP/1.1 302 Found\r\nlocation: /x\r\ncontent-encoding: gzip\r\ncontent-length: 5\r\n\r\nmoved";
+    let (addr, _) = keep_alive(moved);
+    let mut core = new_core(0, 0);
+    let mut r = Reader::new(1);
+    r.until(&mut core, &sget(1, addr, DECODE, 5000), true, |r| r.over());
+    assert_eq!((r.status, r.ended, r.error), (Some(302), true, None));
+    // the connection with a bad body is not kept
+    assert!(core.conns.is_empty());
+}
+
+#[test]
+fn cancel_closes_the_connection() {
+    let closed = Arc::new(AtomicUsize::new(0));
+    let seen = closed.clone();
+    let (addr, _) = server(move |mut s, _| {
+        read_head(&mut s);
+        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 99999999\r\n\r\n");
+        let part = vec![1u8; 1 << 16];
+        while s.write_all(&part).is_ok() {}
+        seen.fetch_add(1, Ordering::SeqCst);
+    });
+    let mut core = new_core(0, 0);
+    let mut r = Reader::new(1);
+    r.until(&mut core, &sget(1, addr, 0, 5000), false, |r| {
+        r.body.len() > 1000
+    });
+    assert_eq!(core.open, 1);
+    r.run(&mut core, &q_cancel(1));
+    assert_eq!(core.open, 0);
+    assert!(core.conns.is_empty());
+    assert!(core.hosts.is_empty());
+    let start = Instant::now();
+    while closed.load(Ordering::SeqCst) == 0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "server not closed"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    // a cancel for an unknown id does nothing
+    r.run(&mut core, &q_cancel(77));
+    assert_eq!(core.open, 0);
+}
+
+#[test]
+fn cancel_a_request_that_waits_for_a_connection() {
+    let (addr, _) = server(|mut s, _| {
+        read_head(&mut s);
+        thread::sleep(Duration::from_secs(1));
+    });
+    let mut core = new_core(1, 0);
+    let mut out = sget(1, addr, 0, 0);
+    out.extend(sget(2, addr, 0, 0));
+    let mut r = Reader::new(2);
+    r.run(&mut core, &out);
+    assert_eq!(core.open, 2);
+    r.run(&mut core, &q_cancel(2));
+    assert_eq!(core.open, 1);
+    assert!(core.hosts.values().all(|h| h.queue.is_empty()));
+    r.run(&mut core, &q_cancel(1));
+    assert_eq!(core.open, 0);
+    assert!(core.hosts.is_empty());
+}
+
+#[test]
+fn the_timeout_of_a_streamed_request_ends_with_its_head() {
+    // no head in time
+    let (addr, _) = server(|mut s, _| {
+        read_head(&mut s);
+        thread::sleep(Duration::from_secs(1));
+    });
+    let mut core = new_core(0, 0);
+    let mut r = Reader::new(1);
+    r.until(&mut core, &sget(1, addr, 0, 50), true, |r| r.over());
+    assert_eq!((r.status, r.error), (None, Some(E_TIMEOUT)));
+    assert!(core.conns.is_empty());
+    // a head in time and a slow body: no timeout
+    let (addr, _) = server(|mut s, _| {
+        read_head(&mut s);
+        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhe");
+        thread::sleep(Duration::from_millis(250));
+        let _ = s.write_all(b"llo");
+    });
+    let mut r = Reader::new(2);
+    r.until(&mut core, &sget(2, addr, 0, 50), true, |r| r.over());
+    assert_eq!((r.status, r.ended, r.error), (Some(200), true, None));
+    assert_eq!(r.body, b"hello");
+}
+
+/// Sends `size` bytes of [pattern] as the body of a POST, the way Dart
+/// does: parts while less than [HIGH] bytes wait. Returns the most bytes
+/// that waited, and the reader.
+fn upload(
+    core: &mut Core,
+    addr: SocketAddr,
+    head: &str,
+    chunked: bool,
+    size: usize,
+) -> (usize, Reader) {
+    let mut r = Reader::new(1);
+    let head = format!("POST / HTTP/1.1\r\nhost: x\r\n{head}\r\n");
+    let mut out = record(1, addr, STREAM | UPLOAD, 10_000, head.as_bytes());
+    let mut handed = head.len();
+    let (mut at, mut ended, mut most) = (0, false, 0);
+    let data = pattern(size);
+    let start = Instant::now();
+    while !r.over() {
+        assert!(start.elapsed() < Duration::from_secs(20), "stuck");
+        // the first report says that the connection works
+        if r.wrote > 0 {
+            while at < size && handed - r.wrote as usize <= HIGH {
+                let n = (size - at).min(PART_MAX);
+                let part = &data[at..at + n];
+                let wire = if chunked {
+                    let mut w = format!("{n:x}\r\n").into_bytes();
+                    w.extend_from_slice(part);
+                    w.extend_from_slice(b"\r\n");
+                    w
+                } else {
+                    part.to_vec()
+                };
+                handed += wire.len();
+                out.extend(q_part(1, &wire));
+                at += n;
+            }
+            if at == size && !ended {
+                ended = true;
+                if chunked {
+                    handed += 5;
+                    out.extend(q_part(1, b"0\r\n\r\n"));
+                }
+                out.extend(q_end(1, false));
+            }
+        }
+        let n = r.run(core, &out);
+        out.clear();
+        most = most.max(handed - r.wrote as usize);
+        if n == 0 && core.again.is_empty() {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    (most, r)
+}
+
+/// A server that reads a request with `len` body bytes, slowly, and answers
+/// 200. The bytes go to `got`.
+fn upload_server(len: usize, got: Arc<std::sync::Mutex<Vec<u8>>>) -> SocketAddr {
+    let (addr, _) = server(move |mut s, _| {
+        if !read_head(&mut s) {
+            return;
+        }
+        let mut buf = vec![0u8; 32 * 1024];
+        let mut all = Vec::new();
+        while all.len() < len {
+            let want = buf.len().min(len - all.len());
+            match s.read(&mut buf[..want]) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => all.extend_from_slice(&buf[..n]),
+            }
+            thread::sleep(Duration::from_micros(500));
+        }
+        *got.lock().unwrap() = all;
+        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        thread::sleep(Duration::from_millis(100));
+    });
+    addr
+}
+
+#[test]
+fn an_upload_with_a_length_is_byte_exact_and_bounded() {
+    const SIZE: usize = 3 << 20;
+    let got = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let addr = upload_server(SIZE, got.clone());
+    let mut core = new_core(0, 0);
+    let head = format!("content-length: {SIZE}\r\n");
+    let (most, r) = upload(&mut core, addr, &head, false, SIZE);
+    assert_eq!((r.status, r.body.as_slice()), (Some(200), &b"ok"[..]));
+    assert!(r.ended);
+    assert!(got.lock().unwrap().as_slice() == pattern(SIZE));
+    // Dart held back when this many bytes waited
+    assert!(most <= HIGH + PART_MAX + 100, "{most}");
+    assert_eq!(core.open, 0);
+}
+
+#[test]
+fn an_upload_with_chunked_framing_is_byte_exact() {
+    const SIZE: usize = 1 << 20;
+    let data = pattern(SIZE);
+    let mut wire = Vec::new();
+    for part in data.chunks(PART_MAX) {
+        wire.extend(format!("{:x}\r\n", part.len()).bytes());
+        wire.extend_from_slice(part);
+        wire.extend_from_slice(b"\r\n");
+    }
+    wire.extend_from_slice(b"0\r\n\r\n");
+    let got = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let addr = upload_server(wire.len(), got.clone());
+    let mut core = new_core(0, 0);
+    let (_, r) = upload(
+        &mut core,
+        addr,
+        "transfer-encoding: chunked\r\n",
+        true,
+        SIZE,
+    );
+    assert_eq!((r.status, r.body.as_slice()), (Some(200), &b"ok"[..]));
+    assert!(*got.lock().unwrap() == wire);
+}
+
+#[test]
+fn an_upload_over_tls_is_byte_exact() {
+    const SIZE: usize = 2 << 20;
+    let made = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let pem = made.cert.pem();
+    let key = rustls::pki_types::PrivateKeyDer::try_from(made.signing_key.serialize_der()).unwrap();
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![made.cert.der().clone()], key)
+        .unwrap();
+    let config = Arc::new(config);
+    let got = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = got.clone();
+    let (addr, _) = server(move |s, _| {
+        let conn = rustls::ServerConnection::new(config.clone()).unwrap();
+        let mut tls = rustls::StreamOwned::new(conn, s);
+        if !read_head(&mut tls) {
+            return;
+        }
+        let mut all = vec![0u8; SIZE];
+        if tls.read_exact(&mut all).is_err() {
+            return;
+        }
+        *seen.lock().unwrap() = all;
+        let _ = tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        let _ = tls.flush();
+        thread::sleep(Duration::from_millis(100));
+    });
+    let mut core = tls_core(&pem);
+    let mut r = Reader::new(1);
+    let request = format!("POST / HTTP/1.1\r\nhost: x\r\ncontent-length: {SIZE}\r\n\r\n");
+    let flags = TLS | STREAM | UPLOAD;
+    let mut out = named(1, addr, "localhost", flags, 10_000, request.as_bytes());
+    let mut handed = request.len();
+    let (mut at, mut ended) = (0, false);
+    let data = pattern(SIZE);
+    let start = Instant::now();
+    while !r.over() {
+        assert!(start.elapsed() < Duration::from_secs(20), "stuck");
+        if r.wrote > 0 {
+            while at < SIZE && handed - r.wrote as usize <= HIGH {
+                let n = (SIZE - at).min(PART_MAX);
+                out.extend(q_part(1, &data[at..at + n]));
+                handed += n;
+                at += n;
+            }
+            if at == SIZE && !ended {
+                ended = true;
+                out.extend(q_end(1, false));
+            }
+        }
+        let n = r.run(&mut core, &out);
+        out.clear();
+        if n == 0 {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    assert_eq!((r.status, r.body.as_slice()), (Some(200), &b"ok"[..]));
+    assert!(got.lock().unwrap().as_slice() == data);
+}
+
+#[test]
+fn an_early_answer_stops_the_upload_and_the_connection_is_not_kept() {
+    let (addr, _) = server(|mut s, _| {
+        if read_head(&mut s) {
+            let _ = s.write_all(b"HTTP/1.1 401 No\r\nContent-Length: 0\r\n\r\n");
+            // does not read the body
+            thread::sleep(Duration::from_millis(600));
+        }
+    });
+    let mut core = new_core(0, 0);
+    let mut r = Reader::new(1);
+    let head = "POST / HTTP/1.1\r\nhost: x\r\ncontent-length: 99999999\r\n\r\n";
+    let mut out = record(1, addr, STREAM | UPLOAD, 10_000, head.as_bytes());
+    let mut handed = head.len();
+    let start = Instant::now();
+    while r.status.is_none() {
+        assert!(start.elapsed() < Duration::from_secs(10), "no answer");
+        if r.wrote > 0 && handed - r.wrote as usize <= HIGH {
+            out.extend(q_part(1, &[7u8; PART_MAX]));
+            handed += PART_MAX;
+        }
+        r.run(&mut core, &out);
+        out.clear();
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(r.status, Some(401));
+    // Dart stops the upload
+    r.until(&mut core, &q_end(1, true), true, |r| r.over());
+    assert!(r.ended, "{:?}", r.error);
+    assert!(core.conns.is_empty());
+    assert!(core.hosts.is_empty());
+    assert_eq!(core.open, 0);
+}
+
+#[test]
+fn a_cancelled_upload_frees_the_request() {
+    let (addr, _) = server(|mut s, _| {
+        read_head(&mut s);
+        thread::sleep(Duration::from_millis(500));
+    });
+    let mut core = new_core(0, 0);
+    let mut r = Reader::new(1);
+    let head = "POST / HTTP/1.1\r\nhost: x\r\ncontent-length: 99\r\n\r\n";
+    let out = record(1, addr, STREAM | UPLOAD, 0, head.as_bytes());
+    r.until(&mut core, &out, true, |r| r.wrote > 0);
+    r.run(&mut core, &q_cancel(1));
+    assert_eq!(core.open, 0);
+    assert!(core.conns.is_empty());
+    // parts for a request that is gone are dropped
+    r.run(&mut core, &q_part(1, b"late"));
+    r.run(&mut core, &q_end(1, false));
+    assert!(core.conns.is_empty());
+}
+
+#[test]
+fn a_connect_failure_of_an_upload_comes_before_any_progress() {
+    // nothing listens on this port
+    let addr = {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap()
+    };
+    let mut core = new_core(0, 0);
+    let mut r = Reader::new(1);
+    let head = "POST / HTTP/1.1\r\nhost: x\r\ncontent-length: 99\r\n\r\n";
+    let out = record(1, addr, STREAM | UPLOAD, 5000, head.as_bytes());
+    r.until(&mut core, &out, true, |r| r.over());
+    assert_eq!((r.wrote, r.error), (0, Some(E_CONNECT)));
+}
+
+#[test]
+fn an_upload_is_never_sent_again() {
+    // the first connection answers one request and closes on the next
+    let (addr, count) = server(|mut s, n| {
+        if n == 0 && read_head(&mut s) {
+            let _ = s.write_all(HELLO);
+            read_head(&mut s);
+        }
+    });
+    let mut core = new_core(0, 0);
+    let mut r = Reader::new(1);
+    r.until(&mut core, &sget(1, addr, AGAIN, 5000), true, |r| r.over());
+    assert!(r.ended);
+    let mut r = Reader::new(2);
+    let head = "POST / HTTP/1.1\r\nhost: x\r\ncontent-length: 1\r\n\r\n";
+    // a wrong AGAIN flag does not matter
+    let out = record(2, addr, STREAM | UPLOAD | AGAIN, 5000, head.as_bytes());
+    r.until(&mut core, &out, true, |r| r.over());
+    assert_eq!(r.error, Some(E_CLOSED));
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+// ---- decoder -----------------------------------------------------------
+
+/// All the output of an `Inflate` for `coded`, given `step` bytes at a time.
+fn inflate_all(coding: Coding, coded: &[u8], step: usize) -> Result<Vec<u8>, u16> {
+    let mut inflate = Inflate::new(coding).unwrap();
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 100];
+    let mut pieces = coded.chunks(step.max(1)).peekable();
+    if pieces.peek().is_none() {
+        inflate.push(&[], true);
+    }
+    while let Some(piece) = pieces.next() {
+        inflate.push(piece, pieces.peek().is_none());
+        loop {
+            match inflate.pull(&mut buf)? {
+                Pull::Data(n) => out.extend_from_slice(&buf[..n]),
+                Pull::Wait => break,
+                Pull::End => return Ok(out),
+            }
+        }
+    }
+    Err(E_BAD)
+}
+
+#[test]
+fn the_decoder_gives_the_same_bytes_for_each_split() {
+    let text = pattern(5000);
+    let mut z = gzip(&text);
+    z.extend(gzip(b"second"));
+    z.extend_from_slice(&[0, 0, 0, b'\n']);
+    let mut expect = text.clone();
+    expect.extend_from_slice(b"second");
+    for step in [1, 2, 3, 7, 100, z.len()] {
+        assert!(
+            inflate_all(Coding::Gzip, &z, step).unwrap() == expect,
+            "{step}"
+        );
+    }
+    for step in [1, 3, BROTLI.len()] {
+        let got = inflate_all(Coding::Brotli, BROTLI, step).unwrap();
+        assert_eq!(got, b"Hello Hello Hello Hello", "{step}");
+    }
+    // cut bodies are bad
+    assert_eq!(inflate_all(Coding::Gzip, &z[..40], 5), Err(E_BAD));
+    assert_eq!(inflate_all(Coding::Brotli, &BROTLI[..10], 5), Err(E_BAD));
+    // bytes after a brotli body are bad
+    let mut extra = BROTLI.to_vec();
+    extra.extend_from_slice(b"more");
+    assert_eq!(inflate_all(Coding::Brotli, &extra, 4), Err(E_BAD));
+    assert_eq!(inflate_all(Coding::Brotli, &extra, extra.len()), Err(E_BAD));
+}
+
+// Only in a build with `--cfg fuzzing`: the fuzz entry on real inputs.
+#[cfg(fuzzing)]
+#[test]
+fn the_fuzz_entry_takes_coded_bodies() {
+    let mut z = gzip(&pattern(3000));
+    z.extend(gzip(b"two"));
+    z.extend_from_slice(b"\n\n");
+    for data in [&z[..], BROTLI, &z[..20], b"not coded", b"", b"\x1f\x8b"] {
+        fuzz(data);
+    }
+    fuzz(&coded("gzip", &z));
 }

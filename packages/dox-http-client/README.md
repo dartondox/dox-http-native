@@ -109,6 +109,7 @@ When no answer comes, the future fails with a `DoxHttpClientException`. Its `fai
 | `tlsFailed` | TLS failed. For example, the certificate is not trusted or is for a different host name. |
 | `clientClosed` | `close()` ran before the answer came. |
 | `tooManyRedirects` | The request got more redirects than `maxRedirects`. |
+| `badRequestBody` | The body stream of `sendStreamed` gave more or fewer bytes than `contentLength`. |
 
 ## Redirects
 
@@ -146,6 +147,52 @@ To get the body as the server sent it, set your own `accept-encoding` header:
 ```dart
 await client.get(url, headers: <String, String>{'accept-encoding': 'identity'});
 ```
+
+## Streamed bodies
+
+`send` keeps the request body and the answer body in memory. For big bodies, use `sendStreamed`. It never holds a whole body in memory. The future completes when the head of the answer is there. The body comes later, in `res.body`.
+
+Download a big file to disk:
+
+```dart
+DoxHttpClientStreamedResponse res = await client.sendStreamed(
+  'GET',
+  Uri.parse('https://example.com/big.iso'),
+);
+IOSink sink = File('big.iso').openWrite();
+await sink.addStream(res.body);
+await sink.close();
+```
+
+Upload a file. With `contentLength`, the client sends a `content-length` header. Without it, the client sends the body with `transfer-encoding: chunked`:
+
+```dart
+File file = File('big.iso');
+DoxHttpClientStreamedResponse res = await client.sendStreamed(
+  'PUT',
+  Uri.parse('https://example.com/upload'),
+  body: file.openRead(),
+  contentLength: await file.length(),
+);
+print(res.statusCode);
+await res.body.drain<void>();
+```
+
+The rules:
+
+- `res.body` is a stream with one subscription. You must listen to it or cancel it, also when you do not need the body. A body that nobody uses keeps its connection open until `close()`.
+- The client reads a maximum of about 256 KiB ahead. When you pause the subscription, the client stops to read the connection. Thus the memory stays small for a 5 GB download.
+- The client listens to the request `body` when the connection to the server works. It pauses that subscription while more than 256 KiB wait to go out.
+- When you cancel `res.body` before its end, the client closes the connection. The connection is not used again.
+- A failure after the head is an error event on `res.body`, then the stream closes. The causes are a closed connection, a chunk that is not correct, gzip data that is not correct and a body over `maxResponseSize`.
+- The client decodes a gzip or brotli body in parts. `maxResponseSize` is the limit for all decoded bytes.
+- `timeout` is for the time until the head of the answer is there. After the head, there is no timeout. A request with a big `body` can need more time to send it than the timeout. Then set a longer `timeout`, or `Duration.zero`.
+- A request with no `body` follows redirects like `send`. A request with a `body` never follows redirects, because the stream can not be read again. You get the redirect answer.
+- The client sends a request with a `body` only once. It does not send it again when a kept connection was closed.
+- If the `body` stream gives more or fewer bytes than `contentLength`, the request fails with `badRequestBody`. If the `body` stream fails with an error, the request fails with that error. In both cases the client closes the connection.
+- The server can answer before the whole `body` went out, for example with 401 or 413. The client cancels the `body` subscription and gives you that answer. The connection is not used again.
+- The headers `content-length` and `transfer-encoding` are not allowed. Use `contentLength`.
+- `close()` fails open streams with `clientClosed`.
 
 ## Timeout
 
@@ -196,7 +243,7 @@ Call `close()` when the client is not necessary any more. If you do not, the con
 ## What the client does not do
 
 - It speaks HTTP/1.1 only.
-- It keeps each request body and each answer body in memory. It has no streamed bodies.
+- `send` keeps each request body and each answer body in memory. `sendStreamed` does not.
 - It sends a request again only when a kept connection closed before an answer byte came, and only for `GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS` and `TRACE`.
 
 ## Fuzz tests

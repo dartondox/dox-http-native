@@ -16,14 +16,35 @@ int mostBusy = 0;
 /// What `/redirect` got in its `authorization` header, per request.
 final List<String?> redirectAuth = <String?>[];
 
+/// Bytes the `/stream/N` route gave to its socket so far.
+int streamSent = 0;
+
+/// `/hold` reads its request body after this completes.
+Completer<void> holdGate = Completer<void>();
+
+/// The byte of the test data at [at]: a pattern that repeats.
+int patternByte(int at) => at % 251;
+
+Uint8List pattern(int start, int length) {
+  Uint8List bytes = Uint8List(length);
+  for (int i = 0; i < length; i++) {
+    bytes[i] = patternByte(start + i);
+  }
+  return bytes;
+}
+
 /// test app: `/redirect/N?to=URL` answers status N with that location,
 /// `/` hello, `/echo` the request back as json, `/chunked` a
-/// body with no length, `/slow` waits, `/big` many bytes, `/status/N`.
+/// body with no length, `/slow` waits, `/big` many bytes, `/status/N`,
+/// `/stream/N` N bytes as fast as the client takes them, `/hold` counts a
+/// request body after [holdGate], `/early` answers 401 and reads nothing,
+/// `/die` closes the connection in the body, `/trickle` a slow body.
 Future<void> handle(HttpRequest req) async {
   connections.add(req.connectionInfo!.remotePort);
   busy++;
   if (busy > mostBusy) mostBusy = busy;
   HttpResponse res = req.response;
+  bool detached = false;
   try {
     List<String> path = req.uri.pathSegments;
     switch (path.isEmpty ? '' : path.first) {
@@ -61,6 +82,47 @@ Future<void> handle(HttpRequest req) async {
       case 'big':
         res.contentLength = 3 << 20;
         res.add(Uint8List(3 << 20)..fillRange(0, 3 << 20, 120));
+      case 'stream':
+        int size = int.parse(path[1]);
+        res.contentLength = size;
+        streamSent = 0;
+        while (streamSent < size) {
+          int n = size - streamSent < 65536 ? size - streamSent : 65536;
+          res.add(pattern(streamSent, n));
+          await res.flush();
+          streamSent += n;
+        }
+      case 'hold':
+        await holdGate.future;
+        int length = 0;
+        bool exact = true;
+        try {
+          await for (List<int> part in req) {
+            for (int i = 0; i < part.length; i++) {
+              if (part[i] != patternByte(length + i)) exact = false;
+            }
+            length += part.length;
+          }
+        } on HttpException {
+          // the client stopped the request
+          return;
+        }
+        res.write(jsonEncode(<String, Object?>{'length': length, 'ok': exact}));
+      case 'early':
+        res.statusCode = 401;
+      case 'die':
+        res.contentLength = 1000000;
+        detached = true;
+        Socket socket = await res.detachSocket();
+        socket.add(Uint8List(1000));
+        await socket.flush();
+        socket.destroy();
+      case 'trickle':
+        res.contentLength = 8;
+        res.write('trick');
+        await res.flush();
+        await Future<void>.delayed(const Duration(milliseconds: 400));
+        res.write('les');
       case 'status':
         res.statusCode = int.parse(path[1]);
       case 'gzip':
@@ -76,7 +138,7 @@ Future<void> handle(HttpRequest req) async {
     }
   } finally {
     busy--;
-    await res.close();
+    if (!detached) await res.close();
   }
 }
 
@@ -108,6 +170,7 @@ void main() {
     client = DoxHttpClient();
     connections.clear();
     mostBusy = 0;
+    holdGate = Completer<void>();
   });
 
   tearDown(() async {
@@ -608,6 +671,500 @@ void main() {
     expect(() => other.get(base), throwsStateError);
   });
 
+  group('streamed bodies', () {
+    /// Reads a body to its end and checks it against [pattern]. [slow]
+    /// pauses the listener now and then.
+    Future<int> readPattern(Stream<Uint8List> body, {bool slow = false}) async {
+      int offset = 0;
+      int pauses = 0;
+      bool exact = true;
+      Completer<void> done = Completer<void>();
+      late StreamSubscription<Uint8List> sub;
+      sub = body.listen(
+        (Uint8List part) {
+          for (int i = 0; i < part.length; i++) {
+            if (part[i] != patternByte(offset + i)) exact = false;
+          }
+          offset += part.length;
+          if (slow && offset ~/ (3 << 20) > pauses) {
+            pauses++;
+            sub.pause(Future<void>.delayed(const Duration(milliseconds: 40)));
+          }
+        },
+        onDone: done.complete,
+        onError: done.completeError,
+      );
+      await done.future;
+      expect(
+        exact,
+        isTrue,
+        reason: 'the bytes are not the bytes of the server',
+      );
+      return offset;
+    }
+
+    /// A body of [size] bytes of [pattern] in parts that the client asks for
+    /// one by one. [made] counts the bytes made so far.
+    Stream<List<int>> generate(int size, List<int> made) async* {
+      while (made[0] < size) {
+        int n = size - made[0] < 65536 ? size - made[0] : 65536;
+        yield pattern(made[0], n);
+        made[0] += n;
+      }
+    }
+
+    test('a big answer comes in parts, also for a slow listener', () async {
+      int size = 24 << 20;
+      DoxHttpClientStreamedResponse res = await client.sendStreamed(
+        'GET',
+        base.resolve('/stream/$size'),
+      );
+      expect(res.statusCode, 200);
+      expect(res.header('content-length'), '$size');
+      expect(res.url, base.resolve('/stream/$size'));
+      expect(await readPattern(res.body, slow: true), size);
+      // the connection is used again
+      await client.get(base);
+      expect(connections.length, 1);
+    });
+
+    test('a paused listener stops the server', () async {
+      int size = 48 << 20;
+      DoxHttpClientStreamedResponse res = await client.sendStreamed(
+        'GET',
+        base.resolve('/stream/$size'),
+      );
+      int offset = 0;
+      Completer<void> done = Completer<void>();
+      StreamSubscription<Uint8List> sub = res.body.listen(
+        (Uint8List part) => offset += part.length,
+        onDone: done.complete,
+      );
+      sub.pause();
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      // the client did not read the socket: the buffers of the system fill
+      // up, and the server waits
+      expect(streamSent, lessThan(size ~/ 2));
+      int before = streamSent;
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      expect(streamSent, before);
+      sub.resume();
+      await done.future;
+      expect(offset, size);
+    });
+
+    test('nobody listens: the same', () async {
+      int size = 48 << 20;
+      DoxHttpClientStreamedResponse res = await client.sendStreamed(
+        'GET',
+        base.resolve('/stream/$size'),
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      expect(streamSent, lessThan(size ~/ 2));
+      // a late listener gets everything
+      expect(await readPattern(res.body), size);
+    });
+
+    test('an answer with a gzip body is decoded in parts', () async {
+      DoxHttpClientStreamedResponse res = await client.sendStreamed(
+        'GET',
+        base.resolve('/gzip'),
+      );
+      expect(res.header('content-encoding'), isNull);
+      BytesBuilder bytes = BytesBuilder(copy: false);
+      await res.body.forEach(bytes.add);
+      expect(utf8.decode(bytes.takeBytes()), 'zipped text ' * 1000);
+    });
+
+    test('a body over maxResponseSize is an error event', () async {
+      DoxHttpClient small = DoxHttpClient(maxResponseSize: 1000);
+      addTearDown(small.close);
+      DoxHttpClientStreamedResponse res = await small.sendStreamed(
+        'GET',
+        base.resolve('/big'),
+      );
+      expect(res.statusCode, 200);
+      await expectLater(
+        res.body.drain<void>(),
+        failsWith(DoxHttpFailure.responseTooBig),
+      );
+    });
+
+    test('an upload with a length is byte exact', () async {
+      int size = 5 << 20;
+      holdGate.complete();
+      List<int> made = <int>[0];
+      DoxHttpClientStreamedResponse res = await client.sendStreamed(
+        'POST',
+        base.resolve('/hold'),
+        body: generate(size, made),
+        contentLength: size,
+      );
+      expect(res.statusCode, 200);
+      Map<String, dynamic> answer = jsonDecode(
+        utf8.decode(await collect(res.body)),
+      ) as Map<String, dynamic>;
+      expect(answer, <String, dynamic>{'length': size, 'ok': true});
+    });
+
+    test('an upload with no length is chunked and byte exact', () async {
+      int size = 3 << 20;
+      holdGate.complete();
+      List<int> made = <int>[0];
+      DoxHttpClientStreamedResponse res = await client.sendStreamed(
+        'POST',
+        base.resolve('/hold'),
+        body: generate(size, made),
+      );
+      Map<String, dynamic> answer = jsonDecode(
+        utf8.decode(await collect(res.body)),
+      ) as Map<String, dynamic>;
+      expect(answer, <String, dynamic>{'length': size, 'ok': true});
+      // small parts and empty parts, and a body with no byte
+      res = await client.sendStreamed(
+        'POST',
+        base.resolve('/echo'),
+        body: Stream<List<int>>.fromIterable(<List<int>>[
+          utf8.encode('one, '),
+          <int>[],
+          utf8.encode('two'),
+        ]),
+      );
+      Map<String, dynamic> echo = jsonDecode(
+        utf8.decode(await collect(res.body)),
+      ) as Map<String, dynamic>;
+      expect(echo['body'], 'one, two');
+      expect(echo['length'], isNull);
+      res = await client.sendStreamed(
+        'POST',
+        base.resolve('/echo'),
+        body: const Stream<List<int>>.empty(),
+      );
+      echo = jsonDecode(
+        utf8.decode(await collect(res.body)),
+      ) as Map<String, dynamic>;
+      expect(echo['body'], '');
+    });
+
+    test('a slow server pauses the body stream', () async {
+      int size = 64 << 20;
+      List<int> made = <int>[0];
+      Future<DoxHttpClientStreamedResponse> request = client.sendStreamed(
+        'POST',
+        base.resolve('/hold'),
+        body: generate(size, made),
+        contentLength: size,
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      // the server reads nothing: the stream stops after the buffers fill
+      expect(made[0], greaterThan(0));
+      expect(made[0], lessThan(size ~/ 2));
+      int before = made[0];
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      expect(made[0], before);
+      holdGate.complete();
+      DoxHttpClientStreamedResponse res = await request;
+      Map<String, dynamic> answer = jsonDecode(
+        utf8.decode(await collect(res.body)),
+      ) as Map<String, dynamic>;
+      expect(answer, <String, dynamic>{'length': size, 'ok': true});
+      expect(made[0], size);
+    });
+
+    test('cancel closes the connection', () async {
+      DoxHttpClientStreamedResponse res = await client.sendStreamed(
+        'GET',
+        base.resolve('/stream/${32 << 20}'),
+      );
+      Completer<void> first = Completer<void>();
+      StreamSubscription<Uint8List> sub = res.body.listen((Uint8List _) {
+        if (!first.isCompleted) first.complete();
+      });
+      await first.future;
+      await sub.cancel();
+      await client.get(base);
+      // the second request used another connection
+      expect(connections.length, 2);
+    });
+
+    test('a connection that closes in the body is an error event', () async {
+      DoxHttpClientStreamedResponse res = await client.sendStreamed(
+        'GET',
+        base.resolve('/die'),
+      );
+      expect(res.statusCode, 200);
+      List<Object> events = <Object>[];
+      Completer<void> done = Completer<void>();
+      res.body.listen(events.add, onError: events.add, onDone: done.complete);
+      await done.future;
+      expect(events.last, isA<DoxHttpClientException>());
+      expect(
+        (events.last as DoxHttpClientException).failure,
+        DoxHttpFailure.connectionClosed,
+      );
+    });
+
+    test('contentLength must be the length of the body', () async {
+      holdGate.complete();
+      // more bytes than the length
+      await expectLater(
+        client.sendStreamed(
+          'POST',
+          base.resolve('/hold'),
+          body: Stream<List<int>>.value(Uint8List(10)),
+          contentLength: 5,
+        ),
+        failsWith(DoxHttpFailure.badRequestBody),
+      );
+      // fewer bytes than the length
+      await expectLater(
+        client.sendStreamed(
+          'POST',
+          base.resolve('/hold'),
+          body: Stream<List<int>>.value(Uint8List(3)),
+          contentLength: 5,
+        ),
+        failsWith(DoxHttpFailure.badRequestBody),
+      );
+      // the client still works
+      expect((await client.get(base)).body, 'Hello World');
+    });
+
+    test('an error of the body stream fails the request', () async {
+      holdGate.complete();
+      Stream<List<int>> broken() async* {
+        yield pattern(0, 1000);
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        throw const FormatException('the body broke');
+      }
+
+      await expectLater(
+        client.sendStreamed('POST', base.resolve('/hold'), body: broken()),
+        throwsA(
+          isA<FormatException>().having(
+            (FormatException e) => e.message,
+            'message',
+            'the body broke',
+          ),
+        ),
+      );
+      await expectLater(
+        client.sendStreamed(
+          'POST',
+          base.resolve('/hold'),
+          body: Stream<List<int>>.error(const FormatException('at once')),
+          contentLength: 4,
+        ),
+        throwsFormatException,
+      );
+      expect((await client.get(base)).body, 'Hello World');
+    });
+
+    test('an early answer stops the upload', () async {
+      // a server that answers at once and does not read the body
+      int accepted = 0;
+      ServerSocket raw = await ServerSocket.bind(
+        InternetAddress.loopbackIPv4,
+        0,
+      );
+      addTearDown(raw.close);
+      List<Socket> sockets = <Socket>[];
+      raw.listen((Socket socket) {
+        accepted++;
+        sockets.add(socket);
+        StringBuffer head = StringBuffer();
+        socket.listen((List<int> data) {
+          head.write(latin1.decode(data));
+          // only the head of a request that is whole is of interest
+          if (head.toString().contains('\r\n\r\n')) {
+            socket.add(
+              latin1.encode('HTTP/1.1 401 No\r\ncontent-length: 0\r\n\r\n'),
+            );
+            head.clear();
+          }
+        }, onError: (Object _) {});
+      });
+      addTearDown(() {
+        for (Socket socket in sockets) {
+          socket.destroy();
+        }
+      });
+      Uri url = Uri.parse('http://127.0.0.1:${raw.port}/early');
+      bool stopped = false;
+      Stream<List<int>> endless() async* {
+        try {
+          while (true) {
+            yield Uint8List(65536);
+            await Future<void>.delayed(const Duration(milliseconds: 1));
+          }
+        } finally {
+          stopped = true;
+        }
+      }
+
+      DoxHttpClientStreamedResponse res = await client.sendStreamed(
+        'POST',
+        url,
+        body: endless(),
+        contentLength: 1 << 40,
+      );
+      expect(res.statusCode, 401);
+      await res.body.drain<void>();
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(stopped, isTrue);
+      // the connection was not kept
+      expect((await client.get(url)).statusCode, 401);
+      expect(accepted, 2);
+    });
+
+    test('redirects: no body follows, a body does not', () async {
+      DoxHttpClientStreamedResponse res = await client.sendStreamed(
+        'GET',
+        base.resolve('/redirect/302?to=/echo?x=1'),
+      );
+      expect(res.statusCode, 200);
+      expect(res.url, base.resolve('/echo?x=1'));
+      await res.body.drain<void>();
+      // a 307 with no body keeps the method
+      res = await client.sendStreamed(
+        'DELETE',
+        base.resolve('/redirect/307?to=/echo'),
+      );
+      Map<String, dynamic> echo = jsonDecode(
+        utf8.decode(await collect(res.body)),
+      ) as Map<String, dynamic>;
+      expect(echo['method'], 'DELETE');
+      // followRedirects false
+      res = await client.sendStreamed(
+        'GET',
+        base.resolve('/redirect/302?to=/'),
+        followRedirects: false,
+      );
+      expect(res.statusCode, 302);
+      await res.body.drain<void>();
+      // a request with a body stream gets the redirect answer
+      res = await client.sendStreamed(
+        'POST',
+        base.resolve('/redirect/307?to=/echo'),
+        body: Stream<List<int>>.value(utf8.encode('data')),
+        contentLength: 4,
+      );
+      expect(res.statusCode, 307);
+      expect(res.header('location'), '/echo');
+      await res.body.drain<void>();
+      // too many redirects
+      Uri chain = base.resolve('/');
+      for (int i = 0; i < 6; i++) {
+        chain = base.replace(
+          path: '/redirect/302',
+          queryParameters: <String, String>{'to': '$chain'},
+        );
+      }
+      await expectLater(
+        client.sendStreamed('GET', chain),
+        failsWith(DoxHttpFailure.tooManyRedirects),
+      );
+    });
+
+    test('the timeout is for the head', () async {
+      await expectLater(
+        client.sendStreamed(
+          'GET',
+          base.resolve('/slow'),
+          timeout: const Duration(milliseconds: 50),
+        ),
+        failsWith(DoxHttpFailure.timeout),
+      );
+      // a body that comes slowly is no timeout
+      DoxHttpClientStreamedResponse res = await client.sendStreamed(
+        'GET',
+        base.resolve('/trickle'),
+        timeout: const Duration(milliseconds: 100),
+      );
+      expect(utf8.decode(await collect(res.body)), 'trickles');
+    });
+
+    test('bad arguments', () {
+      expect(
+        () => client.sendStreamed('GET', base, contentLength: 3),
+        throwsArgumentError,
+      );
+      expect(
+        () => client.sendStreamed(
+          'POST',
+          base,
+          body: const Stream<List<int>>.empty(),
+          contentLength: -1,
+        ),
+        throwsArgumentError,
+      );
+      expect(
+        () => client.sendStreamed(
+          'POST',
+          base,
+          body: const Stream<List<int>>.empty(),
+          headers: <String, String>{'Content-Length': '5'},
+        ),
+        throwsArgumentError,
+      );
+      expect(
+        () => client.sendStreamed(
+          'POST',
+          base,
+          body: const Stream<List<int>>.empty(),
+          headers: <String, String>{'transfer-encoding': 'chunked'},
+        ),
+        throwsArgumentError,
+      );
+    });
+
+    test('close fails the open streams', () async {
+      DoxHttpClient other = DoxHttpClient();
+      // a request with no head
+      Future<DoxHttpClientStreamedResponse> open = other.sendStreamed(
+        'GET',
+        base.resolve('/slow'),
+      );
+      unawaited(expectLater(open, failsWith(DoxHttpFailure.clientClosed)));
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      // an answer body that is on its way
+      DoxHttpClientStreamedResponse res = await other.sendStreamed(
+        'GET',
+        base.resolve('/stream/${32 << 20}'),
+      );
+      Completer<void> first = Completer<void>();
+      Completer<Object> failed = Completer<Object>();
+      StreamSubscription<Uint8List> sub = res.body.listen((Uint8List _) {
+        if (!first.isCompleted) first.complete();
+      }, onError: failed.complete);
+      await first.future;
+      // the answer stays open: the listener waits
+      sub.pause();
+      // an upload that waits for the server
+      Future<DoxHttpClientStreamedResponse> upload = other.sendStreamed(
+        'POST',
+        base.resolve('/hold'),
+        body: generate(64 << 20, <int>[0]),
+        contentLength: 64 << 20,
+      );
+      unawaited(expectLater(upload, failsWith(DoxHttpFailure.clientClosed)));
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      other.close();
+      sub.resume();
+      Object error = await failed.future;
+      expect(
+        error,
+        isA<DoxHttpClientException>().having(
+          (DoxHttpClientException e) => e.failure,
+          'failure',
+          DoxHttpFailure.clientClosed,
+        ),
+      );
+      await pumpEventQueue();
+      expect(() => other.sendStreamed('GET', base), throwsStateError);
+    });
+  });
+
   group('https', () {
     late Directory dir;
     late String certificate;
@@ -748,6 +1305,52 @@ void main() {
           ),
         ),
       );
+    });
+
+    test('streamed bodies', () async {
+      Uri url = Uri.parse('https://localhost:${secure.port}');
+      int size = 6 << 20;
+      DoxHttpClientStreamedResponse res = await trusting.sendStreamed(
+        'GET',
+        url.resolve('/stream/$size'),
+      );
+      int offset = 0;
+      bool exact = true;
+      await res.body.forEach((Uint8List part) {
+        for (int i = 0; i < part.length; i++) {
+          if (part[i] != patternByte(offset + i)) exact = false;
+        }
+        offset += part.length;
+      });
+      expect(offset, size);
+      expect(exact, isTrue);
+      holdGate.complete();
+      Stream<List<int>> body() async* {
+        for (int at = 0; at < size; at += 65536) {
+          yield pattern(at, 65536);
+        }
+      }
+
+      res = await trusting.sendStreamed(
+        'POST',
+        url.resolve('/hold'),
+        body: body(),
+        contentLength: size,
+      );
+      Map<String, dynamic> answer = jsonDecode(
+        utf8.decode(await collect(res.body)),
+      ) as Map<String, dynamic>;
+      expect(answer, <String, dynamic>{'length': size, 'ok': true});
+      // chunked
+      res = await trusting.sendStreamed(
+        'POST',
+        url.resolve('/hold'),
+        body: body(),
+      );
+      answer = jsonDecode(
+        utf8.decode(await collect(res.body)),
+      ) as Map<String, dynamic>;
+      expect(answer, <String, dynamic>{'length': size, 'ok': true});
     });
 
     test('trustedCertificates must be PEM', () {
