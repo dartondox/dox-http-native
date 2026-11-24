@@ -63,6 +63,8 @@ const OUT_HIGH: usize = 256 * 1024;
 /// A server that makes us answer (PING, SETTINGS) and does not read: the
 /// connection closes when `out` is over this.
 const OUT_MAX: usize = 4 << 20;
+/// Most open streams before the SETTINGS frame of the server came.
+const EARLY_STREAMS: u32 = 100;
 /// Most bytes of one header block (HEADERS and its CONTINUATION frames).
 const MAX_BLOCK: usize = 2 * MAX_HEAD;
 
@@ -201,9 +203,16 @@ impl H2 {
 
     /// True when `open` may be called.
     pub(super) fn capacity(&self) -> bool {
+        // before its SETTINGS the limit of the server is not known: not
+        // too many streams that it may then refuse
+        let max = if self.got_settings {
+            self.peer_max
+        } else {
+            self.peer_max.min(EARLY_STREAMS)
+        };
         !self.goaway
             && !self.dead
-            && self.streams.len() < self.peer_max as usize
+            && self.streams.len() < max as usize
             && self.next_id < 0x7fff_fff0
     }
 

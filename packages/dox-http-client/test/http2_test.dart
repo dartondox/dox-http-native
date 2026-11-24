@@ -193,6 +193,29 @@ void main() {
     expect(connections, 1);
   });
 
+  test('many requests wait for one connection', () async {
+    DoxHttpClient one = DoxHttpClient(
+      trustedCertificates: certificate,
+      maxConnectionsPerHost: 1,
+    );
+    addTearDown(one.close);
+    // an IP address: no lookup, so all of them wait for the handshake
+    Uri url = Uri.parse('https://127.0.0.1:${server.port}/echo');
+    List<DoxHttpClientResponse> all = await Future.wait(
+      <Future<DoxHttpClientResponse>>[
+        for (int i = 0; i < 500; i++) one.post(url, body: 'body $i'),
+      ],
+    );
+    for (int i = 0; i < 500; i++) {
+      expect(all[i].statusCode, 200);
+      expect(
+        (jsonDecode(all[i].body) as Map<String, Object?>)['body'],
+        'body $i',
+      );
+    }
+    expect(connections, 1);
+  });
+
   test('a big request body and a big answer', () async {
     Uint8List body = pattern(3 << 20);
     DoxHttpClientResponse res = await client.post(

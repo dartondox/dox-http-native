@@ -1159,7 +1159,8 @@ fn h2_goaway_and_refused_streams_are_sent_again() {
 }
 
 #[test]
-fn h2_a_request_that_may_not_go_again_fails_on_goaway() {
+fn h2_a_request_goes_out_again_one_time_only() {
+    // each connection says GOAWAY with no work done
     let s = h2_server(&[], |peer, _| {
         let Some(In::Head { .. }) = peer.next() else {
             return;
@@ -1168,16 +1169,9 @@ fn h2_a_request_that_may_not_go_again_fails_on_goaway() {
         peer.idle();
     });
     let mut core = h2_core(&s.pem);
-    let out = req(
-        1,
-        s.addr,
-        0,
-        5000,
-        "POST / HTTP/1.1\r\nhost: localhost\r\ncontent-length: 0\r\n\r\n",
-    );
-    let a = run_until(&mut core, &out, 1);
+    let a = run_until(&mut core, &post_path(1, s.addr, "/"), 1);
     assert_eq!((a[0].status, a[0].error), (0, E_CLOSED));
-    assert_eq!(s.count.load(Ordering::SeqCst), 1);
+    assert_eq!(s.count.load(Ordering::SeqCst), 2);
     assert!(core.conns.is_empty());
     assert!(core.hosts.is_empty());
 }
@@ -1302,4 +1296,204 @@ fn h2_an_idle_connection_closes_after_the_idle_timeout() {
         200
     );
     assert_eq!(s.count.load(Ordering::SeqCst), 2);
+}
+
+fn post_path(id: u64, addr: SocketAddr, path: &str) -> Vec<u8> {
+    let request = format!("POST {path} HTTP/1.1\r\nhost: localhost\r\ncontent-length: 0\r\n\r\n");
+    req(id, addr, 0, 5000, &request)
+}
+
+#[test]
+fn h2_many_requests_that_wait_do_not_make_the_stack_deep() {
+    // all of them go to the new connection when its handshake ends
+    let many = || {
+        let s = h2_server(&[], echo);
+        let config = tls_config(s.pem.as_bytes(), true).unwrap();
+        let mut core = Core::new(1, 0, None, config).unwrap();
+        let mut out = Vec::new();
+        for id in 1..=2000 {
+            out.extend(get_path(id, s.addr, "/"));
+        }
+        let answers = run_until(&mut core, &out, 2000);
+        assert!(answers.iter().all(|a| a.status == 200));
+        assert_eq!(s.count.load(Ordering::SeqCst), 1);
+        assert_eq!(core.open, 0);
+    };
+    // the thread of a Dart isolate has a small stack
+    let small = thread::Builder::new().stack_size(512 * 1024);
+    small.spawn(many).unwrap().join().unwrap();
+}
+
+#[test]
+fn h2_requests_that_the_server_refuses_go_out_again() {
+    // "1 stream at a time" is in the SETTINGS of the server, but the
+    // requests go out before the client reads that frame
+    let s = h2_server(&[(3, 1)], |peer, _| {
+        let mut heads = 0;
+        let mut busy: Option<u32> = None;
+        loop {
+            match peer.next() {
+                Some(In::Head { stream, .. }) => {
+                    heads += 1;
+                    if heads > 4 {
+                        peer.answer(stream, "200", &[], b"ok");
+                    } else if busy.is_some() {
+                        // over the limit: REFUSED_STREAM
+                        peer.put(3, 0, stream, &7u32.to_be_bytes());
+                    } else {
+                        busy = Some(stream);
+                    }
+                    if heads == 4
+                        && let Some(stream) = busy.take()
+                    {
+                        peer.answer(stream, "200", &[], b"ok");
+                    }
+                }
+                Some(_) => {}
+                None => return,
+            }
+        }
+    });
+    let config = tls_config(s.pem.as_bytes(), true).unwrap();
+    let mut core = Core::new(1, 0, None, config).unwrap();
+    let mut out = Vec::new();
+    for id in 1..=4 {
+        // POST: not a request that goes out again after a closed connection
+        out.extend(post_path(id, s.addr, "/"));
+    }
+    let answers = run_until(&mut core, &out, 4);
+    for a in &answers {
+        assert_eq!((a.status, a.error), (200, 0));
+    }
+    assert_eq!(s.count.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn h2_an_idle_connection_is_read_before_the_next_request() {
+    let s = h2_server(&[], |peer, n| {
+        if n > 0 {
+            return echo(peer, n);
+        }
+        let Some((stream, _, _)) = peer.request() else {
+            return;
+        };
+        peer.answer(stream, "200", &[], b"first");
+        // GOAWAY while the connection is idle: all its work is done
+        thread::sleep(Duration::from_millis(50));
+        let mut last = [0u8; 8];
+        last[..4].copy_from_slice(&stream.to_be_bytes());
+        peer.put(7, 0, 0, &last);
+        peer.idle();
+    });
+    let mut core = h2_core(&s.pem);
+    assert_eq!(
+        run_until(&mut core, &get_path(1, s.addr, "/"), 1)[0].status,
+        200
+    );
+    thread::sleep(Duration::from_millis(200));
+    // no call of `run` since then: the GOAWAY is not read yet
+    let a = run_until(&mut core, &post_path(2, s.addr, "/x"), 1);
+    assert_eq!((a[0].status, a[0].error), (200, 0));
+    assert_eq!(a[0].body, b"POST /x 0");
+    assert_eq!(s.count.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn h2_answers_before_a_connection_error_are_answers() {
+    let s = h2_server(&[], |peer, _| {
+        let Some((stream, _, _)) = peer.request() else {
+            return;
+        };
+        peer.answer(stream, "200", &[], b"first");
+        let mut open = Vec::new();
+        while open.len() < 2 {
+            match peer.next() {
+                Some(In::Head { stream, .. }) => open.push(stream),
+                Some(_) => {}
+                None => return,
+            }
+        }
+        // a whole answer and a bad frame (PUSH_PROMISE) in one write
+        let mut b = Vec::new();
+        frame(&mut b, 1, 5, open[0], &block(&[(":status", "204")]));
+        frame(&mut b, 5, 4, open[1], &[0, 0, 0, 2]);
+        let _ = peer.tls.write_all(&b);
+        let _ = peer.tls.flush();
+        peer.idle();
+    });
+    let mut core = h2_core(&s.pem);
+    run_until(&mut core, &get_path(9, s.addr, "/"), 1);
+    let mut out = post_path(1, s.addr, "/");
+    out.extend(post_path(2, s.addr, "/"));
+    let mut answers = run_until(&mut core, &out, 2);
+    answers.sort_by_key(|a| a.id);
+    assert_eq!((answers[0].status, answers[0].error), (204, 0));
+    assert_eq!((answers[1].status, answers[1].error), (0, E_BAD));
+    assert!(core.conns.is_empty());
+}
+
+#[test]
+fn h2_a_streamed_bad_body_of_a_redirect_ends_at_once() {
+    let s = h2_server(&[], |peer, _| {
+        loop {
+            match peer.next() {
+                Some(In::Head { stream, .. }) => {
+                    let fields = [("location", "/x"), ("content-encoding", "gzip")];
+                    peer.head(stream, "302", &fields, false);
+                    // no end of the stream
+                    peer.data(stream, b"this is not gzip", false);
+                }
+                Some(_) => {}
+                None => return,
+            }
+        }
+    });
+    let mut core = h2_core(&s.pem);
+    let mut r = Reader::new(1);
+    let out = req(
+        1,
+        s.addr,
+        STREAM | DECODE,
+        5000,
+        "GET / HTTP/1.1\r\nhost: localhost\r\n\r\n",
+    );
+    r.until(&mut core, &out, true, |r| r.over());
+    assert_eq!((r.status, r.error), (Some(302), None));
+    assert!(r.ended && r.body.is_empty());
+    assert_eq!(core.open, 0);
+    assert_eq!(shared(&core), [0]);
+}
+
+#[test]
+fn h2_a_connection_is_idle_from_the_end_of_its_last_request() {
+    let s = h2_server(&[], |peer, _| {
+        while let Some((stream, _, _)) = peer.request() {
+            peer.head(stream, "200", &[], false);
+            peer.data(stream, &pattern(600_000), true);
+        }
+    });
+    let config = tls_config(s.pem.as_bytes(), true).unwrap();
+    let idle = Some(Duration::from_millis(300));
+    let mut core = Core::new(0, 0, idle, config).unwrap();
+    let mut r = Reader::new(1);
+    let out = req(
+        1,
+        s.addr,
+        STREAM,
+        5000,
+        "GET / HTTP/1.1\r\nhost: localhost\r\n\r\n",
+    );
+    // the reader is slow: the answer needs longer than the idle timeout
+    r.until(&mut core, &out, false, |r| r.body.len() >= WINDOW as usize);
+    thread::sleep(Duration::from_millis(400));
+    // the last bytes come after a credit of the reader
+    r.until(&mut core, &[], true, |r| r.over());
+    assert!(r.ended);
+    let mut inb = vec![0u8; 4096];
+    core.run(&[], &mut inb).unwrap();
+    // the connection was in use a moment ago: it stays
+    assert_eq!(shared(&core), [0]);
+    thread::sleep(Duration::from_millis(350));
+    core.run(&[], &mut inb).unwrap();
+    assert!(core.conns.is_empty());
 }

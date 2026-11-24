@@ -1,9 +1,9 @@
 ## Unreleased
 
 - HTTP/2. On an `https://` URL, the client asks for HTTP/2 during the TLS handshake (ALPN) and uses it when the server has it. If not, it uses HTTP/1.1.
-  - All requests to one HTTP/2 server share one connection. A request that fails or gets a timeout stops only its stream.
+  - The requests to one HTTP/2 server share one connection. A request that fails or gets a timeout stops only its stream. Requests that start at the same time to a new server can open more than one connection.
   - `send`, `sendStreamed` and the other methods do not change. Streamed bodies use the flow control of HTTP/2: when the listener pauses, the server stops to send.
-  - A request that the server refused, or did not start before it closed the connection, is sent again one time (not a request with a body stream, and not `POST` or `PATCH`).
+  - A request that the server did not work on (a refused stream, or a GOAWAY frame for an earlier stream) is sent again one time, for each method. When the connection closes before the head of an answer, only `GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS` and `TRACE` are sent again. A request with a body stream is never sent again.
   - `DoxHttpClient(http2: false)` uses HTTP/1.1 only.
   - The native library does the chunked framing of a request body stream now. The ABI version of the native library is 4.
   - The fuzz target also gives random bytes to the HTTP/2 connection and to the HPACK decoder.

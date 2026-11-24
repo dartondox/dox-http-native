@@ -778,6 +778,9 @@ struct Conn {
 struct Mux {
     proto: h2::H2,
     subs: HashMap<u32, Sub>,
+    /// it has no request, and `idle_since` of the connection says since
+    /// when
+    idle: bool,
 }
 
 /// One request on an HTTP/2 connection.
@@ -1335,6 +1338,9 @@ struct Core {
     /// when `run` next looks for idle connections to close
     next_sweep: Instant,
     tls: Arc<ClientConfig>,
+    /// `pump` runs, and the keys that it must look at after it
+    pumping: bool,
+    pumps: Vec<Key>,
     /// The 2 buffers of Dart for `dox_client_run`: the requests and the
     /// answers. They live here, so they are freed with the client, also
     /// when Dart never closes it. See `dox_client_buffer`.
@@ -1370,6 +1376,8 @@ impl Core {
             idle_timeout,
             next_sweep: Instant::now(),
             tls,
+            pumping: false,
+            pumps: Vec::new(),
             bufs: [Vec::new(), Vec::new()],
         })
     }
@@ -1420,7 +1428,7 @@ impl Core {
             // the oldest first, as they go back in front of the queue
             subs.sort_unstable_by_key(|(stream, _)| std::cmp::Reverse(*stream));
             for (_, sub) in subs {
-                self.h2_lost(&key, sub, error, error == E_CLOSED);
+                self.h2_lost(&key, sub, error, false, error == E_CLOSED);
             }
         }
         if let Some(mut req) = conn.req {
@@ -1520,9 +1528,25 @@ impl Core {
     /// Sends a request on an idle connection for `key` or on a new one, or
     /// lets it wait when `max_per_host` connections are open.
     fn start(&mut self, key: Key, req: Req) {
-        if let Some(idx) = self.h2_free(&key) {
+        while let Some(idx) = self.h2_free(&key) {
+            let idle = self
+                .conns
+                .get(idx)
+                .is_some_and(|c| c.h2.as_ref().is_some_and(|mux| mux.subs.is_empty()));
+            if idle {
+                // Read first, as for an idle HTTP/1.1 connection: the
+                // server may have closed it or said GOAWAY.
+                self.mux(idx);
+                if self.h2_free(&key) != Some(idx) {
+                    continue;
+                }
+            }
             self.h2_open(idx, req);
-            return self.drive(idx);
+            // one write for all the requests that start in this call
+            if !self.again.contains(&idx) {
+                self.again.push(idx);
+            }
+            return;
         }
         while let Some(idx) = self.hosts.get_mut(&key).and_then(|h| h.idle.pop()) {
             let Some(c) = self.conns.get_mut(idx) else {
@@ -1552,7 +1576,24 @@ impl Core {
 
     /// Starts the requests that wait for a connection for `key`, while
     /// there is a free one. Drops the entry of a key with nothing.
+    ///
+    /// A request that starts can end a request of the same call chain (an
+    /// answer that is there already, a connection that fails), and that
+    /// pumps again. Such a call inside a call only notes its key: thus
+    /// many requests that wait do not make the stack deep.
     fn pump(&mut self, key: &Key) {
+        if self.pumping {
+            return self.pumps.push(key.clone());
+        }
+        self.pumping = true;
+        self.pump_one(key);
+        while let Some(key) = self.pumps.pop() {
+            self.pump_one(&key);
+        }
+        self.pumping = false;
+    }
+
+    fn pump_one(&mut self, key: &Key) {
         loop {
             let shared = self.h2_free(key).is_some();
             let Some(host) = self.hosts.get_mut(key) else {
@@ -1883,6 +1924,7 @@ impl Core {
         c.h2 = Some(Box::new(Mux {
             proto: h2::H2::new(),
             subs: HashMap::new(),
+            idle: false,
         }));
         self.hosts.entry(key.clone()).or_default().h2.push(idx);
         if let Some(req) = req {
@@ -1914,10 +1956,12 @@ impl Core {
             // the connection works: Dart may give the body now
             push_progress(&mut self.ready, req.id, head_len as u64);
             req.bytes = Vec::new();
-        } else if req.flags & AGAIN == 0 || req.retried {
-            // only a request that may go out again keeps its bytes
+        } else if req.retried {
+            // A request that may go out again keeps its bytes until the
+            // head of its answer comes.
             req.bytes = Vec::new();
         }
+        mux.idle = false;
         mux.subs.insert(
             stream,
             Sub {
@@ -1950,8 +1994,11 @@ impl Core {
             c.sent = 0;
             let waits = mux.proto.out.len();
             let Ok(used) = mux.proto.recv(&c.buf[..c.filled]) else {
+                // the answers that were whole before the bad frame count
+                let events = std::mem::take(&mut mux.proto.events);
                 // tell the server why (GOAWAY), if the socket takes it
                 let _ = c.io(0);
+                self.h2_events(idx, events);
                 return self.fail(idx, E_BAD);
             };
             c.buf.copy_within(used..c.filled, 0);
@@ -1960,7 +2007,6 @@ impl Core {
                 c.buf = Vec::new();
             }
             let events = std::mem::take(&mut mux.proto.events);
-            let busy = !mux.subs.is_empty();
             let key = c.key.clone();
             self.h2_events(idx, events);
             // The answers that came before a failure are whole: only now
@@ -1979,8 +2025,10 @@ impl Core {
                     self.close(idx);
                     break key;
                 }
-                // its last request is done: it is idle from now on
-                if busy {
+                // Its last request is done: it is idle from now on. Each
+                // way a request ends comes through here.
+                if !mux.idle {
+                    mux.idle = true;
                     c.idle_since = self.now;
                 }
             }
@@ -2030,7 +2078,7 @@ impl Core {
                     let key = c.key.clone();
                     let sub = c.h2.as_mut().and_then(|mux| mux.subs.remove(&stream));
                     if let Some(sub) = sub {
-                        self.h2_lost(&key, sub, error, retry);
+                        self.h2_lost(&key, sub, error, retry, false);
                     }
                 }
                 h2::Event::Wrote { stream, total } => {
@@ -2062,6 +2110,8 @@ impl Core {
             .and_then(|mux| mux.subs.get_mut(&stream));
         let Some(sub) = sub else { return };
         sub.status = status;
+        // it has an answer: it does not go out again
+        sub.req.bytes = Vec::new();
         if sub.req.flags & DECODE != 0 {
             sub.coding = coding_of(&lines);
         }
@@ -2150,7 +2200,8 @@ impl Core {
         };
         let quiet = down.redirect && down.inflate.is_some();
         let whole = match emit(down, id, data, sub.ended, stream_max, &mut self.ready) {
-            Ok(whole) => whole,
+            Ok(whole) => whole && sub.ended,
+            // a bad body of a redirect ends here, before the server ends it
             Err(E_BAD) if quiet => true,
             Err(error) => {
                 mux.subs.remove(&stream);
@@ -2158,11 +2209,11 @@ impl Core {
                 return self.failed(id, error);
             }
         };
-        if !(whole && sub.ended) {
+        if !whole {
             return sub.window(&mut mux.proto, stream);
         }
         mux.subs.remove(&stream);
-        // a bad body of a redirect ends before the server ended it
+        // no stream is left after a whole answer: this is for the bad body
         mux.proto.reset(stream, h2::CANCEL);
         self.ready.push_back(Done {
             id,
@@ -2175,12 +2226,17 @@ impl Core {
         self.open -= 1;
     }
 
-    /// A request of an HTTP/2 connection got no whole answer. `retry`: the
-    /// server did not work on it, or the connection closed.
-    fn h2_lost(&mut self, key: &Key, mut sub: Sub, error: u16, retry: bool) {
-        let again = retry
+    /// A request of an HTTP/2 connection got no whole answer. It goes out
+    /// one more time when that is safe:
+    /// - `unused`: the server says that it did not work on the request
+    ///   (REFUSED_STREAM, or GOAWAY for an earlier stream). Safe for each
+    ///   method (RFC 9113 8.7).
+    /// - `closed`: the connection closed before a head came. The server
+    ///   may have done the work, so only for a request with [AGAIN].
+    fn h2_lost(&mut self, key: &Key, mut sub: Sub, error: u16, unused: bool, closed: bool) {
+        let safe = unused || (closed && sub.req.flags & AGAIN != 0);
+        let again = safe
             && sub.status == 0
-            && sub.req.flags & AGAIN != 0
             && sub.req.flags & UPLOAD == 0
             && !sub.req.retried
             && !sub.req.bytes.is_empty();
