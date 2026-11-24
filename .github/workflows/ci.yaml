@@ -1,12 +1,15 @@
 name: CI
 
-# Every push to main and every pull request: Rust checks, then the Dart
-# tests.
+# Every push to main and every pull request: Rust checks, the Dart tests,
+# then a build of the library for the 5 targets. Thus a change that does
+# not build on one target (eg. a dependency with C code) fails before a
+# release, not at the tag.
 #
-# A tag like v<version> (it must match the version in pubspec.yaml):
-# 1. build the library for the 5 targets,
-# 2. upload them to the GitHub release of the tag, with SHA256SUMS,
-# 3. fill `_sha256` in hook/build.dart from SHA256SUMS, publish the package
+# A tag like v<version> (it must match the version in pubspec.yaml), after
+# the build:
+# 1. upload the 5 libraries to the GitHub release of the tag, with
+#    SHA256SUMS,
+# 2. fill `_sha256` in hook/build.dart from SHA256SUMS, publish the package
 #    to pub.dev, and push the new hashes to main.
 # The hook downloads these files, so users do not need Rust.
 
@@ -119,7 +122,6 @@ jobs:
           fi
 
   build:
-    if: startsWith(github.ref, 'refs/tags/v')
     needs: test
     strategy:
       fail-fast: false
@@ -137,6 +139,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Check that the tag matches pubspec.yaml
+        if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: |
           v=$(sed -nE 's/^version:[[:space:]]*([^[:space:]]+).*/\1/p' pubspec.yaml)
@@ -174,6 +177,7 @@ jobs:
           path: dist/${{ matrix.asset }}
 
   release:
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
     permissions:

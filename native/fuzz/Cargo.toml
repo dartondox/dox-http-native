@@ -25,9 +25,11 @@ getrandom = "0.4.3"
 httparse = "1.10.1"
 httpdate = "1.0.3"
 mio = { version = "1.2.4", features = ["os-poll", "net"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 slab = "0.4.12"
 socket2 = { version = "0.6.5", features = ["all"] }
 tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+webpki-roots = "1.0.12"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.191"
@@ -78,6 +80,13 @@ bench = false
 [[bin]]
 name = "h2_conn"
 path = "fuzz_targets/h2_conn.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "client_response"
+path = "fuzz_targets/client_response.rs"
 test = false
 doc = false
 bench = false

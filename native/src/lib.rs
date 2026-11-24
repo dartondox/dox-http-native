@@ -112,6 +112,7 @@
 //! - HTTP: while 1 MB of answers waits to be written, Rust reads no new
 //!   requests of that connection. See `run.rs` for the other limits.
 mod aead;
+mod client;
 mod h2;
 mod run;
 

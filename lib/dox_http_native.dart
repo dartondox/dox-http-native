@@ -4,6 +4,12 @@
 library;
 
 export 'src/aes_gcm.dart' show AesGcm;
+export 'src/client.dart'
+    show
+        DoxHttpClient,
+        DoxHttpClientException,
+        DoxHttpClientResponse,
+        DoxHttpFailure;
 export 'src/headers.dart' show NativeHeaders;
 export 'src/request.dart' show NativeRequest;
 export 'src/response.dart' show NativeResponse;

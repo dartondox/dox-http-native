@@ -134,3 +134,38 @@ external int doxAesGcmOpen(
   int dataLen,
   Pointer<Uint8> out,
 );
+
+/// Makes an HTTP client (see native/src/client.rs). Its idle helper posts
+/// to [sendPort]. [maxPerHost] 0 is no limit of connections to one address.
+/// [maxBody] 0 is no limit of an answer body. [ca] ([caLength] bytes, PEM)
+/// has more root certificates to trust for `https://`. Returns a handle
+/// for [doxClientRun], or -3 when [ca] is not correct.
+@Native<Int64 Function(Int64, Int64, Int64, Pointer<Uint8>, Int64)>(
+  symbol: 'dox_client_new',
+)
+external int doxClientNew(
+  int sendPort,
+  int maxPerHost,
+  int maxBody,
+  Pointer<Uint8> ca,
+  int caLength,
+);
+
+/// Sends the request records in [out], reads the finished answers into
+/// [inBuf]. Never waits. Returns the answer bytes, 0 for none (Rust then
+/// posts to the port when there are some), or -size when one answer needs
+/// a bigger [inBuf].
+@Native<Int64 Function(Int64, Pointer<Uint8>, Int64, Pointer<Uint8>, Int64)>(
+  symbol: 'dox_client_run',
+)
+external int doxClientRun(
+  int handle,
+  Pointer<Uint8> out,
+  int outLength,
+  Pointer<Uint8> inBuf,
+  int inCapacity,
+);
+
+/// Closes a client and frees its handle. Also the finalizer of a client.
+@Native<Void Function(Pointer<Void>)>(symbol: 'dox_client_close')
+external void doxClientClose(Pointer<Void> handle);

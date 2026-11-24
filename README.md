@@ -1,6 +1,7 @@
 # dox_http_native
 
 Native HTTP server for Dart. It speaks HTTP/1.1 and HTTP/2. It is the default HTTP server of Dox.
+The package also has a fast HTTP client for calls to other servers.
 
 [![pub package](https://img.shields.io/pub/v/dox_http_native.svg)](https://pub.dev/packages/dox_http_native)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/dartondox/dox-http-native/blob/main/LICENSE)
@@ -34,7 +35,7 @@ A build hook (`hook/build.dart`) gets the Rust library. It tries these sources i
 2. A local build in `native/target/release`, for the same OS and CPU.
 3. A ready-built library from the GitHub release. The hook checks its sha256.
    There are builds for macOS (arm64, x64), Linux (x64, arm64) and Windows (x64).
-4. A build from source with `cargo`, when Rust is installed.
+4. A build from source with `cargo`, when Rust and a C compiler are installed.
 
 Outside the pub cache, step 4 runs before step 3. This applies to this repo, a path dependency and a git dependency. The source there can be newer than the release.
 
@@ -137,6 +138,117 @@ How it works:
 - `detachSocket` is not supported.
 - On a graceful `close()`, each open WebSocket gets the close code `1001` (going away).
 
+## HTTP client
+
+`DoxHttpClient` sends requests to other servers, for example when a handler calls an API.
+Rust owns the sockets and reads the answers on the thread of your isolate. This makes it faster than `HttpClient` of `dart:io`.
+
+Make one client and use it for all requests. The client keeps its connections open and uses them again:
+
+```dart
+import 'package:dox_http_native/dox_http_native.dart';
+
+final DoxHttpClient client = DoxHttpClient();
+
+Future<String> rates() async {
+  DoxHttpClientResponse res = await client.get(
+    Uri.parse('https://api.example.com/rates'),
+  );
+  return res.body;
+}
+```
+
+Each isolate must have its own client.
+
+### Send a request
+
+`get`, `head`, `post`, `put`, `patch` and `delete` send a request. Give the body as text with `body`, or as bytes with `bodyBytes`:
+
+```dart
+DoxHttpClientResponse res = await client.post(
+  Uri.parse('http://127.0.0.1:8080/users'),
+  headers: <String, String>{'content-type': 'application/json'},
+  body: '{"name":"Dox"}',
+);
+```
+
+For other methods, use `send`:
+
+```dart
+await client.send('OPTIONS', Uri.parse('http://127.0.0.1:8080/users'));
+```
+
+The client sets the `host` and `content-length` headers. A text body with no `content-type` header goes out as `text/plain; charset=utf-8`.
+
+### Read the answer
+
+```dart
+res.statusCode; // 200
+res.body; // the body as text (UTF-8)
+res.bodyBytes; // the body as bytes
+res.headers; // all headers, names in lower case
+res.header('Content-Type'); // one header, or null
+```
+
+An answer with an error status, for example 404 or 500, is an answer and not an exception.
+
+### Failures
+
+When no answer comes, the future fails with a `DoxHttpClientException`. Its `failure` gives the cause:
+
+| `DoxHttpFailure` | Cause |
+| --- | --- |
+| `lookupFailed` | The host name has no address. |
+| `connectionFailed` | The server did not accept the connection. Nothing was sent. |
+| `timeout` | The full answer did not come in the timeout. |
+| `connectionClosed` | The connection closed before the answer was complete. |
+| `badResponse` | The answer is not correct HTTP. |
+| `responseTooBig` | The body is larger than `maxResponseSize`. |
+| `tlsFailed` | TLS failed. For example, the certificate is not trusted or is for a different host name. |
+| `clientClosed` | `close()` ran before the answer came. |
+
+### Timeout
+
+A request fails when its full answer does not come in 30 seconds. Change this for the client or for one request. `Duration.zero` is no timeout:
+
+```dart
+DoxHttpClient client = DoxHttpClient(
+  timeout: const Duration(seconds: 5),
+);
+await client.get(url, timeout: const Duration(minutes: 2));
+```
+
+### HTTPS
+
+An `https://` URL uses TLS 1.2 or TLS 1.3. The client trusts the root certificates of Mozilla, which are in the library. Thus HTTPS also works in a `FROM scratch` Docker image.
+
+To trust your own certificate authority or a self-signed certificate, give the certificates as PEM text:
+
+```dart
+DoxHttpClient client = DoxHttpClient(
+  trustedCertificates: File('ca.pem').readAsStringSync(),
+);
+```
+
+### Limits
+
+Each limit is off by default:
+
+- `maxConnectionsPerHost: 20` holds a maximum of 20 connections open to one address. More requests wait for a free connection.
+- `maxResponseSize: 10 * 1024 * 1024` makes a request fail when its answer body is larger than 10 MB.
+
+### Close the client
+
+`close()` closes all connections. Open requests fail with `clientClosed`.
+
+### What the client does not do
+
+- It speaks HTTP/1.1 only.
+- It does not go to the new address of a redirect (a `301` or `302` answer). You get the answer with its `location` header.
+- It does not ask for a compressed body and does not decompress one.
+- It keeps each request body and each answer body in memory. It has no streamed bodies.
+- It sends a request again only when a kept connection closed before an answer byte came, and only for `GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS` and `TRACE`.
+
 ## Features
 
 Isolates and threads:
@@ -217,6 +329,7 @@ The fuzz targets are in `native/fuzz/`. CI runs each target for 60 seconds when 
 - `conn`: many requests on one connection (pipelined, bodies, keep-alive, close, upgrade). The input goes in as one piece and in random pieces, with a large Dart buffer and a small Dart buffer. Dart must get the same records each time. The server must parse nothing after a close or a bad request.
 - `aead_open`: the cookie decryption on random data. It must not panic. A sealed value must open again. One changed byte must make the open fail.
 - `hpack`: random HTTP/2 header blocks (HPACK) on one decoder. It must not panic. The decoded list must stay below the size limit, and the table size must stay correct. Each decoded block is encoded again and must decode to the same fields.
+- `client_response`: random bytes as the answer of a server to the HTTP client. The parser must not panic. A chunked body must give the same result in one piece and byte by byte.
 - `h2_conn`: random bytes after the HTTP/2 preface, on one connection, with cuts as in `conn`. When Dart does not answer, one piece and random pieces must give the same records and the same bytes back.
   With answers (full or streamed), each frame that the server writes must be complete and valid. Nothing can come after a GOAWAY with an error. No stream can end two times. `STREAM_SENT` must not count more bytes than the answers have.
 

@@ -3268,6 +3268,11 @@ pub mod fuzz {
         crate::h2::hpack::fuzz(data)
     }
 
+    /// The answer parser of the HTTP client: see `client::fuzz`.
+    pub fn client_response(data: &[u8]) {
+        crate::client::fuzz(data)
+    }
+
     /// The defaults of `NativeHttpServer.bind` in lib/src/server.dart
     /// (`maxBodySize`, `maxMultipartSize`, `bodyTimeout`, `idleTimeout`,
     /// `maxConcurrentStreams`, `http2ResetBurst`, `http2ResetRate`). Keep them the same when those change.

@@ -1,5 +1,17 @@
 ## Unreleased
 
+- New: `DoxHttpClient`, an HTTP client for calls to other servers. Rust owns the sockets and reads the answers on the thread of the isolate, as the server does.
+  - `get`, `head`, `post`, `put`, `patch`, `delete` and `send` return a `DoxHttpClientResponse` with `statusCode`, `body`, `bodyBytes`, `headers` and `header(name)`.
+  - HTTP/1.1 with keep-alive: the client keeps its connections open and uses them again. Chunked answers, answers that end with the connection, IPv4, IPv6 and host names are supported. When the first address of a host name does not accept the connection, the client tries the next address.
+  - HTTPS with TLS 1.2 and TLS 1.3 ([rustls](https://github.com/rustls/rustls)). The client trusts the root certificates of Mozilla, which are in the library. `trustedCertificates` adds your own certificates as PEM text.
+  - A request fails with a `DoxHttpClientException` when no answer comes. `failure` gives the cause as a `DoxHttpFailure`.
+  - The default timeout of a request is 30 seconds. Set `timeout` for the client or for one request. `Duration.zero` is no timeout.
+  - `maxConnectionsPerHost` and `maxResponseSize` are off by default.
+  - The client does not do these things: HTTP/2, redirects, compressed bodies and streamed bodies.
+  - New fuzz target `client_response` for the answer parser.
+- The library has 3 new FFI functions: `dox_client_new`, `dox_client_run` and `dox_client_close`. The ABI version goes up at the next release.
+- The library is larger because of TLS. The macOS arm64 library goes from approximately 0.55 MB to approximately 1.5 MB.
+- A build from source now needs a C compiler, because the TLS library compiles C code and assembly code. The ready-built libraries from pub.dev do not need one.
 - The ready-built Linux libraries do not need `libgcc_s.so.1`. They need only glibc 2.34 or newer, as before. A `FROM scratch` Docker image with the Dart `/runtime/` files does not need a copy of `libgcc_s.so.1` for this package. The release build now links the Linux libraries with `cargo zigbuild`, and CI does a check of each library.
 
 ## 3.2.3
