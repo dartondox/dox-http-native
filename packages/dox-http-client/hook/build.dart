@@ -32,7 +32,18 @@ const List<int> _waitSeconds = <int>[1, 3];
 /// sha256 of each release asset. The release workflow
 /// (.github/workflows/release.yaml) fills it from `SHA256SUMS` of the release:
 /// `dart run tool/native_hashes.dart dox_http_client-v<version>`
-const Map<String, String> _sha256 = <String, String>{};
+const Map<String, String> _sha256 = <String, String>{
+  'dox_http_client-linux-arm64.so':
+      '6d627d4a09f9dd9e2e81aaca3ec076f056d007f427eb7e9ec6827911a8ad48d2',
+  'dox_http_client-linux-x64.so':
+      '52a9d54e915baed7d54eaed69cff6df5db91482cedc44fd6ef6702ca005b4b2f',
+  'dox_http_client-macos-arm64.dylib':
+      '2613d20ceda695f0824114f740280dd97ba16f9e277ad9b43de1c516a1ee6f85',
+  'dox_http_client-macos-x64.dylib':
+      '63052c0df644ffac8e819198b9412496ffcfdd25305af42bb866d44090c63ea0',
+  'dox_http_client-windows-x64.dll':
+      '5e38cfe529a4e7c93c1b67e012fc92d414281c199fe064c8ea46f55bb615b48a',
+};
 
 void main(List<String> args) async {
   await build(args, (BuildInput input, BuildOutputBuilder output) async {
