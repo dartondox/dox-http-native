@@ -633,8 +633,11 @@ impl Core {
         let Some(conn) = self.close(idx) else { return };
         let key = conn.key;
         if let Some(req) = conn.req {
+            // `head`: the read buffer of a chunked answer is empty again
+            // after its head, so `filled` alone does not say "no answer byte"
             let again = conn.reused
                 && conn.filled == 0
+                && conn.head.is_none()
                 && req.flags & AGAIN != 0
                 && error == E_CLOSED
                 && self.room(&key);
@@ -847,9 +850,13 @@ impl Core {
         let status = head.status;
         let lines = std::mem::take(&mut head.lines);
         let key = c.key.clone();
+        // The server may answer before it has the whole request (eg. 401 or
+        // 413 for a big body). It then still waits for the other bytes, and
+        // would read the next request as those bytes.
+        let sent_all = c.sent == req.bytes.len() && c.tls.as_ref().is_none_or(|t| !t.wants_write());
         // bytes after the answer are not ours: do not use the connection
         // again
-        if head.keep && !eof && end == c.filled {
+        if head.keep && !eof && end == c.filled && sent_all {
             c.req = None;
             c.head = None;
             c.sent = 0;
@@ -1295,13 +1302,12 @@ pub unsafe extern "C" fn dox_client_run(
     if core.open == 0 && core.idle_timeout.is_some() && !core.conns.is_empty() {
         wake = !s.quiet.swap(true, Ordering::AcqRel);
     }
+    if wake {
+        // the helper starts its checks of the idle connections
+        *s.kick.lock().unwrap() = true;
+        s.cv.notify_one();
+    }
     match got {
-        Ok(n) if wake => {
-            drop(core);
-            *s.kick.lock().unwrap() = true;
-            s.cv.notify_one();
-            n as i64
-        }
         Ok(0) if core.open > 0 => {
             s.set_due(core.due);
             s.armed.store(true, Ordering::Release);

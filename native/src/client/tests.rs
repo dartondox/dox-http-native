@@ -908,3 +908,44 @@ fn https_a_whole_answer_before_a_failure_is_an_answer() {
     );
     assert!(core.conns.is_empty());
 }
+
+#[test]
+fn an_answer_before_the_whole_request_closes_the_connection() {
+    // the server answers when it has the head, and does not read the body
+    let (addr, _) = server(|mut s, _| {
+        if read_head(&mut s) {
+            let _ = s.write_all(b"HTTP/1.1 401 No\r\nContent-Length: 0\r\n\r\n");
+            thread::sleep(Duration::from_millis(500));
+        }
+    });
+    const SIZE: usize = 32 << 20;
+    let mut request =
+        format!("POST / HTTP/1.1\r\nhost: x\r\ncontent-length: {SIZE}\r\n\r\n").into_bytes();
+    request.extend(std::iter::repeat_n(7u8, SIZE));
+    let mut core = new_core(0, 0);
+    let a = run_until(&mut core, &record(1, addr, 0, 5000, &request), 1);
+    assert_eq!((a[0].status, a[0].error), (401, 0));
+    // the body did not go out whole: the connection is not kept
+    assert!(core.conns.is_empty());
+    assert!(core.hosts.is_empty());
+}
+
+#[test]
+fn a_request_with_an_answer_head_is_not_sent_again() {
+    // the first connection answers one request. For the next request it
+    // sends the head of a chunked answer and closes.
+    let (addr, count) = server(|mut s, n| {
+        if n == 0 && read_head(&mut s) {
+            let _ = s.write_all(HELLO);
+            if read_head(&mut s) {
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+                thread::sleep(Duration::from_millis(30));
+            }
+        }
+    });
+    let mut core = new_core(0, 0);
+    assert_eq!(run_until(&mut core, &get(1, addr), 1)[0].status, 200);
+    let a = run_until(&mut core, &get(2, addr), 1);
+    assert_eq!((a[0].status, a[0].error), (0, E_CLOSED));
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}

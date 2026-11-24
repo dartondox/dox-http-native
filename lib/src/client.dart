@@ -218,6 +218,9 @@ class DoxHttpClient implements Finalizable {
   /// The most host names with kept addresses before the old ones go.
   static const int _maxLookups = 256;
 
+  /// The most bytes of one request (head and body).
+  static const int _maxRequest = 0x7FFFFFFF;
+
   /// [microseconds] in milliseconds for Rust, not below 1 when it is not 0.
   static int _ceilMs(int microseconds) {
     if (microseconds <= 0) return 0;
@@ -403,9 +406,14 @@ class DoxHttpClient implements Finalizable {
     if (method == 'HEAD') flags |= _headOnly;
     if (tls) flags |= _tls;
     int wait = (timeout ?? this.timeout).inMicroseconds;
+    Uint8List request = _encode(method, url, headers, body, bodyBytes);
+    // the length of a request record is 32 bits
+    if (request.length > _maxRequest) {
+      throw ArgumentError('the request is too big (over 2 GiB)');
+    }
     _Pending pending = _Pending(
       url,
-      _encode(method, url, headers, body, bodyBytes),
+      request,
       flags,
       wait > 0 ? _clock.elapsedMicroseconds + wait : 0,
     );
@@ -503,6 +511,10 @@ class DoxHttpClient implements Finalizable {
     if (known == null || known.until <= now) {
       if (_lookups.length >= _maxLookups) {
         _lookups.removeWhere((String _, _Lookup old) => old.until <= now);
+        // all are in use: the oldest one goes
+        if (_lookups.length >= _maxLookups) {
+          _lookups.remove(_lookups.keys.first);
+        }
       }
       _Lookup fresh = _Lookup(now + _lookupTime.inMicroseconds);
       fresh.pending = InternetAddress.lookup(host)
