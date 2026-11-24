@@ -1,6 +1,6 @@
 name: dox_http_client
 description: Fast native HTTP client for Dart, with HTTP/1.1, HTTP/2, HTTPS and keep-alive. Rust owns the sockets and parses the answers through dart:ffi.
-version: 0.0.3
+version: 0.0.4
 repository: https://github.com/dartondox/dox-http-native
 homepage: https://dartondox.dev
 
@@ -15,6 +15,12 @@ dependencies:
   http: ^1.6.0
 
 dev_dependencies:
+  # the tests of the Dart team for clients of package:http
+  http_client_conformance_tests:
+    git:
+      url: https://github.com/dart-lang/http.git
+      path: pkgs/http_client_conformance_tests
+      ref: 8751f5c6ea6e29f6e259006091d3ad0bcbc64b3e
   http2: ^3.2.0
   lints: ^6.1.0
   test: ^1.33.0

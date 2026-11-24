@@ -1,3 +1,16 @@
+## 0.0.4
+
+- `DoxHttpPackageClient` now passes all tests of the Dart team for clients of `package:http` (`http_client_conformance_tests`), with each optional group on. The tests run in the CI of this package.
+- `DoxHttpClientResponse.reasonPhrase` and `DoxHttpClientStreamedResponse.reasonPhrase`: the reason phrase of the status line, like `OK`. It is null for an HTTP/2 answer. The adapter gives it as `reasonPhrase` of the response.
+- `maxRedirects` for one request: `send(..., maxRedirects: 2)` and `sendStreamed(..., maxRedirects: 2)`. The adapter uses `maxRedirects` of the request.
+- The client reads a header value that goes over more than one line (obs-fold). It gives the value as one line. Before, such an answer failed with `badResponse`.
+- Fix: a request body stream that the client did not start to read was not canceled when the request failed or was aborted. A `close()` of its sink did not complete.
+- Fix in `DoxHttpPackageClient`:
+  - A `StreamedRequest` with no bytes, for example a `GET`, went out with `transfer-encoding: chunked`. It goes out with no body now.
+  - A request after `close()` failed with a `StateError`. It fails with a `ClientException` now.
+  - The message of a request with too many redirects is `Redirect limit exceeded`, like the default client of `package:http`.
+- The ABI version of the native library does not change.
+
 ## 0.0.3
 
 - `DoxHttpClient.sendStreamed(abort: ...)` stops a request when the `abort` future completes. The client closes the connection of the request.

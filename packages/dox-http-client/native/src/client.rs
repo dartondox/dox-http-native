@@ -610,6 +610,28 @@ fn has_token(value: &[u8], token: &str) -> bool {
         .any(|t| t.trim_ascii().eq_ignore_ascii_case(token.as_bytes()))
 }
 
+/// Writes a header value to `out`. A value that goes over more than one
+/// line (obs-fold) becomes one line: each line break, with the spaces
+/// around it, is one space (RFC 9112, 5.2).
+fn unfold(value: &[u8], out: &mut Vec<u8>) {
+    if !value.contains(&b'\n') {
+        out.extend_from_slice(value);
+        return;
+    }
+    let mut first = true;
+    for part in value.split(|&c| c == b'\n') {
+        let part = part.trim_ascii();
+        if part.is_empty() {
+            continue;
+        }
+        if !first {
+            out.push(b' ');
+        }
+        first = false;
+        out.extend_from_slice(part);
+    }
+}
+
 /// Reads the head of an answer. None: it is not whole yet. Answers with a
 /// 1xx status (eg. 100 Continue) come before the real one and are dropped.
 fn parse_head(buf: &[u8], head_only: bool, max: usize) -> Result<Option<Head>, u16> {
@@ -617,7 +639,11 @@ fn parse_head(buf: &[u8], head_only: bool, max: usize) -> Result<Option<Head>, u
     loop {
         let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
         let mut res = httparse::Response::new(&mut headers);
-        let n = match res.parse(&buf[skip..]) {
+        // An old server can break a header value over lines (obs-fold). A
+        // client reads such a value, see [unfold].
+        let mut config = httparse::ParserConfig::default();
+        config.allow_obsolete_multiline_headers_in_responses(true);
+        let n = match config.parse_response(&mut res, &buf[skip..]) {
             Ok(httparse::Status::Complete(n)) => n,
             Ok(httparse::Status::Partial) => return Ok(None),
             Err(_) => return Err(E_BAD),
@@ -639,10 +665,17 @@ fn parse_head(buf: &[u8], head_only: bool, max: usize) -> Result<Option<Head>, u
         let mut coding = Coding::Raw;
         let mut codings = 0;
         let mut lines = Vec::with_capacity(n);
+        // The reason phrase is a line with no name. Dart reads it for
+        // `reasonPhrase` and does not take it for a header.
+        if let Some(reason) = res.reason.filter(|r| !r.is_empty() && !r.contains('\n')) {
+            lines.push(b':');
+            lines.extend_from_slice(reason.as_bytes());
+            lines.push(b'\n');
+        }
         for h in res.headers.iter() {
             lines.extend(h.name.bytes().map(|c| c.to_ascii_lowercase()));
             lines.push(b':');
-            lines.extend_from_slice(h.value);
+            unfold(h.value, &mut lines);
             lines.push(b'\n');
             if h.name.eq_ignore_ascii_case("content-length") {
                 let v = h.value.trim_ascii();

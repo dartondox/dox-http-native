@@ -86,6 +86,7 @@ The client sets the `host`, `content-length` and `accept-encoding` headers. A te
 
 ```dart
 res.statusCode; // 200
+res.reasonPhrase; // 'OK', or null (HTTP/2 has none)
 res.body; // the body as text (UTF-8)
 res.bodyBytes; // the body as bytes
 res.headers; // all headers, names in lower case
@@ -244,11 +245,11 @@ final http.Client client = DoxHttpPackageClient(client: native);
 
 `close` of the adapter closes the native client only when the adapter made it. Close your own `DoxHttpClient` yourself.
 
-These things are different from the default client of `package:http`:
+The adapter passes all tests of the Dart team for clients of `package:http` ([http_client_conformance_tests](https://github.com/dart-lang/http/tree/master/pkgs/http_client_conformance_tests)). These things are different from the default client of `package:http`:
 
 - A request with a body does not follow redirects. You get the redirect answer.
-- `maxRedirects` and `persistentConnection` of a request have no effect. Set `maxRedirects` on the `DoxHttpClient`.
-- An answer has no `reasonPhrase`.
+- `persistentConnection` of a request has no effect.
+- An HTTP/2 answer has no `reasonPhrase`.
 - A failure is a `DoxHttpPackageClientException`. It is a `ClientException` of `package:http` and also a `DoxHttpClientException`, so `failure` gives the cause.
 
 The adapter does a small quantity of more work for each request than a direct call. In code where speed is important, call `DoxHttpClient` directly.
