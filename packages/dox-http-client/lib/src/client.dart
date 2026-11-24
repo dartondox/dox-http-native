@@ -452,7 +452,11 @@ class _StreamPending extends _Pending {
       // The body was never read. Cancel it, so its source knows and a
       // `close()` of its sink completes.
       _started = true;
-      body.listen(null).cancel().ignore();
+      try {
+        body.listen(null).cancel().ignore();
+      } on Object {
+        // a stream that has a listener, or that can not get one
+      }
     }
   }
 

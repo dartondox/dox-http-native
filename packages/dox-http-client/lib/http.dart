@@ -92,16 +92,18 @@ class DoxHttpPackageClient extends http.BaseClient {
       // A stream with no length can be empty, like a GET that is sent as a
       // StreamedRequest. Wait for its first bytes: with none, the request
       // has no body.
+      // `rest` keeps the parts in their sequence until the native client
+      // listens to it.
       Completer<bool> first = Completer<bool>();
-      List<int> start = const <int>[];
       StreamController<List<int>> rest = StreamController<List<int>>();
-      late StreamSubscription<List<int>> sub;
+      StreamSubscription<List<int>>? sub;
       sub = body.listen(
         (List<int> part) {
-          if (first.isCompleted) return rest.add(part);
-          if (part.isEmpty) return;
-          start = part;
-          sub.pause();
+          if (part.isEmpty && !first.isCompleted) return;
+          rest.add(part);
+          if (first.isCompleted) return;
+          // null: the part came while `listen` ran, see below
+          sub?.pause();
           first.complete(true);
         },
         onError: (Object error, StackTrace trace) {
@@ -109,30 +111,33 @@ class DoxHttpPackageClient extends http.BaseClient {
           first.completeError(error, trace);
         },
         onDone: () {
-          if (first.isCompleted) {
-            rest.close();
-          } else {
-            first.complete(false);
-          }
+          rest.close();
+          if (!first.isCompleted) first.complete(false);
         },
       );
+      StreamSubscription<List<int>> source = sub;
+      if (first.isCompleted) source.pause();
       rest
-        ..onListen = () {
-          rest.add(start);
-          sub.resume();
-        }
-        ..onPause = sub.pause
-        ..onResume = sub.resume
-        ..onCancel = sub.cancel;
-      bool some = abort == null
-          ? await first.future
-          : await Future.any<bool>(<Future<bool>>[
-              first.future,
-              abort.then((_) => false),
-            ]);
+        ..onListen = source.resume
+        ..onPause = source.pause
+        ..onResume = source.resume
+        ..onCancel = source.cancel;
+      bool some;
+      try {
+        some = abort == null
+            ? await first.future
+            : await Future.any<bool>(<Future<bool>>[
+                first.future,
+                abort.then((_) => false),
+              ]);
+      } on Object {
+        // the body failed before its first bytes
+        source.cancel().ignore();
+        rethrow;
+      }
       if (aborted) {
         first.future.ignore();
-        sub.cancel().ignore();
+        source.cancel().ignore();
         throw http.RequestAbortedException(request.url);
       }
       if (some) {
@@ -155,6 +160,10 @@ class DoxHttpPackageClient extends http.BaseClient {
       );
     } on DoxHttpClientException catch (e) {
       throw _failure(e);
+    } on Object {
+      // eg. a URL that is not http: the body was not read
+      if (!empty) _drop(body);
+      rethrow;
     }
     String? size = res.headers['content-length'];
     return http.StreamedResponse(
@@ -192,8 +201,18 @@ class DoxHttpPackageClient extends http.BaseClient {
   /// [body] is canceled, so a `close()` of the sink of the request
   /// completes.
   static http.ClientException _aborted(Stream<List<int>> body, Uri url) {
-    body.listen(null).cancel().ignore();
+    _drop(body);
     return http.RequestAbortedException(url);
+  }
+
+  /// Cancels a request [body] that nobody reads, so a `close()` of the
+  /// sink of the request completes.
+  static void _drop(Stream<List<int>> body) {
+    try {
+      body.listen(null).cancel().ignore();
+    } on Object {
+      // it has a listener: that one ends it
+    }
   }
 
   @override

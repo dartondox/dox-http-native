@@ -158,6 +158,19 @@ fn head(text: &str) -> Result<Option<Head>, u16> {
 }
 
 #[test]
+fn head_with_folded_values_and_a_reason() {
+    let h = head("HTTP/1.1 404 Not Found\r\nX-A: one  \t \r\n \t two\r\n\tthree\r\nX-B: b\r\n\r\n")
+        .unwrap()
+        .unwrap();
+    assert_eq!(h.lines, b":Not Found\nx-a:one two three\nx-b:b\n");
+    // no reason phrase: no line for it
+    let h = head("HTTP/1.1 200\r\nX-A: 1\r\n\r\n").unwrap().unwrap();
+    assert_eq!(h.lines, b"x-a:1\n");
+    // a length must be on one line
+    assert!(head("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n 0\r\n\r\n").is_err());
+}
+
+#[test]
 fn head_with_a_length() {
     let h = head("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX-Name: A b\r\n\r\nhello")
         .unwrap()
