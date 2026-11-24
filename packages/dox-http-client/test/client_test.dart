@@ -1112,6 +1112,83 @@ void main() {
       expect(utf8.decode(await collect(res.body)), 'trickles');
     });
 
+    test('abort stops the request and closes the connection', () async {
+      // before the head: a server that reads and never answers
+      ServerSocket hung = await ServerSocket.bind('127.0.0.1', 0);
+      addTearDown(hung.close);
+      Completer<void> closed = Completer<void>();
+      hung.listen((Socket socket) {
+        socket.listen((List<int> _) {}, onDone: closed.complete);
+      });
+      Completer<void> abort = Completer<void>();
+      Future<DoxHttpClientStreamedResponse> pending = client.sendStreamed(
+        'GET',
+        Uri.parse('http://127.0.0.1:${hung.port}/'),
+        timeout: Duration.zero,
+        abort: abort.future,
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      abort.complete();
+      await expectLater(pending, failsWith(DoxHttpFailure.aborted));
+      await closed.future.timeout(const Duration(seconds: 5));
+
+      // in the body: an error event, then the stream closes
+      Completer<void> later = Completer<void>();
+      DoxHttpClientStreamedResponse res = await client.sendStreamed(
+        'GET',
+        base.resolve('/stream/3000000'),
+        abort: later.future,
+      );
+      int length = 0;
+      Object? error;
+      Completer<void> done = Completer<void>();
+      res.body.listen(
+        (Uint8List part) {
+          length += part.length;
+          if (!later.isCompleted) later.complete();
+        },
+        onError: (Object e) => error = e,
+        onDone: done.complete,
+      );
+      await done.future;
+      expect(length, lessThan(3000000));
+      expect(
+        (error! as DoxHttpClientException).failure,
+        DoxHttpFailure.aborted,
+      );
+
+      // after the end: nothing
+      Completer<void> late = Completer<void>();
+      DoxHttpClientStreamedResponse whole = await client.sendStreamed(
+        'GET',
+        base,
+        abort: late.future,
+      );
+      expect(utf8.decode(await collect(whole.body)), 'Hello World');
+      late.complete();
+      await Future<void>.delayed(Duration.zero);
+
+      // while the lookup runs: the request never goes out
+      Completer<List<InternetAddress>> found =
+          Completer<List<InternetAddress>>();
+      DoxHttpClient slow = DoxHttpClient(lookup: (String _) => found.future);
+      addTearDown(slow.close);
+      connections.clear();
+      Completer<void> early = Completer<void>();
+      Future<DoxHttpClientStreamedResponse> waits = slow.sendStreamed(
+        'GET',
+        Uri.parse('http://app.invalid:${server.port}/'),
+        abort: early.future,
+      );
+      early.complete();
+      await expectLater(waits, failsWith(DoxHttpFailure.aborted));
+      found.complete(<InternetAddress>[InternetAddress.loopbackIPv4]);
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      expect(connections, isEmpty);
+      // the client still works
+      expect((await client.get(base)).body, 'Hello World');
+    });
+
     test('bad arguments', () {
       expect(
         () => client.sendStreamed('GET', base, contentLength: 3),

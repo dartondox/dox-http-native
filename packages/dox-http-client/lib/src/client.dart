@@ -83,6 +83,10 @@ enum DoxHttpFailure {
   /// The body stream of [DoxHttpClient.sendStreamed] gave more or fewer
   /// bytes than its `contentLength`.
   badRequestBody,
+
+  /// The `abort` future of [DoxHttpClient.sendStreamed] completed before
+  /// the end of the answer.
+  aborted,
 }
 
 /// A request of a [DoxHttpClient] that got no answer.
@@ -283,6 +287,7 @@ class _StreamPending extends _Pending {
 
   @override
   void fail(Object error, StackTrace trace) {
+    if (finished) return;
     _stopUpload();
     if (!gotHead) {
       finished = true;
@@ -872,6 +877,12 @@ class DoxHttpClient implements Finalizable {
   /// follows: the stream can not be read again, so you get the redirect
   /// answer. The client sends a request with a [body] only once.
   ///
+  /// When [abort] completes, the request stops and the client closes its
+  /// connection. Before the head of the answer, the future fails with
+  /// [DoxHttpFailure.aborted]. After it, the body gets that failure as an
+  /// error event and closes. After the end of the body, [abort] does
+  /// nothing. [abort] must not complete with an error.
+  ///
   /// The future fails with a [DoxHttpClientException] when no head comes.
   Future<DoxHttpClientStreamedResponse> sendStreamed(
     String method,
@@ -881,6 +892,7 @@ class DoxHttpClient implements Finalizable {
     int? contentLength,
     Duration? timeout,
     bool? followRedirects,
+    Future<void>? abort,
   }) {
     if (body == null && contentLength != null) {
       throw ArgumentError.value(contentLength, 'contentLength', 'needs a body');
@@ -898,11 +910,12 @@ class DoxHttpClient implements Finalizable {
       contentLength,
       deadline,
       wait > 0 ? wait : 0,
+      abort,
     );
     if (body != null || !(followRedirects ?? this.followRedirects)) {
       return first;
     }
-    return _followStreamed(first, method, headers, deadline);
+    return _followStreamed(first, method, headers, deadline, abort);
   }
 
   /// Gives the answer of [first], or of the address its redirects go to.
@@ -934,6 +947,7 @@ class DoxHttpClient implements Finalizable {
     String method,
     Map<String, String>? headers,
     int deadline,
+    Future<void>? abort,
   ) async {
     DoxHttpClientStreamedResponse res = await first;
     for (int hop = 0; ; hop++) {
@@ -956,6 +970,7 @@ class DoxHttpClient implements Finalizable {
         null,
         deadline,
         0,
+        abort,
       );
     }
   }
@@ -1099,6 +1114,7 @@ class DoxHttpClient implements Finalizable {
     int? contentLength,
     int deadline,
     int wait,
+    Future<void>? abort,
   ) {
     if (_closed) throw StateError('the client is closed');
     bool tls = url.scheme == 'https';
@@ -1149,6 +1165,13 @@ class DoxHttpClient implements Finalizable {
     );
     if (body != null) pending.uploadWait = wait;
     _start(pending);
+    // Rust forgets the request and closes its connection
+    abort?.then(
+      (_) => pending._uploadFailed(
+        DoxHttpClientException(DoxHttpFailure.aborted, url),
+        StackTrace.current,
+      ),
+    );
     return pending.head.future;
   }
 
@@ -1400,6 +1423,8 @@ class DoxHttpClient implements Finalizable {
 
   /// Writes the request record of [pending] for the next [_run].
   void _submit(_Pending pending) {
+    // aborted while the lookup ran
+    if (pending is _StreamPending && pending.finished) return;
     if (pending.index >= pending.addresses.length) {
       return _fail(pending, DoxHttpFailure.lookupFailed);
     }

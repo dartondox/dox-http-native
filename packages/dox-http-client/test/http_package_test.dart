@@ -183,6 +183,29 @@ void main() {
     expect((await client.get(base)).body, 'Hello World');
   });
 
+  test('abort before the head closes the connection', () async {
+    // accepts, reads the request, never answers
+    ServerSocket hung = await ServerSocket.bind('127.0.0.1', 0);
+    addTearDown(hung.close);
+    Completer<void> closed = Completer<void>();
+    hung.listen((Socket socket) {
+      socket.listen((List<int> _) {}, onDone: closed.complete);
+    });
+    Completer<void> abort = Completer<void>();
+    Future<http.StreamedResponse> aborted = client.send(
+      http.AbortableRequest(
+        'POST',
+        Uri.parse('http://127.0.0.1:${hung.port}/'),
+        abortTrigger: abort.future,
+      )..body = 'page',
+    );
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+    abort.complete();
+    await expectLater(aborted, throwsA(isA<http.RequestAbortedException>()));
+    // the client has no timeout: only the abort closes the socket
+    await closed.future.timeout(const Duration(seconds: 5));
+  });
+
   test('a trigger that is complete sends no request', () async {
     await expectLater(
       client.send(

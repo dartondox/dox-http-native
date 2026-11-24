@@ -3,6 +3,7 @@
 library;
 
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
 
@@ -80,48 +81,31 @@ class DoxHttpPackageClient extends http.BaseClient {
     if (empty) body.drain<void>().ignore();
     DoxHttpClientStreamedResponse res;
     try {
-      Future<DoxHttpClientStreamedResponse> pending = _client.sendStreamed(
+      res = await _client.sendStreamed(
         request.method,
         request.url,
         headers: headers,
-        // an abort stops the upload: the request then fails with it
-        body: empty
-            ? null
-            : abort == null
-            ? body
-            : _body(body, abort, request.url),
+        body: empty ? null : body,
         contentLength: empty ? null : length,
         followRedirects: request.followRedirects,
+        abort: abort,
       );
-      if (abort == null) {
-        res = await pending;
-      } else {
-        DoxHttpClientStreamedResponse? first =
-            await Future.any<DoxHttpClientStreamedResponse?>(
-              <Future<DoxHttpClientStreamedResponse?>>[
-                pending,
-                abort.then((_) => null),
-              ],
-            );
-        if (first == null) {
-          // nobody reads the answer: give its connection back
-          unawaited(
-            pending.then<void>(
-              (DoxHttpClientStreamedResponse late) =>
-                  late.body.listen(null).cancel(),
-              onError: (Object _) {},
-            ),
-          );
-          throw http.RequestAbortedException(request.url);
-        }
-        res = first;
-      }
     } on DoxHttpClientException catch (e) {
-      throw DoxHttpPackageClientException(e.failure, e.url);
+      throw _failure(e);
     }
     String? size = res.headers['content-length'];
     return http.StreamedResponse(
-      _body(res.body, abort, request.url),
+      res.body.transform(
+        StreamTransformer<Uint8List, List<int>>.fromHandlers(
+          handleError:
+              (Object error, StackTrace trace, EventSink<List<int>> sink) {
+                sink.addError(
+                  error is DoxHttpClientException ? _failure(error) : error,
+                  trace,
+                );
+              },
+        ),
+      ),
       res.statusCode,
       contentLength: size == null ? null : int.tryParse(size),
       request: request,
@@ -132,53 +116,12 @@ class DoxHttpPackageClient extends http.BaseClient {
     );
   }
 
-  /// [source] with its failures as [DoxHttpPackageClientException]. When
-  /// [abort] completes before the end, the stream gets a
-  /// `RequestAbortedException` and closes, and [source] is canceled.
-  Stream<List<int>> _body(
-    Stream<List<int>> source,
-    Future<void>? abort,
-    Uri url,
-  ) {
-    StreamSubscription<List<int>>? sub;
-    bool over = false;
-    late StreamController<List<int>> out;
-    out = StreamController<List<int>>(
-      sync: true,
-      onListen: () {
-        if (over) return;
-        sub = source.listen(
-          out.add,
-          onError: (Object error, StackTrace trace) {
-            out.addError(
-              error is DoxHttpClientException
-                  ? DoxHttpPackageClientException(error.failure, error.url)
-                  : error,
-              trace,
-            );
-          },
-          onDone: () {
-            over = true;
-            out.close();
-          },
-        );
-      },
-      onPause: () => sub?.pause(),
-      onResume: () => sub?.resume(),
-      onCancel: () {
-        over = true;
-        return sub?.cancel();
-      },
-    );
-    abort?.then((_) {
-      if (over) return;
-      over = true;
-      // a body that nobody listens to yet is canceled too
-      unawaited((sub ?? source.listen(null)).cancel());
-      out.addError(http.RequestAbortedException(url));
-      out.close();
-    });
-    return out.stream;
+  /// The failure for `package:http`. An abort is its
+  /// `RequestAbortedException`.
+  static http.ClientException _failure(DoxHttpClientException e) {
+    return e.failure == DoxHttpFailure.aborted
+        ? http.RequestAbortedException(e.url)
+        : DoxHttpPackageClientException(e.failure, e.url);
   }
 
   @override

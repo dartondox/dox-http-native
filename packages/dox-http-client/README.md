@@ -110,6 +110,7 @@ When no answer comes, the future fails with a `DoxHttpClientException`. Its `fai
 | `tlsFailed` | TLS failed. For example, the certificate is not trusted or is for a different host name. |
 | `clientClosed` | `close()` ran before the answer came. |
 | `tooManyRedirects` | The request got more redirects than `maxRedirects`. |
+| `aborted` | The `abort` future of `sendStreamed` completed before the end of the answer. |
 | `badRequestBody` | The body stream of `sendStreamed` gave more or fewer bytes than `contentLength`. |
 
 ## Redirects
@@ -195,6 +196,22 @@ The rules:
 - The server can answer before the whole `body` went out, for example with 401 or 413. The client cancels the `body` subscription and gives you that answer. The connection is not used again. This also applies to an answer with status 200: the client does not send a body and read the answer body at the same time.
 - The headers `content-length` and `transfer-encoding` are not allowed. Use `contentLength`.
 - `close()` fails open streams with `clientClosed`.
+
+To stop a request, give an `abort` future. When it completes, the client closes the connection of the request:
+
+```dart
+Completer<void> abort = Completer<void>();
+Future<DoxHttpClientStreamedResponse> pending = client.sendStreamed(
+  'GET',
+  Uri.parse('https://example.com/events'),
+  abort: abort.future,
+);
+abort.complete();
+```
+
+- Before the head of the answer, the request fails with `aborted`.
+- After the head, the body gets that failure as an error event. Then the body closes.
+- After the end of the body, `abort` does nothing.
 
 ## Use it with package:http
 
