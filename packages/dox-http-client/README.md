@@ -79,7 +79,7 @@ For other methods, use `send`:
 await client.send('OPTIONS', Uri.parse('http://127.0.0.1:8080/users'));
 ```
 
-The client sets the `host` and `content-length` headers. A text body with no `content-type` header goes out as `text/plain; charset=utf-8`.
+The client sets the `host`, `content-length` and `accept-encoding` headers. A text body with no `content-type` header goes out as `text/plain; charset=utf-8`.
 
 ## Read the answer
 
@@ -127,6 +127,21 @@ To get the redirect answer, set `followRedirects` to `false` for the client or f
 ```dart
 DoxHttpClient client = DoxHttpClient(followRedirects: false);
 await client.send('GET', url, followRedirects: false);
+```
+
+## Compressed bodies
+
+The client sends `accept-encoding: gzip, br` with each request. When the answer body is gzip or brotli, the client decodes it in Rust. You get the decoded body in `res.body` and `res.bodyBytes`.
+
+- A decoded answer has no `content-encoding` header and no `content-length` header. These headers are for the compressed body.
+- `maxResponseSize` is the limit for the decoded body. Thus a small compressed body can not fill the memory.
+- A compressed body that is not correct fails the request with `badResponse`.
+- A body with a different encoding, for example `zstd`, stays as the server sent it.
+
+To get the body as the server sent it, set your own `accept-encoding` header:
+
+```dart
+await client.get(url, headers: <String, String>{'accept-encoding': 'identity'});
 ```
 
 ## Timeout
@@ -178,7 +193,6 @@ Call `close()` when the client is not necessary any more. If you do not, the con
 ## What the client does not do
 
 - It speaks HTTP/1.1 only.
-- It does not ask for a compressed body and does not decompress one.
 - It keeps each request body and each answer body in memory. It has no streamed bodies.
 - It sends a request again only when a kept connection closed before an answer byte came, and only for `GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS` and `TRACE`.
 
@@ -186,7 +200,7 @@ Call `close()` when the client is not necessary any more. If you do not, the con
 
 The fuzz target is in `native/fuzz/`. CI runs it for 60 seconds when `native/` changes.
 
-- `client_response`: random bytes as the answer of a server. The parser must not panic. A chunked body must give the same result in one piece and byte by byte.
+- `client_response`: random bytes as the answer of a server. The parser and the gzip and brotli decoders must not panic. A chunked body must give the same result in one piece and byte by byte.
 
 To run it on your computer:
 

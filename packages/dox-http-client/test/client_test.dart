@@ -42,6 +42,7 @@ Future<void> handle(HttpRequest req) async {
             'type': req.headers.value('content-type'),
             'length': req.headers.value('content-length'),
             'x-name': req.headers.value('x-name'),
+            'accept-encoding': req.headers.value('accept-encoding'),
             'body': utf8.decode(body),
           }),
         );
@@ -62,6 +63,9 @@ Future<void> handle(HttpRequest req) async {
         res.add(Uint8List(3 << 20)..fillRange(0, 3 << 20, 120));
       case 'status':
         res.statusCode = int.parse(path[1]);
+      case 'gzip':
+        res.headers.set('content-encoding', 'gzip');
+        res.add(gzip.encode(utf8.encode('zipped text ' * 1000)));
       case 'redirect':
         redirectAuth.add(req.headers.value('authorization'));
         res.statusCode = int.parse(path[1]);
@@ -469,6 +473,44 @@ void main() {
         ),
         failsWith(DoxHttpFailure.timeout),
       );
+    });
+  });
+
+  group('compressed bodies', () {
+    test('a gzip body comes decoded', () async {
+      DoxHttpClientResponse res = await client.get(base.resolve('/gzip'));
+      expect(res.body, 'zipped text ' * 1000);
+      expect(res.header('content-encoding'), isNull);
+      expect(res.header('content-length'), isNull);
+      res = await client.get(base.resolve('/echo'));
+      expect(
+        (jsonDecode(res.body) as Map<String, Object?>)['accept-encoding'],
+        'gzip, br',
+      );
+    });
+
+    test(
+      'an accept-encoding header of the request gives the raw body',
+      () async {
+        DoxHttpClientResponse res = await client.get(
+          base.resolve('/gzip'),
+          headers: <String, String>{'Accept-Encoding': 'gzip'},
+        );
+        expect(res.header('content-encoding'), 'gzip');
+        expect(utf8.decode(gzip.decode(res.bodyBytes)), 'zipped text ' * 1000);
+      },
+    );
+
+    test('maxResponseSize is for the decoded body', () async {
+      DoxHttpClient small = DoxHttpClient(maxResponseSize: 11999);
+      addTearDown(small.close);
+      await expectLater(
+        small.get(base.resolve('/gzip')),
+        failsWith(DoxHttpFailure.responseTooBig),
+      );
+      DoxHttpClient enough = DoxHttpClient(maxResponseSize: 12000);
+      addTearDown(enough.close);
+      expect((await enough.get(base.resolve('/gzip'))).bodyBytes.length, 12000);
     });
   });
 
