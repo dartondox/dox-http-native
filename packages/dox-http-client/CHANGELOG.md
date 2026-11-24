@@ -1,3 +1,12 @@
+## Unreleased
+
+- The client follows redirects (status 301, 302, 303, 307 and 308). One request follows a maximum of 5 redirects, then it fails with the new `DoxHttpFailure.tooManyRedirects`.
+  - `followRedirects` (for the client or for one `send` call) and `maxRedirects` change this.
+  - A 303 redirect changes the method to `GET`. A 301 or 302 redirect changes `POST` to `GET`. A 307 or 308 redirect keeps the method and the body.
+  - The `authorization`, `cookie`, `proxy-authorization` and `host` headers do not go to a different server.
+  - The timeout of a request includes its redirects.
+- `DoxHttpClientResponse.url` is the URL that gave the answer.
+
 ## 0.0.1
 
 - First version. `DoxHttpClient` is an HTTP client for calls to other servers. Rust owns the sockets and reads the answers on the thread of the isolate.

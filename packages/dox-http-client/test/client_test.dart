@@ -13,7 +13,11 @@ final Set<int> connections = <int>{};
 int busy = 0;
 int mostBusy = 0;
 
-/// test app: `/` hello, `/echo` the request back as json, `/chunked` a
+/// What `/redirect` got in its `authorization` header, per request.
+final List<String?> redirectAuth = <String?>[];
+
+/// test app: `/redirect/N?to=URL` answers status N with that location,
+/// `/` hello, `/echo` the request back as json, `/chunked` a
 /// body with no length, `/slow` waits, `/big` many bytes, `/status/N`.
 Future<void> handle(HttpRequest req) async {
   connections.add(req.connectionInfo!.remotePort);
@@ -58,6 +62,11 @@ Future<void> handle(HttpRequest req) async {
         res.add(Uint8List(3 << 20)..fillRange(0, 3 << 20, 120));
       case 'status':
         res.statusCode = int.parse(path[1]);
+      case 'redirect':
+        redirectAuth.add(req.headers.value('authorization'));
+        res.statusCode = int.parse(path[1]);
+        String? to = req.uri.queryParameters['to'];
+        if (to != null) res.headers.set('location', to);
       default:
         res.statusCode = 404;
     }
@@ -316,6 +325,151 @@ void main() {
       client.get(Uri.parse('http://127.0.0.1:$port/')),
       failsWith(DoxHttpFailure.connectionFailed),
     );
+  });
+
+  group('redirects', () {
+    Uri redirect(int status, String to) {
+      return base.replace(
+        path: '/redirect/$status',
+        queryParameters: <String, String>{'to': to},
+      );
+    }
+
+    Map<String, Object?> echo(DoxHttpClientResponse res) {
+      return jsonDecode(res.body) as Map<String, Object?>;
+    }
+
+    test('get goes to the new address, also a relative one', () async {
+      for (int status in <int>[301, 302, 303, 307, 308]) {
+        DoxHttpClientResponse res = await client.get(
+          redirect(status, '/echo?a=1'),
+        );
+        expect(res.statusCode, 200, reason: '$status');
+        expect(res.url, base.resolve('/echo?a=1'));
+        expect(echo(res)['method'], 'GET');
+      }
+      DoxHttpClientResponse res = await client.get(
+        redirect(302, redirect(302, '$base/').toString()),
+      );
+      expect(res.body, 'Hello World');
+    });
+
+    test('307 and 308 keep the method and the body', () async {
+      for (int status in <int>[307, 308]) {
+        DoxHttpClientResponse res = await client.post(
+          redirect(status, '/echo'),
+          headers: <String, String>{'Content-Type': 'application/json'},
+          body: '{"a":1}',
+        );
+        Map<String, Object?> got = echo(res);
+        expect(got['method'], 'POST');
+        expect(got['body'], '{"a":1}');
+        expect(got['type'], 'application/json');
+      }
+    });
+
+    test('301, 302 and 303 change POST to GET with no body', () async {
+      for (int status in <int>[301, 302, 303]) {
+        DoxHttpClientResponse res = await client.post(
+          redirect(status, '/echo'),
+          headers: <String, String>{'Content-Type': 'application/json'},
+          body: '{"a":1}',
+        );
+        Map<String, Object?> got = echo(res);
+        expect(got['method'], 'GET', reason: '$status');
+        expect(got['body'], '');
+        expect(got['type'], isNull);
+        expect(got['length'], isNull);
+      }
+      // PUT stays PUT for 301 and 302, and becomes GET for 303
+      DoxHttpClientResponse res = await client.put(
+        redirect(302, '/echo'),
+        body: 'x',
+      );
+      expect(echo(res)['method'], 'PUT');
+      res = await client.put(redirect(303, '/echo'), body: 'x');
+      expect(echo(res)['method'], 'GET');
+    });
+
+    test('authorization stays on one server only', () async {
+      HttpServer other = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      other.listen(handle);
+      addTearDown(() => other.close(force: true));
+      Map<String, String> headers = <String, String>{
+        'Authorization': 'secret',
+        'x-name': 'kept',
+      };
+      redirectAuth.clear();
+      await client.get(
+        redirect(302, redirect(200, '').toString()),
+        headers: headers,
+      );
+      expect(redirectAuth, <String?>['secret', 'secret']);
+
+      redirectAuth.clear();
+      Uri there = Uri.parse('http://127.0.0.1:${other.port}');
+      await client.get(
+        redirect(302, '$there/redirect/302?to=/echo'),
+        headers: headers,
+      );
+      expect(redirectAuth, <String?>['secret', null]);
+      DoxHttpClientResponse res = await client.get(
+        redirect(302, '$there/echo'),
+        headers: headers,
+      );
+      expect(echo(res)['x-name'], 'kept');
+      expect(echo(res)['host'], '127.0.0.1:${other.port}');
+    });
+
+    test('too many redirects fail', () async {
+      Uri loop = base.replace(path: '/redirect/302');
+      loop = loop.replace(queryParameters: <String, String>{'to': '$loop'});
+      // the answer redirects to a URL with no `to`, which is no redirect
+      DoxHttpClientResponse res = await client.get(loop);
+      expect(res.statusCode, 302);
+      expect(res.header('location'), isNull);
+
+      Uri chain = base.resolve('/');
+      for (int i = 0; i < 6; i++) {
+        chain = redirect(302, chain.toString());
+      }
+      await expectLater(
+        client.get(chain),
+        failsWith(DoxHttpFailure.tooManyRedirects),
+      );
+      DoxHttpClient more = DoxHttpClient(maxRedirects: 6);
+      addTearDown(more.close);
+      expect((await more.get(chain)).body, 'Hello World');
+    });
+
+    test('followRedirects false gives the redirect answer', () async {
+      DoxHttpClientResponse res = await client.send(
+        'GET',
+        redirect(302, '/echo'),
+        followRedirects: false,
+      );
+      expect(res.statusCode, 302);
+      expect(res.header('location'), '/echo');
+      DoxHttpClient plain = DoxHttpClient(followRedirects: false);
+      addTearDown(plain.close);
+      expect((await plain.get(redirect(301, '/echo'))).statusCode, 301);
+      // a location that is not http stays an answer
+      res = await client.get(redirect(302, 'ftp://example.com/x'));
+      expect(res.statusCode, 302);
+      // an empty location is not the same address again
+      res = await client.get(redirect(302, ''));
+      expect(res.statusCode, 302);
+    });
+
+    test('the timeout includes the redirects', () async {
+      await expectLater(
+        client.get(
+          redirect(302, '/slow'),
+          timeout: const Duration(milliseconds: 100),
+        ),
+        failsWith(DoxHttpFailure.timeout),
+      );
+    });
   });
 
   test('a host name with no address fails', () async {

@@ -89,6 +89,7 @@ res.body; // the body as text (UTF-8)
 res.bodyBytes; // the body as bytes
 res.headers; // all headers, names in lower case
 res.header('Content-Type'); // one header, or null
+res.url; // the URL that gave this answer
 ```
 
 An answer with an error status, for example 404 or 500, is an answer and not an exception.
@@ -107,10 +108,30 @@ When no answer comes, the future fails with a `DoxHttpClientException`. Its `fai
 | `responseTooBig` | The body is larger than `maxResponseSize`. |
 | `tlsFailed` | TLS failed. For example, the certificate is not trusted or is for a different host name. |
 | `clientClosed` | `close()` ran before the answer came. |
+| `tooManyRedirects` | The request got more redirects than `maxRedirects`. |
+
+## Redirects
+
+A redirect is an answer with status 301, 302, 303, 307 or 308 and a `location` header. The client sends the request to the new address and gives you the last answer. `res.url` is the URL that gave this answer.
+
+- A 307 or 308 redirect keeps the method and the body.
+- A 303 redirect changes the method to `GET` and removes the body. `GET` and `HEAD` do not change.
+- A 301 or 302 redirect changes `POST` to `GET` and removes the body.
+- If the new address is a different server, the client does not send the `authorization`, `cookie`, `proxy-authorization` and `host` headers of the request. A different scheme, host name or port is a different server.
+- All other headers go to the new address, and a 307 or 308 redirect also sends the body there. If a request has a secret in a different header, set `followRedirects` to `false`.
+
+One request follows a maximum of 5 redirects. Then it fails with `tooManyRedirects`. Change the maximum with `maxRedirects`.
+
+To get the redirect answer, set `followRedirects` to `false` for the client or for one `send` call:
+
+```dart
+DoxHttpClient client = DoxHttpClient(followRedirects: false);
+await client.send('GET', url, followRedirects: false);
+```
 
 ## Timeout
 
-A request fails when its full answer does not come in 30 seconds. Change this for the client or for one request. `Duration.zero` is no timeout:
+A request fails when its full answer does not come in 30 seconds. The timeout includes the redirects. Change this for the client or for one request. `Duration.zero` is no timeout:
 
 ```dart
 DoxHttpClient client = DoxHttpClient(
@@ -157,7 +178,6 @@ Call `close()` when the client is not necessary any more. If you do not, the con
 ## What the client does not do
 
 - It speaks HTTP/1.1 only.
-- It does not go to the new address of a redirect (a `301` or `302` answer). You get the answer with its `location` header.
 - It does not ask for a compressed body and does not decompress one.
 - It keeps each request body and each answer body in memory. It has no streamed bodies.
 - It sends a request again only when a kept connection closed before an answer byte came, and only for `GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS` and `TRACE`.
