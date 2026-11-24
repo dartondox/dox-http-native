@@ -148,7 +148,10 @@ jobs:
             exit 0
           fi
           git stash
-          git checkout main
+          # the newest main: the release of the other package can push its
+          # hashes while this job runs
+          git fetch origin main
+          git checkout -B main origin/main
           git stash pop
           # a rerun of the same tag: main has these hashes already
           if git diff --quiet; then
@@ -156,4 +159,12 @@ jobs:
             exit 0
           fi
           git commit -am "Hashes of the $GITHUB_REF_NAME libraries"
-          git push origin main
+          # main moved after the fetch: put the commit on top and try again
+          for try in 1 2 3; do
+            if git push origin main; then
+              exit 0
+            fi
+            git pull --rebase origin main
+          done
+          echo "::error::could not push the hashes to main"
+          exit 1
