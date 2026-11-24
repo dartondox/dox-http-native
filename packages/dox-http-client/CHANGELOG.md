@@ -1,3 +1,9 @@
+## Unreleased
+
+- `DoxHttpClient.sendStreamed(abort: ...)` stops a request when the `abort` future completes. The client closes the connection of the request.
+  - Before the head of the answer, the request fails with the new `DoxHttpFailure.aborted`. After it, the body gets that failure as an error event.
+- Fix: `DoxHttpPackageClient` did not close the connection when the `abortTrigger` of a request completed before the head of the answer. The connection stayed open until the server answered. It closes now.
+
 ## 0.0.2
 
 - `DoxHttpClient(lookup: ...)` gives the addresses of a host name to the client. The client connects only to these addresses. Use it to refuse addresses, for example those of your own network when a user gives the URL.
