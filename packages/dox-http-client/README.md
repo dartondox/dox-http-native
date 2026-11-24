@@ -196,6 +196,47 @@ The rules:
 - The headers `content-length` and `transfer-encoding` are not allowed. Use `contentLength`.
 - `close()` fails open streams with `clientClosed`.
 
+## Use it with package:http
+
+Some packages take a `Client` of [package:http](https://pub.dev/packages/http). `DoxHttpPackageClient` is such a client. It sends each request through a `DoxHttpClient`:
+
+```dart
+import 'package:dox_http_client/http.dart';
+import 'package:http/http.dart' as http;
+
+final http.Client client = DoxHttpPackageClient();
+
+Future<String> rates() async {
+  http.Response res = await client.get(
+    Uri.parse('https://api.example.com/rates'),
+  );
+  return res.body;
+}
+```
+
+`Request`, `StreamedRequest`, `MultipartRequest` and `AbortableRequest` work. The answer body is a stream, so a large download does not fill the memory.
+
+To set the options of the native client, give your own `DoxHttpClient`:
+
+```dart
+final DoxHttpClient native = DoxHttpClient(
+  timeout: const Duration(seconds: 10),
+);
+final http.Client client = DoxHttpPackageClient(client: native);
+```
+
+`close` of the adapter closes the native client only when the adapter made it. Close your own `DoxHttpClient` yourself.
+
+These things are different from the default client of `package:http`:
+
+- A request fails when the head of the answer does not come in the timeout of the `DoxHttpClient`. The default is 30 seconds.
+- A request with a body does not follow redirects. You get the redirect answer.
+- `maxRedirects` and `persistentConnection` of a request have no effect. Set `maxRedirects` on the `DoxHttpClient`.
+- An answer has no `reasonPhrase`.
+- A failure is a `DoxHttpPackageClientException`. It is a `ClientException` of `package:http` and also a `DoxHttpClientException`, so `failure` gives the cause.
+
+The adapter does a small quantity of more work for each request than a direct call. In code where speed is important, call `DoxHttpClient` directly.
+
 ## Send a request again
 
 With HTTP/1.1, the client sends a request again one time when a kept connection closed before an answer byte came. It does this only for `GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS` and `TRACE`, and not for a request with a body stream. The rules for HTTP/2 are in the next section.
