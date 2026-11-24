@@ -8,6 +8,8 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
+brotli-decompressor = "6.3.2"
+flate2 = "1.1.11"
 httparse = "1.10.1"
 mio = { version = "1.2.4", features = ["os-poll", "net"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

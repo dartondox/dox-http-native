@@ -1068,3 +1068,149 @@ fn an_answer_and_a_close_before_the_whole_request_is_an_answer() {
     assert_eq!((a[0].status, a[0].error), (413, 0));
     assert!(core.conns.is_empty());
 }
+
+fn gzip(data: &[u8]) -> Vec<u8> {
+    let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    e.write_all(data).unwrap();
+    e.finish().unwrap()
+}
+
+/// "Hello Hello Hello Hello" as brotli (`brotli -c`).
+const BROTLI: &[u8] = &[
+    0x1f, 0x16, 0x00, 0xf8, 0x8d, 0xd4, 0x4e, 0xf5, 0xd4, 0xa2, 0x4a, 0x36, 0xa4, 0xb7, 0x02, 0x29,
+    0x0b, 0x79, 0xe2, 0x00, 0x97, 0x01,
+];
+
+/// Sends one GET with `flags` to a server that gives `answer`.
+fn one(flags: u8, max_body: usize, answer: Vec<u8>) -> Answer {
+    let answer: &'static [u8] = answer.leak();
+    let (addr, _) = keep_alive(answer);
+    let mut core = new_core(0, max_body);
+    let req = record(1, addr, flags, 5000, b"GET / HTTP/1.1\r\nhost: x\r\n\r\n");
+    run_until(&mut core, &req, 1).remove(0)
+}
+
+fn coded(coding: &str, body: &[u8]) -> Vec<u8> {
+    let mut a = format!(
+        "HTTP/1.1 200 OK\r\nContent-Encoding: {coding}\r\nx-a: 1\r\ncontent-length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    a.extend_from_slice(body);
+    a
+}
+
+#[test]
+fn decode_reads_brotli_test_bytes() {
+    assert_eq!(
+        decode(Coding::Brotli, BROTLI, 100).unwrap(),
+        b"Hello Hello Hello Hello"
+    );
+}
+
+#[test]
+fn a_gzip_body_is_decoded() {
+    let text = b"hello hello hello hello".repeat(100);
+    let a = one(DECODE, 0, coded("gzip", &gzip(&text)));
+    assert_eq!(a.status, 200);
+    assert_eq!(a.body, text);
+    assert_eq!(a.lines, "x-a:1\n");
+    // two members are one body
+    let mut two = gzip(b"one ");
+    two.extend(gzip(b"two"));
+    assert_eq!(one(DECODE, 0, coded("x-gzip", &two)).body, b"one two");
+    // padding after the last member is dropped
+    two.extend_from_slice(&[0, 0, 0, b'\n']);
+    assert_eq!(one(DECODE, 0, coded("gzip", &two)).body, b"one two");
+    // a second member that is cut is a bad body
+    let mut cut = gzip(b"one ");
+    cut.extend_from_slice(&gzip(b"two")[..12]);
+    assert_eq!(one(DECODE, 0, coded("gzip", &cut)).error, E_BAD);
+}
+
+#[test]
+fn a_brotli_body_is_decoded() {
+    let a = one(DECODE, 0, coded("BR", BROTLI));
+    assert_eq!(a.body, b"Hello Hello Hello Hello");
+    assert_eq!(a.lines, "x-a:1\n");
+}
+
+#[test]
+fn a_chunked_gzip_body_is_decoded() {
+    let z = gzip(b"chunked text");
+    let (x, y) = z.split_at(5);
+    let mut a =
+        b"HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\ntransfer-encoding: chunked\r\n\r\n5\r\n"
+            .to_vec();
+    a.extend_from_slice(x);
+    a.extend(format!("\r\n{:x}\r\n", y.len()).bytes());
+    a.extend_from_slice(y);
+    a.extend_from_slice(b"\r\n0\r\n\r\n");
+    let got = one(DECODE, 0, a);
+    assert_eq!(got.body, b"chunked text");
+    assert_eq!(got.lines, "transfer-encoding:chunked\n");
+}
+
+#[test]
+fn a_body_stays_coded_without_the_flag_or_with_other_codings() {
+    let z = gzip(b"text");
+    let a = one(0, 0, coded("gzip", &z));
+    assert_eq!(a.body, z);
+    assert!(a.lines.contains("content-encoding:gzip\n"));
+    for coding in ["zstd", "gzip, br", "identity"] {
+        let a = one(DECODE, 0, coded(coding, &z));
+        assert_eq!(a.body, z, "{coding}");
+        assert!(a.lines.contains("content-encoding"), "{coding}");
+    }
+    // an empty body is not gzip
+    let a = one(DECODE, 0, coded("gzip", b""));
+    assert_eq!((a.status, a.body.len()), (200, 0));
+    assert!(a.lines.contains("content-encoding"));
+}
+
+#[test]
+fn a_bad_coded_body_fails_and_the_next_request_works() {
+    let mut bad = coded("gzip", b"this is not gzip");
+    bad.extend(coded("gzip", &gzip(b"good")));
+    let bad: &'static [u8] = bad.leak();
+    // the server gives the 2 answers one after the other on one connection
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        let half = coded("gzip", b"this is not gzip").len();
+        assert!(read_head(&mut s));
+        s.write_all(&bad[..half]).unwrap();
+        assert!(read_head(&mut s));
+        s.write_all(&bad[half..]).unwrap();
+        thread::sleep(Duration::from_millis(200));
+    });
+    let mut core = new_core(0, 0);
+    let req = |id| record(id, addr, DECODE, 5000, b"GET / HTTP/1.1\r\nhost: x\r\n\r\n");
+    let a = run_until(&mut core, &req(1), 1).remove(0);
+    assert_eq!((a.status, a.error), (0, E_BAD));
+    let a = run_until(&mut core, &req(2), 1).remove(0);
+    assert_eq!(a.body, b"good");
+    // a redirect with a bad body keeps it: only its location is of use
+    let moved = b"HTTP/1.1 302 Found\r\nlocation: /x\r\ncontent-encoding: gzip\r\ncontent-length: 5\r\n\r\nmoved";
+    let a = one(DECODE, 0, moved.to_vec());
+    assert_eq!((a.status, a.body.as_slice()), (302, &b"moved"[..]));
+    assert!(a.lines.contains("content-encoding:gzip\n"));
+    // a cut gzip body is bad too
+    let z = gzip(&b"long text ".repeat(50));
+    let a = one(DECODE, 0, coded("gzip", &z[..z.len() - 9]));
+    assert_eq!((a.status, a.error), (0, E_BAD));
+}
+
+#[test]
+fn the_body_limit_is_for_the_decoded_bytes() {
+    // 512 kB of zeros is under 1 kB of gzip
+    let z = gzip(&vec![0u8; 1 << 19]);
+    assert!(z.len() < 4096);
+    let a = one(DECODE, 4096, coded("gzip", &z));
+    assert_eq!((a.status, a.error), (0, E_BIG));
+    let a = one(DECODE, 1 << 19, coded("gzip", &z));
+    assert_eq!(a.body.len(), 1 << 19);
+    let a = one(DECODE, (1 << 19) - 1, coded("gzip", &z));
+    assert_eq!((a.status, a.error), (0, E_BIG));
+}

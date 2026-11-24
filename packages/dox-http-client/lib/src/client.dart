@@ -191,7 +191,7 @@ class _Lookup {
 /// client.
 ///
 /// It speaks HTTP/1.1 over `http://` and `https://`. It follows
-/// redirects. It does not unzip a body.
+/// redirects and decodes a gzip or brotli answer body.
 class DoxHttpClient implements Finalizable {
   /// A request with no whole answer in [timeout] fails. `Duration.zero`
   /// is no timeout.
@@ -306,6 +306,7 @@ class DoxHttpClient implements Finalizable {
   static const int _headOnly = 1;
   static const int _again = 2;
   static const int _tls = 4;
+  static const int _decode = 8;
 
   /// How long the addresses of a host name are kept.
   static const Duration _lookupTime = Duration(seconds: 30);
@@ -460,7 +461,9 @@ class DoxHttpClient implements Finalizable {
   /// Sends a request with any [method], like `OPTIONS`.
   ///
   /// The body is [body] (text, sent as UTF-8) or [bodyBytes], not both.
-  /// The client sets `host` and `content-length`. [timeout] is for this
+  /// The client sets `host`, `content-length` and `accept-encoding`. A
+  /// request with its own `accept-encoding` header or with a `range`
+  /// header gets the body as the server sent it. [timeout] is for this
   /// request only: `Duration.zero` is no timeout. It includes the
   /// redirects. [followRedirects] is for this request only.
   ///
@@ -576,7 +579,14 @@ class DoxHttpClient implements Finalizable {
     int flags = _idempotent.contains(method) ? _again : 0;
     if (method == 'HEAD') flags |= _headOnly;
     if (tls) flags |= _tls;
-    Uint8List request = _encode(method, url, headers, body, bodyBytes);
+    // the client asks for a coded body, so Rust decodes it
+    // Not for a part of a body (`range`): a part of a gzip body can not
+    // be decoded.
+    bool coded =
+        !_hasHeader(headers, 'accept-encoding') &&
+        !_hasHeader(headers, 'range');
+    if (coded) flags |= _decode;
+    Uint8List request = _encode(method, url, headers, body, bodyBytes, coded);
     // the length of a request record is 32 bits
     if (request.length > _maxRequest) {
       throw ArgumentError('the request is too big (over 2 GiB)');
@@ -611,6 +621,11 @@ class DoxHttpClient implements Finalizable {
     }
   }
 
+  static bool _hasHeader(Map<String, String>? headers, String name) {
+    if (headers == null) return false;
+    return headers.keys.any((String key) => key.toLowerCase() == name);
+  }
+
   /// The request line, the headers and the body as bytes.
   static Uint8List _encode(
     String method,
@@ -618,6 +633,7 @@ class DoxHttpClient implements Finalizable {
     Map<String, String>? headers,
     String? body,
     Uint8List? bodyBytes,
+    bool coded,
   ) {
     String target = url.path.isEmpty ? '/' : url.path;
     if (url.hasQuery) target = '$target?${url.query}';
@@ -648,6 +664,7 @@ class DoxHttpClient implements Finalizable {
       if (url.port != normal) host = '$host:${url.port}';
       head.write('host: $host\r\n');
     }
+    if (coded) head.write('accept-encoding: gzip, br\r\n');
     Uint8List? payload = bodyBytes;
     if (body != null) {
       payload = utf8.encode(body);

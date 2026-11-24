@@ -11,7 +11,7 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::OnceLock;
 
 /// Bump when the FFI functions or the record layout change.
-const ABI_VERSION: i32 = 1;
+const ABI_VERSION: i32 = 2;
 
 // ---- Dart API DL -------------------------------------------------------
 // `NativeApi.initializeApiDLData` points to this table. We only need

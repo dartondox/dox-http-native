@@ -18,7 +18,7 @@
 //!   0  u32 length of the record
 //!   4  u64 id
 //!   12 u8  family (4 or 6)
-//!   13 u8  flags: [HEAD_ONLY], [AGAIN], [TLS]
+//!   13 u8  flags: [HEAD_ONLY], [AGAIN], [TLS], [DECODE]
 //!   14 u16 port
 //!   16 16 bytes address (IPv4: the first 4)
 //!   32 u32 timeout in milliseconds (0: none)
@@ -31,6 +31,10 @@
 //!   12 u16 status (0: the request failed)
 //!   14 u16 error ([E_CONNECT] ...) when the status is 0
 //!   16 u32 length of the header lines
+//!
+//! With [DECODE], a body with `content-encoding: gzip` or `br` comes to
+//! Dart decoded, without its `content-encoding` and `content-length`
+//! lines. The body limit is for the decoded bytes.
 //!
 //! TLS (`https://`): rustls, with the root certificates of Mozilla
 //! (webpki-roots) and the ones Dart gives. The server name is checked
@@ -93,6 +97,8 @@ const HEAD_ONLY: u8 = 1;
 const AGAIN: u8 = 2;
 /// Request flag: an `https://` request. The record has the server name.
 const TLS: u8 = 4;
+/// Request flag: decode a gzip or brotli answer body.
+const DECODE: u8 = 8;
 
 /// Could not connect. Nothing was sent.
 const E_CONNECT: u16 = 1;
@@ -209,6 +215,65 @@ impl Chunked {
     }
 }
 
+/// The `content-encoding` of an answer that [decode] can read.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Coding {
+    /// none, or one that stays as it is
+    Raw,
+    Gzip,
+    Brotli,
+}
+
+/// Decodes a body. The result has at most `max` bytes: a small body can
+/// decode to a very big one.
+fn decode(coding: Coding, body: &[u8], max: usize) -> Result<Vec<u8>, u16> {
+    let mut out = Vec::new();
+    let limit = max as u64 + 1;
+    match coding {
+        Coding::Raw => Ok(body.to_vec()),
+        Coding::Gzip => {
+            // A gzip body may have more than one member. Bytes after the
+            // last member that are not gzip (padding) are dropped.
+            let mut rest = body;
+            loop {
+                let mut member = flate2::bufread::GzDecoder::new(rest);
+                let read = (&mut member)
+                    .take(limit - out.len() as u64)
+                    .read_to_end(&mut out);
+                if out.len() > max {
+                    return Err(E_BIG);
+                }
+                read.map_err(|_| E_BAD)?;
+                rest = member.into_inner();
+                if !rest.starts_with(&[0x1f, 0x8b]) {
+                    return Ok(out);
+                }
+            }
+        }
+        Coding::Brotli => {
+            let read = brotli_decompressor::Decompressor::new(body, 4096)
+                .take(limit)
+                .read_to_end(&mut out);
+            if out.len() > max {
+                return Err(E_BIG);
+            }
+            read.map(|_| out).map_err(|_| E_BAD)
+        }
+    }
+}
+
+/// The header lines without `content-encoding` and `content-length`: they
+/// are not true for a decoded body.
+fn decoded_lines(lines: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines.split_inclusive(|&c| c == b'\n') {
+        if !line.starts_with(b"content-encoding:") && !line.starts_with(b"content-length:") {
+            out.extend_from_slice(line);
+        }
+    }
+    out
+}
+
 enum Body {
     Len(usize),
     Chunked(Chunked),
@@ -225,6 +290,7 @@ struct Head {
     lines: Vec<u8>,
     keep: bool,
     body: Body,
+    coding: Coding,
 }
 
 fn has_token(value: &[u8], token: &str) -> bool {
@@ -259,6 +325,8 @@ fn parse_head(buf: &[u8], head_only: bool, max: usize) -> Result<Option<Head>, u
         let mut length: Option<usize> = None;
         let mut encoded = false;
         let mut chunked = false;
+        let mut coding = Coding::Raw;
+        let mut codings = 0;
         let mut lines = Vec::with_capacity(n);
         for h in res.headers.iter() {
             lines.extend(h.name.bytes().map(|c| c.to_ascii_lowercase()));
@@ -286,6 +354,14 @@ fn parse_head(buf: &[u8], head_only: bool, max: usize) -> Result<Option<Head>, u
                     .rsplit(|&c| c == b',')
                     .next()
                     .is_some_and(|t| t.trim_ascii().eq_ignore_ascii_case(b"chunked"));
+            } else if h.name.eq_ignore_ascii_case("content-encoding") {
+                let v = h.value.trim_ascii();
+                codings += 1;
+                if v.eq_ignore_ascii_case(b"gzip") || v.eq_ignore_ascii_case(b"x-gzip") {
+                    coding = Coding::Gzip;
+                } else if v.eq_ignore_ascii_case(b"br") {
+                    coding = Coding::Brotli;
+                }
             } else if h.name.eq_ignore_ascii_case("connection") {
                 if has_token(h.value, "close") {
                     close = true;
@@ -323,12 +399,17 @@ fn parse_head(buf: &[u8], head_only: bool, max: usize) -> Result<Option<Head>, u
         if matches!(body, Body::Eof) {
             keep = false;
         }
+        // more than one coding (rare) stays as it is
+        if codings != 1 {
+            coding = Coding::Raw;
+        }
         return Ok(Some(Head {
             status,
             start,
             lines,
             keep,
             body,
+            coding,
         }));
     }
 }
@@ -887,8 +968,11 @@ impl Core {
         };
         let id = req.id;
         let status = head.status;
-        let lines = std::mem::take(&mut head.lines);
+        let mut lines = std::mem::take(&mut head.lines);
         let key = c.key.clone();
+        // an answer with no body (eg. to HEAD) keeps its lines
+        let coded = req.flags & DECODE != 0 && head.coding != Coding::Raw && !body.is_empty();
+        let coding = head.coding;
         // The server may answer before it has the whole request (eg. 401 or
         // 413 for a big body). It then still waits for the other bytes, and
         // would read the next request as those bytes.
@@ -909,6 +993,23 @@ impl Core {
         } else {
             self.close(idx);
         }
+        // the connection is in order, also when the body is not
+        let body = if coded {
+            match decode(coding, &body, max) {
+                Ok(plain) => {
+                    lines = decoded_lines(&lines);
+                    plain
+                }
+                // a redirect is read for its `location`, not for its body
+                Err(E_BAD) if (300..400).contains(&status) => body,
+                Err(error) => {
+                    self.failed(id, error);
+                    return self.pump(&key);
+                }
+            }
+        } else {
+            body
+        };
         self.done(id, status, lines, body);
         self.pump(&key);
     }
@@ -1438,6 +1539,16 @@ pub(crate) fn fuzz(data: &[u8]) {
         return;
     };
     assert!(head.start <= data.len());
+    // the bytes after the head as a coded body: no panic, and the limit
+    // holds
+    let coding = if head.coding == Coding::Raw {
+        Coding::Gzip
+    } else {
+        head.coding
+    };
+    if let Ok(plain) = decode(coding, &data[head.start..], MAX) {
+        assert!(plain.len() <= MAX);
+    }
     let Body::Chunked(mut whole) = head.body else {
         return;
     };
