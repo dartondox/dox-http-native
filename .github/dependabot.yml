@@ -9,6 +9,10 @@ updates:
     schedule:
       interval: weekly
   - package-ecosystem: cargo
-    directory: "/native"
+    directory: "/packages/dox-http-native/native"
+    schedule:
+      interval: weekly
+  - package-ecosystem: cargo
+    directory: "/packages/dox-http-client/native"
     schedule:
       interval: weekly

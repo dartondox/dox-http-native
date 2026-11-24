@@ -1,6 +1,7 @@
 name: CodeQL
 
-# Code scanning for the GitHub workflows and the Rust code in native/
+# Code scanning for the GitHub workflows and the Rust code in
+# packages/*/native/
 # CodeQL has no Dart support, so Dart is not scanned.
 
 on:

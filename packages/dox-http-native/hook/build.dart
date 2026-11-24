@@ -9,6 +9,8 @@
 //            lib_path: /path/to/libdox_http_native.so
 // 2. A local build in `native/target/release` (for dev, same OS and CPU).
 // 3. The ready-built library from the GitHub release, checked with sha256.
+//    The hook tries the tag dox_http_native-v<version> first, then the old
+//    tag form v<version>.
 // 4. `cargo build` from source, when cargo is installed.
 // Outside the pub cache (this repo, or a path or git dependency), 4 comes
 // before 3, because the source may be newer than the release.
@@ -29,8 +31,8 @@ const int _attempts = 3;
 const List<int> _waitSeconds = <int>[1, 3];
 
 /// sha256 of each release asset. The release workflow
-/// (.github/workflows/ci.yaml) fills it from `SHA256SUMS` of the release:
-/// `dart run tool/native_hashes.dart v<version>`
+/// (.github/workflows/release.yaml) fills it from `SHA256SUMS` of the release:
+/// `dart run tool/native_hashes.dart dox_http_native-v<version>`
 const Map<String, String> _sha256 = <String, String>{
   'dox_http_native-linux-arm64.so':
       'f1b4580855f58486f7a155723d16d05eb17f7dae32b595167d32e2cc24d10640',
@@ -110,7 +112,6 @@ Future<Uri?> _download(
   String? hash = _sha256[asset];
   if (hash == null) return null; // no release for this platform (yet)
 
-  // the release tag has the package version, eg. dox_http_native-v3.0.0
   String pubspec = File.fromUri(input.packageRoot.resolve('pubspec.yaml'))
       .readAsStringSync();
   String version = RegExp(
@@ -121,6 +122,22 @@ Future<Uri?> _download(
   if (file.existsSync() && _sha(file.readAsBytesSync()) == hash) {
     return file.uri;
   }
+  for (Uri url in releaseUrls(version, asset)) {
+    if (await _fetch(url, asset, hash, file)) return file.uri;
+  }
+  return null;
+}
+
+/// The download URLs of [asset], in the order to try. New releases have
+/// the tag `dox_http_native-v<version>`. Releases before the move to a
+/// workspace have the tag `v<version>`.
+List<Uri> releaseUrls(String version, String asset) => <Uri>[
+  Uri.parse('$_releases/dox_http_native-v$version/$asset'),
+  Uri.parse('$_releases/v$version/$asset'),
+];
+
+/// Downloads [url] into [file]. True when the bytes have the sha256 [hash].
+Future<bool> _fetch(Uri url, String asset, String hash, File file) async {
   // GitHub sometimes answers 503 or 504. Try up to 3 times, with a short wait.
   for (int attempt = 1; attempt <= _attempts; attempt++) {
     if (attempt > 1) {
@@ -133,16 +150,14 @@ Future<Uri?> _download(
     HttpClient client = HttpClient()
       ..connectionTimeout = const Duration(seconds: 30);
     try {
-      HttpClientRequest req = await client
-          .getUrl(Uri.parse('$_releases/v$version/$asset'))
-          .timeout(_left(deadline));
+      HttpClientRequest req = await client.getUrl(url).timeout(_left(deadline));
       HttpClientResponse res = await req.close().timeout(_left(deadline));
       if (res.statusCode != 200) {
         stderr.writeln(
-          'dox_http_native: download $asset: ${res.statusCode} $tried',
+          'dox_http_native: download $url: ${res.statusCode} $tried',
         );
         if (shouldRetryStatus(res.statusCode)) continue;
-        return null;
+        return false;
       }
       List<int> bytes = <int>[
         for (List<int> chunk in await res.toList().timeout(_left(deadline)))
@@ -157,14 +172,14 @@ Future<Uri?> _download(
       }
       file.parent.createSync(recursive: true);
       file.writeAsBytesSync(bytes);
-      return file.uri;
+      return true;
     } on Exception catch (error) {
-      stderr.writeln('dox_http_native: download $asset failed: $error $tried');
+      stderr.writeln('dox_http_native: download $url failed: $error $tried');
     } finally {
       client.close(force: true);
     }
   }
-  return null;
+  return false;
 }
 
 /// The longest time one download try may take, from connect to the last byte.
