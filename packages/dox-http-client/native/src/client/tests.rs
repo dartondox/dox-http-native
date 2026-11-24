@@ -158,6 +158,19 @@ fn head(text: &str) -> Result<Option<Head>, u16> {
 }
 
 #[test]
+fn head_with_folded_values_and_a_reason() {
+    let h = head("HTTP/1.1 404 Not Found\r\nX-A: one  \t \r\n \t two\r\n\tthree\r\nX-B: b\r\n\r\n")
+        .unwrap()
+        .unwrap();
+    assert_eq!(h.lines, b":Not Found\nx-a:one two three\nx-b:b\n");
+    // no reason phrase: no line for it
+    let h = head("HTTP/1.1 200\r\nX-A: 1\r\n\r\n").unwrap().unwrap();
+    assert_eq!(h.lines, b"x-a:1\n");
+    // a length must be on one line
+    assert!(head("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n 0\r\n\r\n").is_err());
+}
+
+#[test]
 fn head_with_a_length() {
     let h = head("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX-Name: A b\r\n\r\nhello")
         .unwrap()
@@ -165,7 +178,7 @@ fn head_with_a_length() {
     assert_eq!(h.status, 200);
     assert!(h.keep);
     assert!(matches!(h.body, Body::Len(5)));
-    assert_eq!(h.lines, b"content-length:5\nx-name:A b\n");
+    assert_eq!(h.lines, b":OK\ncontent-length:5\nx-name:A b\n");
     assert_eq!(h.start, 51);
 }
 
@@ -310,7 +323,7 @@ fn requests_use_one_connection_again() {
         let a = run_until(&mut core, &get(id, addr), 1);
         assert_eq!((a[0].id, a[0].status, a[0].error), (id, 200, 0));
         assert_eq!(a[0].body, b"hello");
-        assert_eq!(a[0].lines, "content-length:5\nx-a:1\n");
+        assert_eq!(a[0].lines, ":OK\ncontent-length:5\nx-a:1\n");
     }
     assert_eq!(count.load(Ordering::SeqCst), 1);
     assert_eq!(core.open, 0);
@@ -605,7 +618,7 @@ fn https_requests_use_one_connection_again() {
         let a = run_until(&mut core, &tls_get(id, addr, "localhost"), 1);
         assert_eq!((a[0].status, a[0].error), (200, 0));
         assert_eq!(a[0].body, b"hello");
-        assert_eq!(a[0].lines, "content-length:5\nx-a:1\n");
+        assert_eq!(a[0].lines, ":OK\ncontent-length:5\nx-a:1\n");
     }
     assert_eq!(count.load(Ordering::SeqCst), 1);
     // the same address with no TLS is another connection
@@ -1124,7 +1137,7 @@ fn a_gzip_body_is_decoded() {
     let a = one(DECODE, 0, coded("gzip", &gzip(&text)));
     assert_eq!(a.status, 200);
     assert_eq!(a.body, text);
-    assert_eq!(a.lines, "x-a:1\n");
+    assert_eq!(a.lines, ":OK\nx-a:1\n");
     // two members are one body
     let mut two = gzip(b"one ");
     two.extend(gzip(b"two"));
@@ -1142,7 +1155,7 @@ fn a_gzip_body_is_decoded() {
 fn a_brotli_body_is_decoded() {
     let a = one(DECODE, 0, coded("BR", BROTLI));
     assert_eq!(a.body, b"Hello Hello Hello Hello");
-    assert_eq!(a.lines, "x-a:1\n");
+    assert_eq!(a.lines, ":OK\nx-a:1\n");
 }
 
 #[test]
@@ -1158,7 +1171,7 @@ fn a_chunked_gzip_body_is_decoded() {
     a.extend_from_slice(b"\r\n0\r\n\r\n");
     let got = one(DECODE, 0, a);
     assert_eq!(got.body, b"chunked text");
-    assert_eq!(got.lines, "transfer-encoding:chunked\n");
+    assert_eq!(got.lines, ":OK\ntransfer-encoding:chunked\n");
 }
 
 #[test]
@@ -1423,7 +1436,7 @@ fn a_paused_reader_leaves_the_socket_alone() {
     let mut core = new_core(0, 0);
     let r = paused_then_read(&mut core, sget(1, addr, AGAIN, 5000), SIZE);
     assert_eq!(r.status, Some(200));
-    assert_eq!(r.lines, format!("content-length:{SIZE}\n"));
+    assert_eq!(r.lines, format!(":OK\ncontent-length:{SIZE}\n"));
     // the connection is kept
     assert_eq!(core.open, 0);
     assert_eq!(core.conns.len(), 1);
@@ -1506,14 +1519,14 @@ fn streamed_answers_of_each_kind() {
     let mut r = Reader::new(1);
     r.until(&mut core, &sget(1, addr, AGAIN, 5000), true, |r| r.over());
     assert_eq!((r.status, r.body.as_slice()), (Some(200), &b"abcde"[..]));
-    assert_eq!(r.lines, "transfer-encoding:chunked\n");
+    assert_eq!(r.lines, ":OK\ntransfer-encoding:chunked\n");
     // content-length answers use one connection again
     let (addr, count) = keep_alive(HELLO);
     for id in 2..=3 {
         let mut r = Reader::new(id);
         r.until(&mut core, &sget(id, addr, AGAIN, 5000), true, |r| r.over());
         assert_eq!((r.status, r.body.as_slice()), (Some(200), &b"hello"[..]));
-        assert_eq!(r.lines, "content-length:5\nx-a:1\n");
+        assert_eq!(r.lines, ":OK\ncontent-length:5\nx-a:1\n");
     }
     assert_eq!(count.load(Ordering::SeqCst), 1);
     // a body that ends with the connection
@@ -1606,7 +1619,7 @@ fn a_streamed_gzip_answer_is_decoded_in_parts() {
     let mut r = Reader::new(1);
     r.until(&mut core, &sget(1, addr, DECODE, 5000), true, |r| r.over());
     assert!(r.ended, "{:?} {} {}", r.error, r.body.len(), expect.len());
-    assert_eq!(r.lines, "x-a:1\ntransfer-encoding:chunked\n");
+    assert_eq!(r.lines, ":OK\nx-a:1\ntransfer-encoding:chunked\n");
     assert!(r.body == expect);
 }
 
@@ -1703,7 +1716,7 @@ fn a_streamed_brotli_answer_is_decoded() {
     let mut r = Reader::new(1);
     r.until(&mut core, &sget(1, addr, DECODE, 5000), true, |r| r.over());
     assert_eq!(r.body, b"Hello Hello Hello Hello");
-    assert_eq!(r.lines, "");
+    assert_eq!(r.lines, ":OK\n");
     let (addr, _) = server(move |mut s, _| {
         read_head(&mut s);
         for byte in whole {

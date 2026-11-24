@@ -187,6 +187,11 @@ void main() {
     expect(res.header('X-Test'), 'one, two');
     expect(res.header('content-type'), startsWith('text/plain'));
     expect(res.header('nope'), isNull);
+    expect(res.reasonPhrase, 'OK');
+    expect(
+      (await client.get(base.resolve('/status/404'))).reasonPhrase,
+      'Not Found',
+    );
   });
 
   test('lookup gives the addresses of a host name', () async {

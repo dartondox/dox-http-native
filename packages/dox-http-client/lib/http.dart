@@ -15,7 +15,12 @@ import 'dox_http_client.dart';
 class DoxHttpPackageClientException extends http.ClientException
     implements DoxHttpClientException {
   DoxHttpPackageClientException(this.failure, this.url)
-    : super('DoxHttpClientException: ${failure.name}', url);
+    : super(
+        failure == DoxHttpFailure.tooManyRedirects
+            ? 'Redirect limit exceeded'
+            : 'DoxHttpClientException: ${failure.name}',
+        url,
+      );
 
   @override
   final DoxHttpFailure failure;
@@ -37,9 +42,8 @@ class DoxHttpPackageClientException extends http.ClientException
 /// What is different from the default client of `package:http`:
 ///
 /// - A request with a body does not follow redirects.
-/// - `maxRedirects` and `persistentConnection` of a request have no effect:
-///   set `maxRedirects` on the [DoxHttpClient].
-/// - An answer has no `reasonPhrase`.
+/// - `persistentConnection` of a request has no effect.
+/// - An HTTP/2 answer has no `reasonPhrase`.
 /// - A failure is a [DoxHttpPackageClientException].
 class DoxHttpPackageClient extends http.BaseClient {
   /// With no [client], the adapter makes a [DoxHttpClient] with no
@@ -51,23 +55,27 @@ class DoxHttpPackageClient extends http.BaseClient {
 
   final DoxHttpClient _client;
   final bool _owned;
+  bool _closed = false;
 
   static const Set<int> _redirects = <int>{301, 302, 303, 307, 308};
 
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    if (_closed) {
+      throw http.ClientException('The client is closed', request.url);
+    }
     Future<void>? abort = request is http.Abortable
         ? request.abortTrigger
         : null;
+    bool aborted = false;
     if (abort != null) {
-      // a trigger that is complete now: the request must not go out
-      bool aborted = false;
       unawaited(abort.then((_) => aborted = true));
+      // a trigger that is complete now: the request must not go out
       await null;
-      if (aborted) throw http.RequestAbortedException(request.url);
     }
     int? length = request.contentLength;
-    http.ByteStream body = request.finalize();
+    Stream<List<int>> body = request.finalize();
+    if (aborted) throw _aborted(body, request.url);
     // the native client sets these two itself
     Map<String, String> headers = <String, String>{};
     for (MapEntry<String, String> header in request.headers.entries) {
@@ -78,7 +86,66 @@ class DoxHttpPackageClient extends http.BaseClient {
     // No body: the native client then follows redirects and can send the
     // request again. It sends `content-length: 0` for POST, PUT and PATCH.
     bool empty = length == 0;
-    if (empty) body.drain<void>().ignore();
+    if (empty) {
+      body.drain<void>().ignore();
+    } else if (length == null) {
+      // A stream with no length can be empty, like a GET that is sent as a
+      // StreamedRequest. Wait for its first bytes: with none, the request
+      // has no body.
+      // `rest` keeps the parts in their sequence until the native client
+      // listens to it.
+      Completer<bool> first = Completer<bool>();
+      StreamController<List<int>> rest = StreamController<List<int>>();
+      StreamSubscription<List<int>>? sub;
+      sub = body.listen(
+        (List<int> part) {
+          if (part.isEmpty && !first.isCompleted) return;
+          rest.add(part);
+          if (first.isCompleted) return;
+          // null: the part came while `listen` ran, see below
+          sub?.pause();
+          first.complete(true);
+        },
+        onError: (Object error, StackTrace trace) {
+          if (first.isCompleted) return rest.addError(error, trace);
+          first.completeError(error, trace);
+        },
+        onDone: () {
+          rest.close();
+          if (!first.isCompleted) first.complete(false);
+        },
+      );
+      StreamSubscription<List<int>> source = sub;
+      if (first.isCompleted) source.pause();
+      rest
+        ..onListen = source.resume
+        ..onPause = source.pause
+        ..onResume = source.resume
+        ..onCancel = source.cancel;
+      bool some;
+      try {
+        some = abort == null
+            ? await first.future
+            : await Future.any<bool>(<Future<bool>>[
+                first.future,
+                abort.then((_) => false),
+              ]);
+      } on Object {
+        // the body failed before its first bytes
+        source.cancel().ignore();
+        rethrow;
+      }
+      if (aborted) {
+        first.future.ignore();
+        source.cancel().ignore();
+        throw http.RequestAbortedException(request.url);
+      }
+      if (some) {
+        body = rest.stream;
+      } else {
+        empty = true;
+      }
+    }
     DoxHttpClientStreamedResponse res;
     try {
       res = await _client.sendStreamed(
@@ -88,10 +155,15 @@ class DoxHttpPackageClient extends http.BaseClient {
         body: empty ? null : body,
         contentLength: empty ? null : length,
         followRedirects: request.followRedirects,
+        maxRedirects: request.maxRedirects,
         abort: abort,
       );
     } on DoxHttpClientException catch (e) {
       throw _failure(e);
+    } on Object {
+      // eg. a URL that is not http: the body was not read
+      if (!empty) _drop(body);
+      rethrow;
     }
     String? size = res.headers['content-length'];
     return http.StreamedResponse(
@@ -110,6 +182,7 @@ class DoxHttpPackageClient extends http.BaseClient {
       contentLength: size == null ? null : int.tryParse(size),
       request: request,
       headers: res.headers,
+      reasonPhrase: res.reasonPhrase,
       isRedirect:
           _redirects.contains(res.statusCode) &&
           res.headers.containsKey('location'),
@@ -124,8 +197,27 @@ class DoxHttpPackageClient extends http.BaseClient {
         : DoxHttpPackageClientException(e.failure, e.url);
   }
 
+  /// The exception of a request that was aborted before it went out. Its
+  /// [body] is canceled, so a `close()` of the sink of the request
+  /// completes.
+  static http.ClientException _aborted(Stream<List<int>> body, Uri url) {
+    _drop(body);
+    return http.RequestAbortedException(url);
+  }
+
+  /// Cancels a request [body] that nobody reads, so a `close()` of the
+  /// sink of the request completes.
+  static void _drop(Stream<List<int>> body) {
+    try {
+      body.listen(null).cancel().ignore();
+    } on Object {
+      // it has a listener: that one ends it
+    }
+  }
+
   @override
   void close() {
+    _closed = true;
     if (_owned) _client.close();
   }
 }

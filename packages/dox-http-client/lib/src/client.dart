@@ -120,6 +120,17 @@ abstract class DoxHttpClientResponseHead {
   /// than once has its values joined with `, `.
   late final Map<String, String> headers = _parseHeaders();
 
+  /// The reason phrase of the status line, like `OK` or `Not Found`. Null
+  /// when the server sent none. An HTTP/2 answer has none.
+  late final String? reasonPhrase = _reason();
+
+  String? _reason() {
+    // Rust gives it as a first line with no name: `:OK\n`
+    if (_lines.isEmpty || _lines[0] != 0x3a) return null;
+    int end = _lines.indexOf(0x0a);
+    return latin1.decode(_lines.sublist(1, end < 0 ? _lines.length : end));
+  }
+
   /// One header, or null. [name] may be in any case.
   String? header(String name) => headers[name.toLowerCase()];
 
@@ -436,6 +447,17 @@ class _StreamPending extends _Pending {
     StreamSubscription<List<int>>? sub = _sub;
     _sub = null;
     sub?.cancel();
+    Stream<List<int>>? body = upload;
+    if (!_started && body != null) {
+      // The body was never read. Cancel it, so its source knows and a
+      // `close()` of its sink completes.
+      _started = true;
+      try {
+        body.listen(null).cancel().ignore();
+      } on Object {
+        // a stream that has a listener, or that can not get one
+      }
+    }
   }
 
   /// Stops the upload and tells Rust: the connection is not used again.
@@ -817,7 +839,8 @@ class DoxHttpClient implements Finalizable {
   /// request with its own `accept-encoding` header or with a `range`
   /// header gets the body as the server sent it. [timeout] is for this
   /// request only: `Duration.zero` is no timeout. It includes the
-  /// redirects. [followRedirects] is for this request only.
+  /// redirects. [followRedirects] and [maxRedirects] are for this request
+  /// only.
   ///
   /// The future fails with a [DoxHttpClientException] when no answer
   /// comes.
@@ -829,6 +852,7 @@ class DoxHttpClient implements Finalizable {
     Uint8List? bodyBytes,
     Duration? timeout,
     bool? followRedirects,
+    int? maxRedirects,
   }) {
     int wait = (timeout ?? this.timeout).inMicroseconds;
     int deadline = wait > 0 ? _clock.elapsedMicroseconds + wait : 0;
@@ -841,7 +865,15 @@ class DoxHttpClient implements Finalizable {
       deadline,
     );
     if (!(followRedirects ?? this.followRedirects)) return first;
-    return _follow(first, method, headers, body, bodyBytes, deadline);
+    return _follow(
+      first,
+      method,
+      headers,
+      body,
+      bodyBytes,
+      deadline,
+      maxRedirects ?? this.maxRedirects,
+    );
   }
 
   /// Sends a request and gives the answer when its head is there. The body
@@ -873,7 +905,8 @@ class DoxHttpClient implements Finalizable {
   /// body can go out, and a server that does not read fails the request.
   ///
   /// With [followRedirects], a request with no [body] goes to the new
-  /// address of a redirect like [send]. A request with a [body] never
+  /// address of a redirect like [send], at most [maxRedirects] times. A
+  /// request with a [body] never
   /// follows: the stream can not be read again, so you get the redirect
   /// answer. The client sends a request with a [body] only once.
   ///
@@ -892,6 +925,7 @@ class DoxHttpClient implements Finalizable {
     int? contentLength,
     Duration? timeout,
     bool? followRedirects,
+    int? maxRedirects,
     Future<void>? abort,
   }) {
     if (body == null && contentLength != null) {
@@ -915,7 +949,14 @@ class DoxHttpClient implements Finalizable {
     if (body != null || !(followRedirects ?? this.followRedirects)) {
       return first;
     }
-    return _followStreamed(first, method, headers, deadline, abort);
+    return _followStreamed(
+      first,
+      method,
+      headers,
+      deadline,
+      abort,
+      maxRedirects ?? this.maxRedirects,
+    );
   }
 
   /// Gives the answer of [first], or of the address its redirects go to.
@@ -926,10 +967,11 @@ class DoxHttpClient implements Finalizable {
     String? body,
     Uint8List? bodyBytes,
     int deadline,
+    int maxRedirects,
   ) async {
     DoxHttpClientResponse res = await first;
     for (int hop = 0; ; hop++) {
-      _Hop? next = _hop(res, method, headers, hop);
+      _Hop? next = _hop(res, method, headers, hop, maxRedirects);
       if (next == null) return res;
       method = next.method;
       headers = next.headers;
@@ -948,12 +990,13 @@ class DoxHttpClient implements Finalizable {
     Map<String, String>? headers,
     int deadline,
     Future<void>? abort,
+    int maxRedirects,
   ) async {
     DoxHttpClientStreamedResponse res = await first;
     for (int hop = 0; ; hop++) {
       _Hop? next;
       try {
-        next = _hop(res, method, headers, hop);
+        next = _hop(res, method, headers, hop, maxRedirects);
       } on Object {
         unawaited(_discard(res, deadline));
         rethrow;
@@ -1016,6 +1059,7 @@ class DoxHttpClient implements Finalizable {
     String method,
     Map<String, String>? headers,
     int hop,
+    int maxRedirects,
   ) {
     String? location = res.header('location');
     if (location == null ||
