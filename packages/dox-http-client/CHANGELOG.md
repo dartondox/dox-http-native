@@ -1,4 +1,4 @@
-## Unreleased
+## 0.0.3
 
 - `DoxHttpClient.sendStreamed(abort: ...)` stops a request when the `abort` future completes. The client closes the connection of the request.
   - Before the head of the answer, the request fails with the new `DoxHttpFailure.aborted`. After it, the body gets that failure as an error event.
