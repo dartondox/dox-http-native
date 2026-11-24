@@ -1,4 +1,5 @@
-//! The HTTP/1.1 client. It runs on the thread of the Dart isolate.
+//! The HTTP client (HTTP/1.1 and HTTP/2). It runs on the thread of the Dart
+//! isolate.
 //!
 //! Dart calls `dox_client_run` with the new requests (request records). One
 //! call writes them to connections, reads what the sockets have (it never
@@ -18,7 +19,8 @@
 //!   0  u32 length of the record
 //!   4  u64 id
 //!   12 u8  family (4 or 6)
-//!   13 u8  flags: [HEAD_ONLY], [AGAIN], [TLS], [DECODE], [STREAM], [UPLOAD]
+//!   13 u8  flags: [HEAD_ONLY], [AGAIN], [TLS], [DECODE], [STREAM], [UPLOAD],
+//!          [CHUNKED]
 //!   14 u16 port
 //!   16 16 bytes address (IPv4: the first 4)
 //!   32 u32 timeout in milliseconds (0: none)
@@ -27,9 +29,10 @@
 //! - [Q_NEW]: a new request. The payload is the server name and then the raw
 //!   HTTP request (head and body). With [UPLOAD] it is the head only: the
 //!   body comes in [Q_PART] records.
-//! - [Q_PART]: bytes of the request body of request `id`, as they go on the
-//!   wire (Dart does the chunked framing). Only after the first
-//!   [R_PROGRESS] record of the request. The payload is the bytes.
+//! - [Q_PART]: bytes of the request body of request `id`. Rust does the
+//!   framing: chunks for HTTP/1.1 with [CHUNKED], DATA frames for HTTP/2.
+//!   Only after the first [R_PROGRESS] record of the request. The payload
+//!   is the bytes.
 //! - [Q_END]: the body of request `id` is whole. Byte 16 is 1 when Dart
 //!   stops the upload before its end: the connection is not used again.
 //! - [Q_CREDIT]: u64 at 16: the total bytes of the answer body of request
@@ -54,8 +57,9 @@
 //! - [R_PART]: bytes of the body of a streamed answer (the body field).
 //! - [R_END]: the body of a streamed answer is whole.
 //! - [R_PROGRESS]: the body field has a u64: the total bytes of the request
-//!   (head and body) that went out. The first one also says that the
-//!   connection works.
+//!   (the head and the body as Dart gave them) that went out. While chunks
+//!   wait, the number can be a little too small. The first one also says
+//!   that the connection works.
 //!
 //! With [DECODE], a body with `content-encoding: gzip` or `br` comes to
 //! Dart decoded, without its `content-encoding` and `content-length`
@@ -70,6 +74,13 @@
 //! TLS (`https://`): rustls, with the root certificates of Mozilla
 //! (webpki-roots) and the ones Dart gives. The server name is checked
 //! against the certificate. TLS 1.2 and 1.3.
+//!
+//! HTTP/2 (see `h2.rs`): an `https://` connection offers `h2` and
+//! `http/1.1` (ALPN), when Dart did not turn HTTP/2 off. The request waits
+//! for the end of the TLS handshake, because only then the protocol is
+//! known. With `h2`, the requests to one address share the connection:
+//! each one is a stream. Dart sees no difference: Rust makes the HTTP/2
+//! head from the HTTP/1.1 head of the request record.
 //!
 //! Connections:
 //! - A connection stays open after an answer (keep-alive) and the next
@@ -96,6 +107,8 @@ use rustls::{ClientConfig, ClientConnection, RootCertStore};
 use slab::Slab;
 
 use crate::{POST, post, rd32, rd64};
+
+mod h2;
 
 const REQ_HEAD: usize = 40;
 const RES_HEAD: usize = 24;
@@ -133,6 +146,9 @@ const HEAD_ONLY: u8 = 1;
 const AGAIN: u8 = 2;
 /// Request flag: an `https://` request. The record has the server name.
 const TLS: u8 = 4;
+/// Request flag: the body in the [Q_PART] records has no length. HTTP/1.1
+/// sends it in chunks.
+const CHUNKED: u8 = 64;
 /// Request flag: decode a gzip or brotli answer body.
 const DECODE: u8 = 8;
 /// Request flag: the answer comes in parts (head, body parts, end).
@@ -181,6 +197,8 @@ struct Req {
     more: bool,
     /// Dart stopped the upload: the connection is not used again
     aborted: bool,
+    /// bytes of chunk framing that Rust put in `bytes` so far ([CHUNKED])
+    framing: u64,
 }
 
 enum ChunkState {
@@ -749,6 +767,114 @@ struct Conn {
     /// of them Dart knows
     wrote: u64,
     told: u64,
+    /// The TLS handshake is not done, and the server may pick HTTP/2: the
+    /// request waits.
+    wait_alpn: bool,
+    /// the requests of an HTTP/2 connection. `req` is then not in use.
+    h2: Option<Box<Mux>>,
+}
+
+/// An HTTP/2 connection: its protocol state and its requests by stream.
+struct Mux {
+    proto: h2::H2,
+    subs: HashMap<u32, Sub>,
+}
+
+/// One request on an HTTP/2 connection.
+struct Sub {
+    req: Req,
+    /// bytes of the HTTP/1.1 head that Dart gave: [R_PROGRESS] counts them
+    head_len: u64,
+    /// 0: no head of the answer yet
+    status: u16,
+    lines: Vec<u8>,
+    coding: Coding,
+    /// the body of an answer that is not streamed
+    body: Vec<u8>,
+    /// the state of a streamed answer, from its head on
+    down: Option<Box<Down>>,
+    /// body bytes that the server got back as room (flow control)
+    released: u64,
+    /// the server ended the answer: Dart may still have to use bytes
+    ended: bool,
+}
+
+impl Sub {
+    /// Gives the server room for the body bytes that are used: the ones
+    /// Dart used, or for a coded body the ones the decoder took.
+    fn window(&mut self, proto: &mut h2::H2, stream: u32) {
+        let Some(down) = &self.down else { return };
+        let used = match &down.inflate {
+            Some(inflate) => down.raw.saturating_sub(inflate.held() as u64),
+            None => down.credit,
+        };
+        if used > self.released {
+            proto.release(stream, used - self.released);
+            self.released = used;
+        }
+    }
+}
+
+/// The `content-encoding` in header lines (`name:value\n`, lower case)
+/// that [decode] can read. More than one coding stays as it is.
+fn coding_of(lines: &[u8]) -> Coding {
+    let mut found = Coding::Raw;
+    let mut count = 0;
+    for line in lines.split(|&c| c == b'\n') {
+        if let Some(value) = line.strip_prefix(b"content-encoding:") {
+            count += 1;
+            let value = value.trim_ascii();
+            if value.eq_ignore_ascii_case(b"gzip") || value.eq_ignore_ascii_case(b"x-gzip") {
+                found = Coding::Gzip;
+            } else if value.eq_ignore_ascii_case(b"br") {
+                found = Coding::Brotli;
+            }
+        }
+    }
+    if count == 1 { found } else { Coding::Raw }
+}
+
+/// A name and a value of a request head.
+type Field = (Vec<u8>, Vec<u8>);
+
+/// The HTTP/2 fields of an HTTP/1.1 request head as Dart writes it, and
+/// the length of that head. The headers that are only for an HTTP/1.1
+/// connection are left out (RFC 9113 8.2.2).
+fn h2_fields(bytes: &[u8]) -> Option<(usize, Vec<Field>)> {
+    let len = bytes.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+    let mut lines = bytes[..len - 4]
+        .split(|&c| c == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line));
+    let mut first = lines.next()?.split(|&c| c == b' ');
+    let method = first.next()?;
+    let path = first.next()?;
+    if method.is_empty() || path.is_empty() {
+        return None;
+    }
+    let mut authority: &[u8] = b"";
+    let mut rest: Vec<Field> = Vec::new();
+    for line in lines {
+        let colon = line.iter().position(|&c| c == b':')?;
+        let name = line[..colon].to_ascii_lowercase();
+        let value = line[colon + 1..].trim_ascii();
+        match name.as_slice() {
+            b"host" => authority = value,
+            b"connection" | b"keep-alive" | b"proxy-connection" | b"transfer-encoding"
+            | b"upgrade" | b"te" => {}
+            _ => rest.push((name, value.to_vec())),
+        }
+    }
+    if authority.is_empty() {
+        return None;
+    }
+    let mut fields: Vec<Field> = vec![
+        (b":method".to_vec(), method.to_vec()),
+        (b":scheme".to_vec(), b"https".to_vec()),
+        (b":authority".to_vec(), authority.to_vec()),
+        (b":path".to_vec(), path.to_vec()),
+    ];
+    fields.append(&mut rest);
+    Some((len, fields))
 }
 
 /// A streamed answer that goes to Dart in parts.
@@ -873,7 +999,12 @@ impl Conn {
     /// out as TLS records for the socket, and the other way for the answer.
     /// The handshake runs in the same steps.
     fn tls_io(&mut self, tls: &mut ClientConnection, cap: usize) -> (Option<u16>, bool, bool) {
-        let bytes: &[u8] = self.req.as_ref().map_or(&[], |r| &r.bytes);
+        let bytes: &[u8] = match (&self.h2, &self.req) {
+            (Some(mux), _) => &mux.proto.out,
+            // the protocol is not known before the end of the handshake
+            (None, Some(req)) if !self.wait_alpn => &req.bytes,
+            _ => &[],
+        };
         let closed = |connected: bool| Some(if connected { E_CLOSED } else { E_CONNECT });
         let mut fail: Option<u16> = None;
         let mut eof = false;
@@ -1138,6 +1269,8 @@ fn emit(
 /// Where a request is.
 enum Spot {
     Conn(usize),
+    /// a stream of an HTTP/2 connection
+    Mux(usize, u32),
     /// in the queue of a host, at this place
     Queued(Key, usize),
 }
@@ -1171,6 +1304,8 @@ struct Host {
     count: usize,
     /// requests that wait for a free connection
     queue: VecDeque<Req>,
+    /// the HTTP/2 connections: they are never in `idle`
+    h2: Vec<usize>,
 }
 
 struct Core {
@@ -1268,6 +1403,7 @@ impl Core {
         let conn = self.conns.try_remove(idx)?;
         if let Some(host) = self.hosts.get_mut(&conn.key) {
             host.idle.retain(|&i| i != idx);
+            host.h2.retain(|&i| i != idx);
             host.count -= 1;
         }
         Some(conn)
@@ -1279,6 +1415,14 @@ impl Core {
     fn fail(&mut self, idx: usize, error: u16) {
         let Some(conn) = self.close(idx) else { return };
         let key = conn.key;
+        if let Some(mux) = conn.h2 {
+            let mut subs: Vec<(u32, Sub)> = mux.subs.into_iter().collect();
+            // the oldest first, as they go back in front of the queue
+            subs.sort_unstable_by_key(|(stream, _)| std::cmp::Reverse(*stream));
+            for (_, sub) in subs {
+                self.h2_lost(&key, sub, error, error == E_CLOSED);
+            }
+        }
         if let Some(mut req) = conn.req {
             // `head`: the read buffer of a chunked answer is empty again
             // after its head, so `filled` alone does not say "no answer byte"
@@ -1329,6 +1473,8 @@ impl Core {
             }
             None => None,
         };
+        // with one protocol to offer there is nothing to wait for
+        let wait_alpn = tls.is_some() && self.tls.alpn_protocols.len() > 1;
         let Ok(mut stream) = TcpStream::connect(key.addr) else {
             self.forget(&key);
             return self.failed(req.id, E_CONNECT);
@@ -1365,6 +1511,8 @@ impl Core {
             down: None,
             wrote: 0,
             told: 0,
+            wait_alpn,
+            h2: None,
         });
         self.hosts.entry(key).or_default().count += 1;
     }
@@ -1372,6 +1520,10 @@ impl Core {
     /// Sends a request on an idle connection for `key` or on a new one, or
     /// lets it wait when `max_per_host` connections are open.
     fn start(&mut self, key: Key, req: Req) {
+        if let Some(idx) = self.h2_free(&key) {
+            self.h2_open(idx, req);
+            return self.drive(idx);
+        }
         while let Some(idx) = self.hosts.get_mut(&key).and_then(|h| h.idle.pop()) {
             let Some(c) = self.conns.get_mut(idx) else {
                 continue;
@@ -1402,6 +1554,7 @@ impl Core {
     /// there is a free one. Drops the entry of a key with nothing.
     fn pump(&mut self, key: &Key) {
         loop {
+            let shared = self.h2_free(key).is_some();
             let Some(host) = self.hosts.get_mut(key) else {
                 return;
             };
@@ -1411,7 +1564,8 @@ impl Core {
                 }
                 return;
             }
-            if host.idle.is_empty() && self.max_per_host != 0 && host.count >= self.max_per_host {
+            let full = self.max_per_host != 0 && host.count >= self.max_per_host;
+            if !shared && host.idle.is_empty() && full {
                 return;
             }
             let Some(req) = host.queue.pop_front() else {
@@ -1438,8 +1592,23 @@ impl Core {
         let Some(c) = self.conns.get_mut(idx) else {
             return;
         };
+        if c.h2.is_some() {
+            return self.mux(idx);
+        }
         let cap = c.cap();
-        let (fail, eof, cut) = c.io(cap);
+        let (mut fail, mut eof, mut cut) = c.io(cap);
+        if c.wait_alpn && fail.is_none() && c.tls.as_ref().is_some_and(|t| !t.is_handshaking()) {
+            // the handshake is done: the server picked the protocol
+            c.wait_alpn = false;
+            if c.tls.as_ref().and_then(|t| t.alpn_protocol()) == Some(b"h2") {
+                return self.adopt(idx);
+            }
+            // the request goes out now, and no event comes for that
+            let (fail2, eof2, cut2) = c.io(cap);
+            fail = fail2;
+            eof |= eof2;
+            cut |= cut2;
+        }
         let Some(req) = &mut c.req else {
             // an idle connection: the server closed it, or sent bytes
             // nobody asked for
@@ -1459,7 +1628,8 @@ impl Core {
             // the first report also tells Dart that the connection works
             if c.connected && c.wrote > c.told {
                 c.told = c.wrote;
-                push_progress(&mut self.ready, req.id, c.wrote);
+                // Dart counts the bytes it gave, not the chunk framing
+                push_progress(&mut self.ready, req.id, c.wrote.saturating_sub(req.framing));
                 // `due` may now be too early: then `expire` finds nothing
                 if let (Some(wait), Some(_)) = (req.wait, req.deadline) {
                     req.deadline = Some(self.now + wait);
@@ -1691,6 +1861,341 @@ impl Core {
         self.pump(&key);
     }
 
+    /// An HTTP/2 connection for `key` that can take one more request.
+    fn h2_free(&self, key: &Key) -> Option<usize> {
+        let free = |idx: &usize| {
+            let mux = self.conns.get(*idx).and_then(|c| c.h2.as_ref());
+            mux.is_some_and(|mux| mux.proto.capacity())
+        };
+        self.hosts.get(key)?.h2.iter().copied().find(free)
+    }
+
+    /// The server of connection `idx` picked HTTP/2: the request of the
+    /// connection is its first stream, and the requests that wait may
+    /// follow.
+    fn adopt(&mut self, idx: usize) {
+        let Some(c) = self.conns.get_mut(idx) else {
+            return;
+        };
+        let key = c.key.clone();
+        let req = c.req.take();
+        c.sent = 0;
+        c.h2 = Some(Box::new(Mux {
+            proto: h2::H2::new(),
+            subs: HashMap::new(),
+        }));
+        self.hosts.entry(key.clone()).or_default().h2.push(idx);
+        if let Some(req) = req {
+            self.h2_open(idx, req);
+        }
+        self.drive(idx);
+        self.pump(&key);
+    }
+
+    /// Makes `req` a stream of the HTTP/2 connection `idx`.
+    fn h2_open(&mut self, idx: usize, mut req: Req) {
+        let Some((head_len, fields)) = h2_fields(&req.bytes) else {
+            return self.failed(req.id, E_BAD);
+        };
+        let Some(mux) = self.conns.get_mut(idx).and_then(|c| c.h2.as_mut()) else {
+            return self.failed(req.id, E_CLOSED);
+        };
+        let upload = req.flags & UPLOAD != 0;
+        let body = &req.bytes[head_len..];
+        let list: Vec<(&[u8], &[u8])> = fields
+            .iter()
+            .map(|(name, value)| (name.as_slice(), value.as_slice()))
+            .collect();
+        let stream = mux.proto.open(&list, body.is_empty() && !upload);
+        if !body.is_empty() {
+            mux.proto.send(stream, body, !upload);
+        }
+        if upload {
+            // the connection works: Dart may give the body now
+            push_progress(&mut self.ready, req.id, head_len as u64);
+            req.bytes = Vec::new();
+        } else if req.flags & AGAIN == 0 || req.retried {
+            // only a request that may go out again keeps its bytes
+            req.bytes = Vec::new();
+        }
+        mux.subs.insert(
+            stream,
+            Sub {
+                req,
+                head_len: head_len as u64,
+                status: 0,
+                lines: Vec::new(),
+                coding: Coding::Raw,
+                body: Vec::new(),
+                down: None,
+                released: 0,
+                ended: false,
+            },
+        );
+    }
+
+    /// Reads and writes the HTTP/2 connection `idx` and gives Dart what
+    /// came for its requests.
+    fn mux(&mut self, idx: usize) {
+        let mut turns = 0;
+        let key = loop {
+            let Some(c) = self.conns.get_mut(idx) else {
+                return;
+            };
+            let (fail, eof, _) = c.io(READ_MAX);
+            let Some(mux) = c.h2.as_mut() else { return };
+            // what went out
+            let sent = c.sent.min(mux.proto.out.len());
+            mux.proto.out.drain(..sent);
+            c.sent = 0;
+            let waits = mux.proto.out.len();
+            let Ok(used) = mux.proto.recv(&c.buf[..c.filled]) else {
+                // tell the server why (GOAWAY), if the socket takes it
+                let _ = c.io(0);
+                return self.fail(idx, E_BAD);
+            };
+            c.buf.copy_within(used..c.filled, 0);
+            c.filled -= used;
+            if c.filled == 0 && c.buf.len() > KEEP_BUF {
+                c.buf = Vec::new();
+            }
+            let events = std::mem::take(&mut mux.proto.events);
+            let busy = !mux.subs.is_empty();
+            let key = c.key.clone();
+            self.h2_events(idx, events);
+            // The answers that came before a failure are whole: only now
+            // the others fail.
+            if fail.is_some() || eof {
+                return self.fail(idx, fail.unwrap_or(E_CLOSED));
+            }
+            let Some(c) = self.conns.get_mut(idx) else {
+                return;
+            };
+            let Some(mux) = c.h2.as_mut() else { return };
+            mux.proto.flush();
+            if mux.subs.is_empty() {
+                // the server said GOAWAY and has all its answers out
+                if mux.proto.goaway {
+                    self.close(idx);
+                    break key;
+                }
+                // its last request is done: it is idle from now on
+                if busy {
+                    c.idle_since = self.now;
+                }
+            }
+            // Bytes that came to `out` after the `io`: no socket event
+            // comes for them, so they need one more `io`.
+            turns += 1;
+            if mux.proto.out.len() <= waits {
+                break key;
+            }
+            if turns == 8 {
+                c.more = true;
+                break key;
+            }
+        };
+        // a stream that ended makes room for a request that waits
+        self.pump(&key);
+    }
+
+    fn h2_events(&mut self, idx: usize, events: Vec<h2::Event>) {
+        for event in events {
+            match event {
+                h2::Event::Head {
+                    stream,
+                    status,
+                    lines,
+                } => self.h2_head(idx, stream, status, lines),
+                h2::Event::Data { stream, bytes } => self.h2_pull(idx, stream, &bytes),
+                h2::Event::End { stream } => {
+                    let sub = self
+                        .conns
+                        .get_mut(idx)
+                        .and_then(|c| c.h2.as_mut())
+                        .and_then(|mux| mux.subs.get_mut(&stream));
+                    if let Some(sub) = sub {
+                        sub.ended = true;
+                    }
+                    self.h2_pull(idx, stream, &[]);
+                }
+                h2::Event::Reset {
+                    stream,
+                    error,
+                    retry,
+                } => {
+                    let Some(c) = self.conns.get_mut(idx) else {
+                        return;
+                    };
+                    let key = c.key.clone();
+                    let sub = c.h2.as_mut().and_then(|mux| mux.subs.remove(&stream));
+                    if let Some(sub) = sub {
+                        self.h2_lost(&key, sub, error, retry);
+                    }
+                }
+                h2::Event::Wrote { stream, total } => {
+                    let sub = self
+                        .conns
+                        .get_mut(idx)
+                        .and_then(|c| c.h2.as_mut())
+                        .and_then(|mux| mux.subs.get_mut(&stream));
+                    if let Some(sub) = sub
+                        && sub.req.flags & UPLOAD != 0
+                    {
+                        push_progress(&mut self.ready, sub.req.id, sub.head_len + total);
+                        // see `step`: the timeout of an upload starts again
+                        if let (Some(wait), Some(_)) = (sub.req.wait, sub.req.deadline) {
+                            sub.req.deadline = Some(self.now + wait);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The head of the answer of a stream.
+    fn h2_head(&mut self, idx: usize, stream: u32, status: u16, lines: Vec<u8>) {
+        let sub = self
+            .conns
+            .get_mut(idx)
+            .and_then(|c| c.h2.as_mut())
+            .and_then(|mux| mux.subs.get_mut(&stream));
+        let Some(sub) = sub else { return };
+        sub.status = status;
+        if sub.req.flags & DECODE != 0 {
+            sub.coding = coding_of(&lines);
+        }
+        if sub.req.flags & STREAM == 0 {
+            sub.lines = lines;
+            return;
+        }
+        // an answer with no body keeps its lines
+        let bodiless = sub.req.flags & HEAD_ONLY != 0 || status == 204 || status == 304;
+        let coded = sub.coding != Coding::Raw && !bodiless;
+        sub.down = Some(Box::new(Down {
+            sent: 0,
+            credit: 0,
+            total: 0,
+            raw: 0,
+            inflate: if coded {
+                Inflate::new(sub.coding)
+            } else {
+                None
+            },
+            redirect: (300..400).contains(&status),
+            raw_done: None,
+        }));
+        // the timeout is for the head
+        sub.req.deadline = None;
+        self.ready.push_back(Done {
+            id: sub.req.id,
+            kind: R_HEAD,
+            status,
+            error: 0,
+            lines: if coded { decoded_lines(&lines) } else { lines },
+            body: Vec::new(),
+        });
+    }
+
+    /// Body bytes of a stream came (`data`), or Dart made room, or the
+    /// server ended the answer: gives Dart what it can take, and finishes
+    /// the request when its answer is whole.
+    fn h2_pull(&mut self, idx: usize, stream: u32, data: &[u8]) {
+        let (max_body, stream_max) = (self.max_body, self.stream_max);
+        let Some(mux) = self.conns.get_mut(idx).and_then(|c| c.h2.as_mut()) else {
+            return;
+        };
+        let Some(sub) = mux.subs.get_mut(&stream) else {
+            return;
+        };
+        let id = sub.req.id;
+        // An answer to HEAD has no body. Bytes of a server that sends one
+        // are dropped, as HTTP/1.1 does not read them.
+        let data: &[u8] = if sub.req.flags & HEAD_ONLY != 0 {
+            mux.proto.release(stream, data.len() as u64);
+            &[]
+        } else {
+            data
+        };
+        let Some(down) = sub.down.as_mut() else {
+            // not streamed: the body waits here for its end
+            if sub.req.flags & STREAM != 0 {
+                return;
+            }
+            sub.body.extend_from_slice(data);
+            mux.proto.release(stream, data.len() as u64);
+            if sub.body.len() > max_body {
+                mux.subs.remove(&stream);
+                mux.proto.reset(stream, h2::CANCEL);
+                return self.failed(id, E_BIG);
+            }
+            if !sub.ended {
+                return;
+            }
+            let Some(sub) = mux.subs.remove(&stream) else {
+                return;
+            };
+            let coded = sub.coding != Coding::Raw && !sub.body.is_empty();
+            if !coded {
+                return self.done(id, sub.status, sub.lines, sub.body);
+            }
+            return match decode(sub.coding, &sub.body, max_body) {
+                Ok(plain) => self.done(id, sub.status, decoded_lines(&sub.lines), plain),
+                // a redirect is read for its `location`, not for its body
+                Err(E_BAD) if (300..400).contains(&sub.status) => {
+                    self.done(id, sub.status, sub.lines, sub.body)
+                }
+                Err(error) => self.failed(id, error),
+            };
+        };
+        let quiet = down.redirect && down.inflate.is_some();
+        let whole = match emit(down, id, data, sub.ended, stream_max, &mut self.ready) {
+            Ok(whole) => whole,
+            Err(E_BAD) if quiet => true,
+            Err(error) => {
+                mux.subs.remove(&stream);
+                mux.proto.reset(stream, h2::CANCEL);
+                return self.failed(id, error);
+            }
+        };
+        if !(whole && sub.ended) {
+            return sub.window(&mut mux.proto, stream);
+        }
+        mux.subs.remove(&stream);
+        // a bad body of a redirect ends before the server ended it
+        mux.proto.reset(stream, h2::CANCEL);
+        self.ready.push_back(Done {
+            id,
+            kind: R_END,
+            status: 0,
+            error: 0,
+            lines: Vec::new(),
+            body: Vec::new(),
+        });
+        self.open -= 1;
+    }
+
+    /// A request of an HTTP/2 connection got no whole answer. `retry`: the
+    /// server did not work on it, or the connection closed.
+    fn h2_lost(&mut self, key: &Key, mut sub: Sub, error: u16, retry: bool) {
+        let again = retry
+            && sub.status == 0
+            && sub.req.flags & AGAIN != 0
+            && sub.req.flags & UPLOAD == 0
+            && !sub.req.retried
+            && !sub.req.bytes.is_empty();
+        if again {
+            sub.req.retried = true;
+            self.hosts
+                .entry(key.clone())
+                .or_default()
+                .queue
+                .push_front(sub.req);
+        } else {
+            self.failed(sub.req.id, error);
+        }
+    }
+
     /// Finds the request `id`, on a connection or in a queue.
     fn locate(&self, id: u64) -> Option<Spot> {
         let on = |r: &Req| r.id == id;
@@ -1701,6 +2206,12 @@ impl Core {
         {
             return Some(Spot::Conn(idx));
         }
+        for (idx, c) in self.conns.iter() {
+            let Some(mux) = &c.h2 else { continue };
+            if let Some((&stream, _)) = mux.subs.iter().find(|(_, sub)| sub.req.id == id) {
+                return Some(Spot::Mux(idx, stream));
+            }
+        }
         self.hosts.iter().find_map(|(key, host)| {
             let at = host.queue.iter().position(on)?;
             Some(Spot::Queued(key.clone(), at))
@@ -1710,6 +2221,10 @@ impl Core {
     fn req_at(&mut self, spot: &Spot) -> Option<&mut Req> {
         match spot {
             Spot::Conn(idx) => self.conns.get_mut(*idx)?.req.as_mut(),
+            Spot::Mux(idx, stream) => {
+                let mux = self.conns.get_mut(*idx)?.h2.as_mut()?;
+                mux.subs.get_mut(stream).map(|sub| &mut sub.req)
+            }
             Spot::Queued(key, at) => self.hosts.get_mut(key)?.queue.get_mut(*at),
         }
     }
@@ -1717,6 +2232,14 @@ impl Core {
     /// [Q_PART]: more bytes of the request body.
     fn part(&mut self, id: u64, data: &[u8]) {
         let Some(spot) = self.locate(id) else { return };
+        if let Spot::Mux(idx, stream) = spot {
+            if let Some(mux) = self.conns.get_mut(idx).and_then(|c| c.h2.as_mut())
+                && mux.subs.get(&stream).is_some_and(|sub| sub.req.more)
+            {
+                mux.proto.send(stream, data, false);
+            }
+            return self.drive(idx);
+        }
         if let Spot::Conn(idx) = spot
             && let Some(c) = self.conns.get_mut(idx)
             && let Some(req) = &mut c.req
@@ -1731,7 +2254,17 @@ impl Core {
             }
         }
         match self.req_at(&spot) {
-            Some(req) if req.more && !req.aborted => req.bytes.extend_from_slice(data),
+            Some(req) if req.more && !req.aborted => {
+                if req.flags & CHUNKED != 0 && !data.is_empty() {
+                    let size = format!("{:x}\r\n", data.len());
+                    req.bytes.extend_from_slice(size.as_bytes());
+                    req.bytes.extend_from_slice(data);
+                    req.bytes.extend_from_slice(b"\r\n");
+                    req.framing += size.len() as u64 + 2;
+                } else {
+                    req.bytes.extend_from_slice(data);
+                }
+            }
             _ => return,
         }
         // the socket may take the bytes now, and no event comes for that
@@ -1743,25 +2276,64 @@ impl Core {
     /// [Q_END]: the request body is whole, or Dart stopped it.
     fn end_body(&mut self, id: u64, aborted: bool) {
         let Some(spot) = self.locate(id) else { return };
+        let mut last_chunk = false;
         if let Some(req) = self.req_at(&spot) {
+            if !req.more {
+                return;
+            }
             req.more = false;
             if aborted {
                 req.aborted = true;
                 req.bytes.clear();
+            } else if req.flags & CHUNKED != 0 && matches!(spot, Spot::Conn(_)) {
+                req.bytes.extend_from_slice(b"0\r\n\r\n");
+                req.framing += 5;
+                last_chunk = true;
             }
         }
-        if aborted
-            && let Spot::Conn(idx) = spot
-            && let Some(c) = self.conns.get_mut(idx)
-        {
-            c.sent = 0;
+        match spot {
+            Spot::Mux(idx, stream) => {
+                if let Some(mux) = self.conns.get_mut(idx).and_then(|c| c.h2.as_mut()) {
+                    if aborted {
+                        mux.proto.abort_send(stream);
+                    } else {
+                        mux.proto.send(stream, &[], true);
+                    }
+                }
+                self.drive(idx);
+            }
+            Spot::Conn(idx) => {
+                if aborted && let Some(c) = self.conns.get_mut(idx) {
+                    c.sent = 0;
+                }
+                // the socket may take the last chunk now
+                if last_chunk {
+                    self.drive(idx);
+                }
+            }
+            Spot::Queued(..) => {}
         }
     }
 
     /// [Q_CREDIT]: Dart used `total` bytes of the answer body.
     fn credit(&mut self, id: u64, total: u64) {
-        let Some(Spot::Conn(idx)) = self.locate(id) else {
-            return;
+        let idx = match self.locate(id) {
+            Some(Spot::Conn(idx)) => idx,
+            Some(Spot::Mux(idx, stream)) => {
+                let down = self
+                    .conns
+                    .get_mut(idx)
+                    .and_then(|c| c.h2.as_mut())
+                    .and_then(|mux| mux.subs.get_mut(&stream))
+                    .and_then(|sub| sub.down.as_mut());
+                if let Some(down) = down {
+                    down.credit = down.credit.max(total.min(down.sent));
+                }
+                self.h2_pull(idx, stream, &[]);
+                // a WINDOW_UPDATE may wait to go out
+                return self.drive(idx);
+            }
+            _ => return,
         };
         let Some(down) = self.conns.get_mut(idx).and_then(|c| c.down.as_mut()) else {
             return;
@@ -1780,6 +2352,20 @@ impl Core {
                     self.open -= 1;
                     self.pump(&conn.key);
                 }
+            }
+            Some(Spot::Mux(idx, stream)) => {
+                let Some(c) = self.conns.get_mut(idx) else {
+                    return;
+                };
+                let key = c.key.clone();
+                if let Some(mux) = c.h2.as_mut()
+                    && mux.subs.remove(&stream).is_some()
+                {
+                    mux.proto.reset(stream, h2::CANCEL);
+                    self.open -= 1;
+                }
+                self.drive(idx);
+                self.pump(&key);
             }
             Some(Spot::Queued(key, at)) => {
                 if let Some(host) = self.hosts.get_mut(&key) {
@@ -1832,6 +2418,7 @@ impl Core {
                 bytes: rec[REQ_HEAD + name_len..].to_vec(),
                 more: flags & UPLOAD != 0,
                 aborted: false,
+                framing: 0,
             },
         );
     }
@@ -1856,7 +2443,11 @@ impl Core {
         let old: Vec<usize> = self
             .conns
             .iter()
-            .filter(|(_, c)| c.req.is_none() && now.duration_since(c.idle_since) >= limit)
+            .filter(|(_, c)| {
+                c.req.is_none()
+                    && c.h2.as_ref().is_none_or(|mux| mux.subs.is_empty())
+                    && now.duration_since(c.idle_since) >= limit
+            })
             .map(|(idx, _)| idx)
             .collect();
         for idx in old {
@@ -1900,9 +2491,42 @@ impl Core {
                 self.pump(&conn.key);
             }
         }
+        // the streams of the HTTP/2 connections: the connection stays
+        let mut late: Vec<(usize, u32)> = Vec::new();
+        for (idx, c) in self.conns.iter() {
+            let Some(mux) = &c.h2 else { continue };
+            late.extend(
+                mux.subs
+                    .iter()
+                    .filter(|(_, sub)| over(&sub.req))
+                    .map(|(&stream, _)| (idx, stream)),
+            );
+        }
+        for (idx, stream) in late {
+            let Some(c) = self.conns.get_mut(idx) else {
+                continue;
+            };
+            let key = c.key.clone();
+            let Some(mux) = c.h2.as_mut() else { continue };
+            if let Some(sub) = mux.subs.remove(&stream) {
+                mux.proto.reset(stream, h2::CANCEL);
+                self.failed(sub.req.id, E_TIMEOUT);
+            }
+            self.drive(idx);
+            self.pump(&key);
+        }
         let busy = self.conns.iter().filter_map(|(_, c)| c.req.as_ref());
+        let shared = self
+            .conns
+            .iter()
+            .filter_map(|(_, c)| c.h2.as_ref())
+            .flat_map(|mux| mux.subs.values().map(|sub| &sub.req));
         let waiting = self.hosts.values().flat_map(|h| h.queue.iter());
-        self.due = busy.chain(waiting).filter_map(|r| r.deadline).min();
+        self.due = busy
+            .chain(shared)
+            .chain(waiting)
+            .filter_map(|r| r.deadline)
+            .min();
     }
 
     /// See `dox_client_run`. Err(size): the next record needs `size` bytes.
@@ -2128,7 +2752,7 @@ impl Client {
 /// The TLS setup of a client: the root certificates of Mozilla plus the
 /// certificates in `extra` (PEM). None: `extra` is not correct PEM, or has
 /// a certificate that can not be a root.
-fn tls_config(extra: &[u8]) -> Option<Arc<ClientConfig>> {
+fn tls_config(extra: &[u8], http2: bool) -> Option<Arc<ClientConfig>> {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let mut added = 0;
@@ -2145,7 +2769,12 @@ fn tls_config(extra: &[u8]) -> Option<Arc<ClientConfig>> {
         .ok()?
         .with_root_certificates(roots)
         .with_no_client_auth();
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    // the server picks the first of them that it has
+    config.alpn_protocols = if http2 {
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+    } else {
+        vec![b"http/1.1".to_vec()]
+    };
     Some(Arc::new(config))
 }
 
@@ -2154,7 +2783,9 @@ fn tls_config(extra: &[u8]) -> Option<Arc<ClientConfig>> {
 /// at most that many connections open to one address. With `max_body` > 0,
 /// a request whose answer body is bigger fails. With `idle_ms` > 0, a
 /// connection with no request for that long closes. `ca` (`ca_len` bytes,
-/// PEM) has more root certificates to trust for `https://`. Returns a handle
+/// PEM) has more root certificates to trust for `https://`. With `http2`
+/// not 0, an `https://` connection uses HTTP/2 when the server has it.
+/// Returns a handle
 /// (> 0), or < 0: -1 not initialized, -2 no poller or thread, -3 `ca` is
 /// not correct.
 ///
@@ -2168,6 +2799,7 @@ pub unsafe extern "C" fn dox_client_new(
     idle_ms: i64,
     ca: *const u8,
     ca_len: i64,
+    http2: i32,
 ) -> i64 {
     if POST.get().is_none() {
         return -1;
@@ -2177,7 +2809,7 @@ pub unsafe extern "C" fn dox_client_new(
     } else {
         &[]
     };
-    let Some(tls) = tls_config(ca) else {
+    let Some(tls) = tls_config(ca, http2 != 0) else {
         return -3;
     };
     let idle = (idle_ms > 0).then(|| Duration::from_millis(idle_ms as u64));
@@ -2364,6 +2996,9 @@ fn inflate_bytes(coding: Coding, coded: &[u8], step: usize, max: usize) -> Resul
 #[cfg(fuzzing)]
 pub(crate) fn fuzz(data: &[u8]) {
     const MAX: usize = 1 << 20;
+    h2::fuzz(data);
+    let _ = h2_fields(data);
+    let _ = coding_of(data);
     for coding in [Coding::Gzip, Coding::Brotli] {
         let whole = inflate_bytes(coding, data, data.len(), MAX);
         let split = inflate_bytes(coding, data, 1, MAX);

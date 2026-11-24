@@ -1,5 +1,12 @@
 ## Unreleased
 
+- HTTP/2. On an `https://` URL, the client asks for HTTP/2 during the TLS handshake (ALPN) and uses it when the server has it. If not, it uses HTTP/1.1.
+  - All requests to one HTTP/2 server share one connection. A request that fails or gets a timeout stops only its stream.
+  - `send`, `sendStreamed` and the other methods do not change. Streamed bodies use the flow control of HTTP/2: when the listener pauses, the server stops to send.
+  - A request that the server refused, or did not start before it closed the connection, is sent again one time (not a request with a body stream, and not `POST` or `PATCH`).
+  - `DoxHttpClient(http2: false)` uses HTTP/1.1 only.
+  - The native library does the chunked framing of a request body stream now. The ABI version of the native library is 4.
+  - The fuzz target also gives random bytes to the HTTP/2 connection and to the HPACK decoder.
 - `DoxHttpClient.sendStreamed` sends a request with a body stream and gives the answer body as a stream. The memory stays small for bodies of many GB.
   - The answer body is `DoxHttpClientStreamedResponse.body`. The new base class `DoxHttpClientResponseHead` has `url`, `statusCode`, `headers` and `header(name)`.
   - The client reads a maximum of about 512 KiB ahead. When the listener pauses, the client stops to read the connection. When you cancel the body, the client closes the connection.
@@ -10,7 +17,7 @@
   - A request with no body follows redirects. A request with a body stream does not follow them and is sent only once.
   - If the server answers before the whole body went out, the client cancels the upload and does not use the connection again.
   - New `DoxHttpFailure.badRequestBody`: the body stream gave more or fewer bytes than `contentLength`.
-  - The ABI version of the native library is 3. The records have a kind, so the answers of requests that are not streamed are as cheap as before.
+  - The records between Dart and the native library have a kind, so the answers of requests that are not streamed are as cheap as before.
 - The client follows redirects (status 301, 302, 303, 307 and 308). One request follows a maximum of 5 redirects, then it fails with the new `DoxHttpFailure.tooManyRedirects`.
   - `followRedirects` (for the client or for one `send` call) and `maxRedirects` change this.
   - A 303 redirect changes the method to `GET`. A 301 or 302 redirect changes `POST` to `GET`. A 307 or 308 redirect keeps the method and the body.

@@ -1,4 +1,4 @@
-//! Native HTTP/1.1 client for Dart (dox_http_client).
+//! Native HTTP client for Dart (dox_http_client): HTTP/1.1 and HTTP/2.
 //!
 //! Rust owns the sockets and parses the answers. It runs on the thread of
 //! the Dart isolate. See `client.rs` for the records and the connections.
@@ -11,7 +11,7 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::OnceLock;
 
 /// Bump when the FFI functions or the record layout change.
-const ABI_VERSION: i32 = 3;
+const ABI_VERSION: i32 = 4;
 
 // ---- Dart API DL -------------------------------------------------------
 // `NativeApi.initializeApiDLData` points to this table. We only need

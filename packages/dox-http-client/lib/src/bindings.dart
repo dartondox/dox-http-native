@@ -4,7 +4,7 @@ import 'dart:ffi';
 /// the library as the code asset of this file.
 
 /// The ABI version the Dart side expects. Must match `ABI_VERSION` in Rust.
-const int abiVersion = 3;
+const int abiVersion = 4;
 
 @Native<Int32 Function()>(symbol: 'dox_client_version', isLeaf: true)
 external int doxClientVersion();
@@ -28,11 +28,12 @@ external void doxClientFree(Pointer<Uint8> ptr, int size);
 /// to [sendPort]. [maxPerHost] 0 is no limit of connections to one address.
 /// [maxBody] 0 is no limit of an answer body. A connection with no request
 /// for [idleMs] closes (0: never). [ca] ([caLength] bytes, PEM) has more
-/// root certificates to trust for `https://`. Returns a handle for
-/// [doxClientRun], or -3 when [ca] is not correct.
-@Native<Int64 Function(Int64, Int64, Int64, Int64, Pointer<Uint8>, Int64)>(
-  symbol: 'dox_client_new',
-)
+/// root certificates to trust for `https://`. With [http2] not 0, an
+/// `https://` connection uses HTTP/2 when the server has it. Returns a
+/// handle for [doxClientRun], or -3 when [ca] is not correct.
+@Native<
+  Int64 Function(Int64, Int64, Int64, Int64, Pointer<Uint8>, Int64, Int32)
+>(symbol: 'dox_client_new')
 external int doxClientNew(
   int sendPort,
   int maxPerHost,
@@ -40,6 +41,7 @@ external int doxClientNew(
   int idleMs,
   Pointer<Uint8> ca,
   int caLength,
+  int http2,
 );
 
 /// Gives buffer [which] of a client (0: the requests for [doxClientRun],
