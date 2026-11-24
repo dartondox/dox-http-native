@@ -501,6 +501,22 @@ void main() {
       },
     );
 
+    test('a range request does not ask for a coded body', () async {
+      DoxHttpClientResponse res = await client.get(
+        base.resolve('/echo'),
+        headers: <String, String>{'Range': 'bytes=0-9'},
+      );
+      expect(
+        (jsonDecode(res.body) as Map<String, Object?>)['accept-encoding'],
+        isNull,
+      );
+      res = await client.get(
+        base.resolve('/gzip'),
+        headers: <String, String>{'range': 'bytes=0-9'},
+      );
+      expect(res.header('content-encoding'), 'gzip');
+    });
+
     test('maxResponseSize is for the decoded body', () async {
       DoxHttpClient small = DoxHttpClient(maxResponseSize: 11999);
       addTearDown(small.close);

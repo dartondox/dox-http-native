@@ -462,8 +462,8 @@ class DoxHttpClient implements Finalizable {
   ///
   /// The body is [body] (text, sent as UTF-8) or [bodyBytes], not both.
   /// The client sets `host`, `content-length` and `accept-encoding`. A
-  /// request with its own `accept-encoding` header gets the body as the
-  /// server sent it. [timeout] is for this
+  /// request with its own `accept-encoding` header or with a `range`
+  /// header gets the body as the server sent it. [timeout] is for this
   /// request only: `Duration.zero` is no timeout. It includes the
   /// redirects. [followRedirects] is for this request only.
   ///
@@ -580,8 +580,13 @@ class DoxHttpClient implements Finalizable {
     if (method == 'HEAD') flags |= _headOnly;
     if (tls) flags |= _tls;
     // the client asks for a coded body, so Rust decodes it
-    if (!_hasHeader(headers, 'accept-encoding')) flags |= _decode;
-    Uint8List request = _encode(method, url, headers, body, bodyBytes);
+    // Not for a part of a body (`range`): a part of a gzip body can not
+    // be decoded.
+    bool coded =
+        !_hasHeader(headers, 'accept-encoding') &&
+        !_hasHeader(headers, 'range');
+    if (coded) flags |= _decode;
+    Uint8List request = _encode(method, url, headers, body, bodyBytes, coded);
     // the length of a request record is 32 bits
     if (request.length > _maxRequest) {
       throw ArgumentError('the request is too big (over 2 GiB)');
@@ -628,13 +633,13 @@ class DoxHttpClient implements Finalizable {
     Map<String, String>? headers,
     String? body,
     Uint8List? bodyBytes,
+    bool coded,
   ) {
     String target = url.path.isEmpty ? '/' : url.path;
     if (url.hasQuery) target = '$target?${url.query}';
     StringBuffer head = StringBuffer('$method $target HTTP/1.1\r\n');
     bool hasHost = false;
     bool hasType = false;
-    bool hasCoding = false;
     if (headers != null) {
       for (MapEntry<String, String> header in headers.entries) {
         String name = header.key.toLowerCase();
@@ -650,7 +655,6 @@ class DoxHttpClient implements Finalizable {
         }
         if (name == 'host') hasHost = true;
         if (name == 'content-type') hasType = true;
-        if (name == 'accept-encoding') hasCoding = true;
         head.write('$name: ${header.value}\r\n');
       }
     }
@@ -660,7 +664,7 @@ class DoxHttpClient implements Finalizable {
       if (url.port != normal) host = '$host:${url.port}';
       head.write('host: $host\r\n');
     }
-    if (!hasCoding) head.write('accept-encoding: gzip, br\r\n');
+    if (coded) head.write('accept-encoding: gzip, br\r\n');
     Uint8List? payload = bodyBytes;
     if (body != null) {
       payload = utf8.encode(body);

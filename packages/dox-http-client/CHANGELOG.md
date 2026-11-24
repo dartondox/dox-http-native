@@ -9,7 +9,7 @@
 - The client sends `accept-encoding: gzip, br` and decodes a gzip or brotli answer body in Rust.
   - A decoded answer has no `content-encoding` header and no `content-length` header.
   - `maxResponseSize` is the limit for the decoded body.
-  - A request with its own `accept-encoding` header gets the body as the server sent it.
+  - A request with its own `accept-encoding` header or with a `range` header gets the body as the server sent it.
   - The native library has two more crates: [flate2](https://github.com/rust-lang/flate2-rs) and [brotli-decompressor](https://github.com/dropbox/rust-brotli-decompressor). The ABI version of the library is 2.
 
 ## 0.0.1
