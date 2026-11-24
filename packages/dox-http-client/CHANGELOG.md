@@ -1,4 +1,4 @@
-## Unreleased
+## 0.0.2
 
 - HTTP/2. On an `https://` URL, the client asks for HTTP/2 during the TLS handshake (ALPN) and uses it when the server has it. If not, it uses HTTP/1.1.
   - The requests to one HTTP/2 server share one connection. A request that fails or gets a timeout stops only its stream. Requests that start at the same time to a new server can open more than one connection.
