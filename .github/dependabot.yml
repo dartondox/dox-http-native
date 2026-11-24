@@ -4,6 +4,11 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    groups:
+      # CodeQL fails when its steps have different versions.
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"
   - package-ecosystem: pub
     directory: "/"
     schedule:
