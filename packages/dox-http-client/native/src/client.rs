@@ -1632,7 +1632,11 @@ impl Core {
             });
         }
         let result = c.body_step(eof, cut, ended, max, &mut self.ready);
-        let redirect = c.down.as_ref().is_some_and(|d| d.redirect);
+        // only a coded body that is bad: bad chunks are still a failure
+        let redirect = c
+            .down
+            .as_ref()
+            .is_some_and(|d| d.redirect && d.inflate.is_some());
         match result {
             Ok(None) => {}
             Ok(Some(rest)) => self.finish(idx, eof, rest == 0),

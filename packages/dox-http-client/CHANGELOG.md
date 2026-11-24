@@ -2,7 +2,7 @@
 
 - `DoxHttpClient.sendStreamed` sends a request with a body stream and gives the answer body as a stream. The memory stays small for bodies of many GB.
   - The answer body is `DoxHttpClientStreamedResponse.body`. The new base class `DoxHttpClientResponseHead` has `url`, `statusCode`, `headers` and `header(name)`.
-  - The client reads a maximum of about 256 KiB ahead. When the listener pauses, the client stops to read the connection. When you cancel the body, the client closes the connection.
+  - The client reads a maximum of about 512 KiB ahead. When the listener pauses, the client stops to read the connection. When you cancel the body, the client closes the connection.
   - The request `body` is a `Stream<List<int>>`. `contentLength` sets the `content-length` header. Without it, the client sends the body chunked. The client pauses the stream while more than 256 KiB wait to go out.
   - `timeout` is for the time until the head of the answer is there. With a body stream, the timeout starts again each time bytes of the body go out.
   - A gzip or brotli body is decoded in parts. `maxResponseSize` is the limit for the decoded bytes.

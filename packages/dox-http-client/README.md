@@ -181,7 +181,7 @@ await res.body.drain<void>();
 The rules:
 
 - `res.body` is a stream with one subscription. You must listen to it or cancel it, also when you do not need the body. A body that nobody uses keeps its connection open until `close()`.
-- The client reads a maximum of about 256 KiB ahead. When you pause the subscription, the client stops to read the connection. Thus the memory stays small for a 5 GB download.
+- The client reads a maximum of about 512 KiB ahead. When you pause the subscription, the client stops to read the connection. Thus the memory stays small for a 5 GB download.
 - The client listens to the request `body` when the connection to the server works. It pauses that subscription while more than 256 KiB wait to go out.
 - When you cancel `res.body` before its end, the client closes the connection. The connection is not used again.
 - A failure after the head is an error event on `res.body`, then the stream closes. The causes are a closed connection, a chunk that is not correct, gzip data that is not correct and a body over `maxResponseSize`.

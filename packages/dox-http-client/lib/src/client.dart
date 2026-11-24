@@ -163,7 +163,7 @@ class DoxHttpClientStreamedResponse extends DoxHttpClientResponseHead {
   /// The body as it comes. A stream with one subscription.
   ///
   /// You must listen to it or cancel it. A body that nobody uses keeps its
-  /// connection open. The client reads at most about 256 KiB ahead: when the
+  /// connection open. The client reads at most about 512 KiB ahead: when the
   /// listener pauses, the client stops to read the connection.
   ///
   /// A failure after the head (the connection closes, a chunk or the gzip
@@ -191,6 +191,10 @@ abstract class _Pending {
   /// The addresses of the host, and the one in use.
   List<InternetAddress> addresses = const <InternetAddress>[];
   int index = 0;
+
+  /// The whole timeout of a request with a body stream, in microseconds.
+  /// 0: none, or not such a request.
+  int uploadWait = 0;
 
   /// The id of the record in Rust.
   int id = 0;
@@ -870,6 +874,7 @@ class DoxHttpClient implements Finalizable {
       body,
       contentLength,
       deadline,
+      wait > 0 ? wait : 0,
     );
     if (body != null || !(followRedirects ?? this.followRedirects)) {
       return first;
@@ -920,7 +925,15 @@ class DoxHttpClient implements Finalizable {
       method = next.method;
       headers = next.headers;
       await _discard(res, deadline);
-      res = await _streamOnce(method, next.url, headers, null, null, deadline);
+      res = await _streamOnce(
+        method,
+        next.url,
+        headers,
+        null,
+        null,
+        deadline,
+        0,
+      );
     }
   }
 
@@ -1062,6 +1075,7 @@ class DoxHttpClient implements Finalizable {
     Stream<List<int>>? body,
     int? contentLength,
     int deadline,
+    int wait,
   ) {
     if (_closed) throw StateError('the client is closed');
     bool tls = url.scheme == 'https';
@@ -1108,6 +1122,7 @@ class DoxHttpClient implements Finalizable {
       body,
       contentLength,
     );
+    if (body != null) pending.uploadWait = wait;
     _start(pending);
     return pending.head.future;
   }
@@ -1389,6 +1404,9 @@ class DoxHttpClient implements Finalizable {
       int left = pending.deadline - _clock.elapsedMicroseconds;
       if (left <= 0) return _fail(pending, DoxHttpFailure.timeout);
       timeoutMs = _ceilMs(left);
+      // The timeout of an upload starts again each time bytes go out, so
+      // Rust needs all of it, not what a lookup left.
+      if (pending.uploadWait != 0) timeoutMs = _ceilMs(pending.uploadWait);
     }
     InternetAddress address = pending.addresses[pending.index];
     Uint8List request = pending.request;
