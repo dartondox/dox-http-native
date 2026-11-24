@@ -949,3 +949,122 @@ fn a_request_with_an_answer_head_is_not_sent_again() {
     assert_eq!((a[0].status, a[0].error), (0, E_CLOSED));
     assert_eq!(count.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn requests_that_time_out_together_open_no_new_connection() {
+    let (addr, count) = server(|mut s, _| {
+        read_head(&mut s);
+        thread::sleep(Duration::from_secs(2));
+    });
+    let mut core = new_core(1, 0);
+    let request = b"GET / HTTP/1.1\r\nhost: x\r\n\r\n";
+    let mut out = record(1, addr, AGAIN, 50, request);
+    out.extend(record(2, addr, AGAIN, 50, request));
+    let a = run_until(&mut core, &out, 2);
+    assert!(a.iter().all(|a| (a.status, a.error) == (0, E_TIMEOUT)));
+    assert!(core.conns.is_empty());
+    assert!(core.hosts.is_empty());
+    thread::sleep(Duration::from_millis(30));
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_body_over_the_limit_stops_the_read_early() {
+    // 64 MB that end with the connection, and a limit of 1 MB
+    let (addr, _) = server(|mut s, _| {
+        read_head(&mut s);
+        let _ = s.write_all(b"HTTP/1.1 200 OK\r\n\r\n");
+        let part = vec![b'z'; 1 << 20];
+        for _ in 0..64 {
+            if s.write_all(&part).is_err() {
+                return;
+            }
+        }
+    });
+    let mut core = new_core(0, 1 << 20);
+    let mut inb = vec![0u8; 4096];
+    let mut out = get(1, addr);
+    let start = Instant::now();
+    loop {
+        assert!(start.elapsed() < Duration::from_secs(10), "no answer");
+        let n = core.run(&out, &mut inb).unwrap();
+        out.clear();
+        // the read buffer never grows far over the limit
+        assert!(core.conns.iter().all(|(_, c)| c.buf.len() <= 4 << 20));
+        if n > 0 {
+            let a = answers(&inb[..n]);
+            assert_eq!((a[0].status, a[0].error), (0, E_BIG));
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(core.conns.is_empty());
+}
+
+#[test]
+fn a_big_body_comes_whole_through_many_read_steps() {
+    const SIZE: usize = 24 << 20;
+    let (addr, _) = server(|mut s, _| {
+        read_head(&mut s);
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {SIZE}\r\n\r\n");
+        let _ = s.write_all(head.as_bytes());
+        let part: Vec<u8> = (0..(1usize << 20)).map(|i| (i % 251) as u8).collect();
+        for _ in 0..SIZE >> 20 {
+            if s.write_all(&part).is_err() {
+                return;
+            }
+        }
+    });
+    let mut core = new_core(0, 0);
+    let mut inb = vec![0u8; SIZE + 4096];
+    let mut out = get(1, addr);
+    let start = Instant::now();
+    let n = loop {
+        assert!(start.elapsed() < Duration::from_secs(20), "no answer");
+        let n = core.run(&out, &mut inb).unwrap();
+        out.clear();
+        if n > 0 {
+            break n;
+        }
+        // no sleep while a connection has more to read: the run must go
+        // on from there with no new socket event
+        if core.again.is_empty() {
+            thread::sleep(Duration::from_millis(1));
+        }
+    };
+    let a = answers(&inb[..n]);
+    assert_eq!(a[0].body.len(), SIZE);
+    assert!(
+        a[0].body
+            .iter()
+            .enumerate()
+            .all(|(i, &b)| b == ((i % (1 << 20)) % 251) as u8)
+    );
+}
+
+// On Linux, an answer that is in the socket when a write fails can still
+// be read. Other systems can drop it.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_answer_and_a_close_before_the_whole_request_is_an_answer() {
+    let (addr, _) = server(|mut s, _| {
+        if read_head(&mut s) {
+            let _ = s.write_all(
+                b"HTTP/1.1 413 Too Big\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            // close the write side, read a part of the body, then close
+            let _ = s.shutdown(std::net::Shutdown::Write);
+            let mut some = vec![0u8; 1 << 20];
+            let _ = s.read(&mut some);
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
+    const SIZE: usize = 64 << 20;
+    let mut request =
+        format!("POST / HTTP/1.1\r\nhost: x\r\ncontent-length: {SIZE}\r\n\r\n").into_bytes();
+    request.extend(std::iter::repeat_n(7u8, SIZE));
+    let mut core = new_core(0, 0);
+    let a = run_until(&mut core, &record(1, addr, 0, 5000, &request), 1);
+    assert_eq!((a[0].status, a[0].error), (413, 0));
+    assert!(core.conns.is_empty());
+}

@@ -45,7 +45,7 @@
 //!   one address. More requests wait for a free one, in order.
 //! - A kept connection may be closed by the server just when the next
 //!   request goes out. When no answer byte came, a request with [AGAIN]
-//!   is sent one more time on a new connection.
+//!   is sent one more time, before the requests that wait.
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::io::{ErrorKind, Read, Write};
@@ -67,6 +67,12 @@ const REQ_HEAD: usize = 40;
 const RES_HEAD: usize = 20;
 /// Smallest free room in a read buffer before a read.
 const READ_ROOM: usize = 16 * 1024;
+/// Most bytes one connection reads in one step. Then the limits are
+/// checked, and the other connections get their turn.
+const READ_MAX: usize = 256 * 1024;
+/// Most bytes all connections read in one `dox_client_run` call after the
+/// first step of each. Then Dart gets its event loop back.
+const RUN_MAX: usize = 4 * 1024 * 1024;
 /// A read buffer bigger than this is freed after its answer.
 const KEEP_BUF: usize = 64 * 1024;
 /// Most bytes of the status line plus headers of an answer.
@@ -104,6 +110,8 @@ const E_TLS: u16 = 6;
 struct Req {
     id: u64,
     flags: u8,
+    /// it was sent a second time: never a third time
+    retried: bool,
     deadline: Option<Instant>,
     bytes: Vec<u8>,
 }
@@ -360,6 +368,9 @@ struct Conn {
     reused: bool,
     /// when its last answer was whole (for an idle connection)
     idle_since: Instant,
+    /// The last `io` stopped at [READ_MAX]: the socket may have more
+    /// bytes, and no new event comes for them.
+    more: bool,
 }
 
 impl Conn {
@@ -367,6 +378,7 @@ impl Conn {
     /// Returns the error when the connection failed, true when the server
     /// closed it, and true when a TLS connection ended with no TLS close.
     fn io(&mut self) -> (Option<u16>, bool, bool) {
+        self.more = false;
         match self.tls.take() {
             Some(mut tls) => {
                 let result = self.tls_io(&mut tls);
@@ -404,7 +416,14 @@ impl Conn {
                 },
             }
         }
-        while !fail {
+        // Read also after a write that failed: the server may have answered
+        // and closed before it read the whole request (eg. 413).
+        let start = self.filled;
+        loop {
+            if self.filled - start >= READ_MAX {
+                self.more = true;
+                break;
+            }
             room(&mut self.buf, self.filled);
             match self.stream.read(&mut self.buf[self.filled..]) {
                 Ok(0) => {
@@ -418,7 +437,10 @@ impl Conn {
                 Err(e) => match e.kind() {
                     ErrorKind::Interrupted => {}
                     ErrorKind::WouldBlock | ErrorKind::NotConnected => break,
-                    _ => fail = true,
+                    _ => {
+                        fail = true;
+                        break;
+                    }
                 },
             }
         }
@@ -435,9 +457,10 @@ impl Conn {
         let mut fail: Option<u16> = None;
         let mut eof = false;
         let mut cut = false;
+        let start = self.filled;
         loop {
             let mut progress = false;
-            if self.sent < bytes.len() {
+            if fail.is_none() && self.sent < bytes.len() {
                 // takes what fits in the TLS buffer, also during the handshake
                 match tls.writer().write(&bytes[self.sent..]) {
                     Ok(n) => {
@@ -461,7 +484,9 @@ impl Conn {
                     },
                 }
             }
-            if fail.is_none() && !eof {
+            // also after a write that failed: the server may have answered
+            // and closed before it read the whole request (eg. 413)
+            if fail != Some(E_TLS) && !eof {
                 match tls.read_tls(&mut self.stream) {
                     Ok(0) => eof = true,
                     Ok(_) => {
@@ -476,7 +501,7 @@ impl Conn {
                     Err(e) => match e.kind() {
                         ErrorKind::Interrupted => progress = true,
                         ErrorKind::WouldBlock | ErrorKind::NotConnected => {}
-                        _ => fail = closed(self.connected),
+                        _ => fail = fail.or(closed(self.connected)),
                     },
                 }
             }
@@ -512,6 +537,10 @@ impl Conn {
             if fail.is_some() || !progress || (eof && !tls.wants_write()) {
                 return (fail, eof, cut);
             }
+            if self.filled - start >= READ_MAX {
+                self.more = true;
+                return (fail, eof, cut);
+            }
         }
     }
 }
@@ -541,6 +570,8 @@ struct Core {
     /// `events` has events that no call looked at yet (Windows helper)
     stored: bool,
     tokens: Vec<usize>,
+    /// connections whose read stopped at [READ_MAX]
+    again: Vec<usize>,
     conns: Slab<Conn>,
     hosts: HashMap<Key, Host>,
     ready: VecDeque<Done>,
@@ -575,6 +606,7 @@ impl Core {
             events: Events::with_capacity(256),
             stored: false,
             tokens: Vec::new(),
+            again: Vec::new(),
             conns: Slab::new(),
             hosts: HashMap::new(),
             ready: VecDeque::new(),
@@ -632,31 +664,28 @@ impl Core {
     fn fail(&mut self, idx: usize, error: u16) {
         let Some(conn) = self.close(idx) else { return };
         let key = conn.key;
-        if let Some(req) = conn.req {
+        if let Some(mut req) = conn.req {
             // `head`: the read buffer of a chunked answer is empty again
             // after its head, so `filled` alone does not say "no answer byte"
             let again = conn.reused
                 && conn.filled == 0
                 && conn.head.is_none()
                 && req.flags & AGAIN != 0
-                && error == E_CLOSED
-                && self.room(&key);
+                && !req.retried
+                && error == E_CLOSED;
             if again {
-                self.connect(key.clone(), req);
+                // first in the queue: it is older than each request there
+                req.retried = true;
+                self.hosts
+                    .entry(key.clone())
+                    .or_default()
+                    .queue
+                    .push_front(req);
             } else {
                 self.failed(req.id, error);
             }
         }
         self.pump(&key);
-    }
-
-    /// true when one more connection for `key` may open
-    fn room(&self, key: &Key) -> bool {
-        self.max_per_host == 0
-            || self
-                .hosts
-                .get(key)
-                .is_none_or(|h| h.count < self.max_per_host)
     }
 
     /// Drops the entry of `key` when it has no connection and no request.
@@ -716,6 +745,7 @@ impl Core {
             connected: false,
             reused: false,
             idle_since: self.now,
+            more: false,
         });
         self.hosts.entry(key).or_default().count += 1;
     }
@@ -770,9 +800,19 @@ impl Core {
         }
     }
 
+    /// Runs `step` for connection `idx`. When its read stopped at
+    /// [READ_MAX], the connection gets one more step later in this call or
+    /// in the next one.
+    fn drive(&mut self, idx: usize) {
+        self.step(idx);
+        if self.conns.get(idx).is_some_and(|c| c.more) {
+            self.again.push(idx);
+        }
+    }
+
     /// Writes what is left of the request, reads what the socket has and
     /// finishes the request when its answer is whole.
-    fn drive(&mut self, idx: usize) {
+    fn step(&mut self, idx: usize) {
         let max = self.max_body;
         let Some(c) = self.conns.get_mut(idx) else {
             return;
@@ -908,6 +948,22 @@ impl Core {
     fn expire(&mut self) {
         let now = self.now;
         let over = |r: &Req| r.deadline.is_some_and(|d| d <= now);
+        // The queues first: a connection that closes below gives its place
+        // to a waiting request, and that request must not be over its
+        // timeout too.
+        let mut late: Vec<u64> = Vec::new();
+        for host in self.hosts.values_mut() {
+            host.queue.retain(|r| {
+                let keep = !over(r);
+                if !keep {
+                    late.push(r.id);
+                }
+                keep
+            });
+        }
+        for id in late {
+            self.failed(id, E_TIMEOUT);
+        }
         let late: Vec<usize> = self
             .conns
             .iter()
@@ -921,19 +977,6 @@ impl Core {
                 }
                 self.pump(&conn.key);
             }
-        }
-        let mut late: Vec<u64> = Vec::new();
-        for host in self.hosts.values_mut() {
-            host.queue.retain(|r| {
-                let keep = !over(r);
-                if !keep {
-                    late.push(r.id);
-                }
-                keep
-            });
-        }
-        for id in late {
-            self.failed(id, E_TIMEOUT);
         }
         let busy = self.conns.iter().filter_map(|(_, c)| c.req.as_ref());
         let waiting = self.hosts.values().flat_map(|h| h.queue.iter());
@@ -984,6 +1027,7 @@ impl Core {
                 Req {
                     id,
                     flags,
+                    retried: false,
                     deadline,
                     bytes: rec[REQ_HEAD + name_len..].to_vec(),
                 },
@@ -995,6 +1039,19 @@ impl Core {
         if !self.conns.is_empty() {
             let _ = self.poll.poll(&mut self.events, Some(Duration::ZERO));
             self.turn();
+        }
+        // the connections with more bytes to read, up to [RUN_MAX] in all
+        let mut steps = RUN_MAX / READ_MAX;
+        while steps > 0 && !self.again.is_empty() {
+            let list = std::mem::take(&mut self.again);
+            for idx in list {
+                if steps > 0 {
+                    steps -= 1;
+                    self.drive(idx);
+                } else {
+                    self.again.push(idx);
+                }
+            }
         }
         if self.due.is_some_and(|d| d <= self.now) {
             self.expire();
@@ -1029,6 +1086,7 @@ impl Core {
     /// Closes all connections. Open requests get no answer.
     fn stop(&mut self) {
         self.conns.clear();
+        self.again.clear();
         self.hosts.clear();
         self.ready.clear();
         self.open = 0;
@@ -1308,6 +1366,13 @@ pub unsafe extern "C" fn dox_client_run(
         s.cv.notify_one();
     }
     match got {
+        Ok(0) if !core.again.is_empty() => {
+            // a connection has more bytes to read and no event comes for
+            // them: come back after a turn of the event loop
+            drop(core);
+            post(s.dart_port, &[1]);
+            0
+        }
         Ok(0) if core.open > 0 => {
             s.set_due(core.due);
             s.armed.store(true, Ordering::Release);
