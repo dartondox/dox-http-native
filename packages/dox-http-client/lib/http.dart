@@ -3,7 +3,6 @@
 library;
 
 import 'dart:async';
-import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
 
@@ -60,6 +59,13 @@ class DoxHttpPackageClient extends http.BaseClient {
     Future<void>? abort = request is http.Abortable
         ? request.abortTrigger
         : null;
+    if (abort != null) {
+      // a trigger that is complete now: the request must not go out
+      bool aborted = false;
+      unawaited(abort.then((_) => aborted = true));
+      await null;
+      if (aborted) throw http.RequestAbortedException(request.url);
+    }
     int? length = request.contentLength;
     http.ByteStream body = request.finalize();
     // the native client sets these two itself
@@ -72,14 +78,19 @@ class DoxHttpPackageClient extends http.BaseClient {
     // No body: the native client then follows redirects and can send the
     // request again. It sends `content-length: 0` for POST, PUT and PATCH.
     bool empty = length == 0;
-    if (empty) unawaited(body.drain<void>());
+    if (empty) body.drain<void>().ignore();
     DoxHttpClientStreamedResponse res;
     try {
       Future<DoxHttpClientStreamedResponse> pending = _client.sendStreamed(
         request.method,
         request.url,
         headers: headers,
-        body: empty ? null : body,
+        // an abort stops the upload: the request then fails with it
+        body: empty
+            ? null
+            : abort == null
+            ? body
+            : _body(body, abort, request.url),
         contentLength: empty ? null : length,
         followRedirects: request.followRedirects,
       );
@@ -126,11 +137,11 @@ class DoxHttpPackageClient extends http.BaseClient {
   /// [abort] completes before the end, the stream gets a
   /// `RequestAbortedException` and closes, and [source] is canceled.
   Stream<List<int>> _body(
-    Stream<Uint8List> source,
+    Stream<List<int>> source,
     Future<void>? abort,
     Uri url,
   ) {
-    StreamSubscription<Uint8List>? sub;
+    StreamSubscription<List<int>>? sub;
     bool over = false;
     late StreamController<List<int>> out;
     out = StreamController<List<int>>(

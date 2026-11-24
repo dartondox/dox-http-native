@@ -7,7 +7,7 @@ import 'package:dox_http_client/http.dart';
 import 'package:http/http.dart' as http;
 import 'package:test/test.dart';
 
-import 'client_test.dart' show handle;
+import 'client_test.dart' show connections, handle;
 
 void main() {
   late HttpServer server;
@@ -19,6 +19,7 @@ void main() {
     server.listen(handle);
     base = Uri.parse('http://127.0.0.1:${server.port}');
     client = DoxHttpPackageClient();
+    connections.clear();
   });
 
   tearDown(() async {
@@ -180,6 +181,41 @@ void main() {
     await expectLater(pending, throwsA(isA<http.RequestAbortedException>()));
     // the client still works
     expect((await client.get(base)).body, 'Hello World');
+  });
+
+  test('a trigger that is complete sends no request', () async {
+    await expectLater(
+      client.send(
+        http.AbortableRequest(
+          'POST',
+          base.resolve('/hold'),
+          abortTrigger: Future<void>.value(),
+        ),
+      ),
+      throwsA(isA<http.RequestAbortedException>()),
+    );
+    expect(connections, isEmpty);
+  });
+
+  test('abort stops an upload', () async {
+    Completer<void> abort = Completer<void>();
+    bool canceled = false;
+    StreamController<List<int>> body = StreamController<List<int>>(
+      onCancel: () => canceled = true,
+    );
+    body.add(utf8.encode('start'));
+    http.AbortableStreamedRequest request = http.AbortableStreamedRequest(
+      'POST',
+      base.resolve('/hold'),
+      abortTrigger: abort.future,
+    );
+    unawaited(request.sink.addStream(body.stream));
+    Future<http.StreamedResponse> pending = client.send(request);
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+    abort.complete();
+    await expectLater(pending, throwsA(isA<http.RequestAbortedException>()));
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+    expect(canceled, isTrue);
   });
 
   test('abort in the body ends the stream with the exception', () async {
