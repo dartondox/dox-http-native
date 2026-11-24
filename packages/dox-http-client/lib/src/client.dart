@@ -490,6 +490,9 @@ class DoxHttpClient implements Finalizable {
   ///
   /// With [maxConnectionsPerHost] > 0, the client holds at most that many
   /// connections open to one address. More requests wait for a free one.
+  /// An HTTP/2 connection that takes no new requests (the server closes
+  /// it, or it gave no answer in the timeout) does not count while it ends
+  /// its requests.
   ///
   /// With [maxResponseSize] > 0, a request whose answer body has more
   /// bytes fails.

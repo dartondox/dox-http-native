@@ -385,7 +385,10 @@ impl H2 {
                     break;
                 }
             }
-            if st.pos > OUT_HIGH {
+            // Give the memory of the bytes that went out back. Only when
+            // they are the bigger part: else a big body is moved again and
+            // again.
+            if st.pos > OUT_HIGH && st.pos >= st.body.len() / 2 {
                 st.body.drain(..st.pos);
                 st.pos = 0;
             }
