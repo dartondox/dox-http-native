@@ -296,8 +296,6 @@ class _StreamPending extends _Pending {
   void onHead(int status, Uint8List lines) {
     gotHead = true;
     Stream<Uint8List> body = controller.stream;
-    // a body that nobody listens to and nobody can reach: cancel it
-    DoxHttpClient._abandoned.attach(body, this, detach: this);
     head.complete(DoxHttpClientStreamedResponse._(url, status, lines, body));
     // the server answered before it had the whole request
     if (upload != null && !uploadOver) _abortUpload();
@@ -313,7 +311,6 @@ class _StreamPending extends _Pending {
 
   void _onListen() {
     listened = true;
-    DoxHttpClient._abandoned.detach(this);
     pump();
   }
 
@@ -337,7 +334,6 @@ class _StreamPending extends _Pending {
       }
       if (streamEnded && queue.isEmpty) {
         finished = true;
-        DoxHttpClient._abandoned.detach(this);
         Object? error = failure;
         if (error != null) controller.addError(error, failureTrace);
         controller.close();
@@ -631,12 +627,6 @@ class DoxHttpClient implements Finalizable {
   /// The most bytes of a redirect body that the client reads to keep the
   /// connection. After them it closes the connection.
   static const int _redirectBody = 64 * 1024;
-
-  /// Cancels the answer body of a request that nobody listened to, when
-  /// the stream is collected.
-  static final Finalizer<_StreamPending> _abandoned = Finalizer<_StreamPending>(
-    (_StreamPending pending) => pending.client._cancelStream(pending),
-  );
 
   /// How long the addresses of a host name are kept.
   static const Duration _lookupTime = Duration(seconds: 30);
@@ -1165,7 +1155,6 @@ class DoxHttpClient implements Finalizable {
     if (pending.finished) return;
     pending.finished = true;
     pending.queue.clear();
-    _abandoned.detach(pending);
     _forget(pending);
   }
 

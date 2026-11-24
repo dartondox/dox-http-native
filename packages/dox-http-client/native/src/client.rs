@@ -347,8 +347,10 @@ struct Feed {
 
 impl Feed {
     fn push(&mut self, bytes: &[u8]) {
-        if self.pos == self.buf.len() {
-            self.buf.clear();
+        // The bytes the decoder took go away. The decoder stops when Dart
+        // has no room, so it does not often take all of them.
+        if self.pos > 0 {
+            self.buf.drain(..self.pos);
             self.pos = 0;
         }
         self.buf.extend_from_slice(bytes);
@@ -967,7 +969,9 @@ impl Conn {
         let id = req.id;
         if let Some(rest) = down.raw_done {
             let out = emit(down, id, &[], true, max, ready)?;
-            return Ok(out.then_some(rest));
+            // more bytes may have come after the body since then: the
+            // connection is then not clean
+            return Ok(out.then_some(rest.max(self.filled)));
         }
         // the raw body bytes that are here, and if they end the body
         let (out, raw_end, rest) = match &mut head.body {
@@ -1114,7 +1118,9 @@ fn emit(
     let mut out = vec![0u8; PART_MAX];
     loop {
         // Dart has no room: the coded bytes wait in the decoder
-        let want = PART_MAX.min(down.room()).min(max - down.total + 1);
+        let want = PART_MAX
+            .min(down.room())
+            .min((max - down.total).saturating_add(1));
         if want == 0 {
             return Ok(false);
         }
@@ -1186,6 +1192,9 @@ struct Core {
     now: Instant,
     max_per_host: usize,
     max_body: usize,
+    /// The biggest body of a streamed answer. It comes in parts, so it has
+    /// no limit when Dart gives none.
+    stream_max: usize,
     /// an idle connection closes after this time. None: never.
     idle_timeout: Option<Duration>,
     /// when `run` next looks for idle connections to close
@@ -1222,6 +1231,7 @@ impl Core {
             } else {
                 max_body.min(MAX_BODY)
             },
+            stream_max: if max_body == 0 { usize::MAX } else { max_body },
             idle_timeout,
             next_sweep: Instant::now(),
             tls,
@@ -1464,7 +1474,7 @@ impl Core {
         let streamed = req.flags & STREAM != 0;
         if c.head.is_none() {
             // a streamed body has its limit while it comes
-            let limit = if streamed { MAX_BODY } else { max };
+            let limit = if streamed { usize::MAX } else { max };
             match parse_head(&c.buf[..c.filled], req.flags & HEAD_ONLY != 0, limit) {
                 Ok(Some(head)) => c.head = Some(head),
                 Ok(None) if c.filled > MAX_HEAD => return self.fail(idx, E_BAD),
@@ -1571,7 +1581,7 @@ impl Core {
     /// The answer of a streamed request: the head goes to Dart, then the
     /// body in parts, as far as Dart has room for them.
     fn stream(&mut self, idx: usize, eof: bool, cut: bool, ended: u16) {
-        let max = self.max_body;
+        let max = self.stream_max;
         let Some(c) = self.conns.get_mut(idx) else {
             return;
         };

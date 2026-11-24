@@ -1597,6 +1597,84 @@ fn a_streamed_gzip_answer_is_decoded_in_parts() {
 }
 
 #[test]
+fn the_decoder_keeps_no_coded_bytes_that_it_took() {
+    // text that does not pack well, so the coded body is big too
+    let mut seed = 1u32;
+    let text: Vec<u8> = (0..4 << 20)
+        .map(|_| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            b'a' + ((seed >> 16) % 16) as u8
+        })
+        .collect();
+    let z = gzip(&text);
+    assert!(z.len() > 1 << 20);
+    let head = format!(
+        "HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\ncontent-length: {}\r\n\r\n",
+        z.len()
+    );
+    let (addr, _) = server(move |mut s, _| {
+        read_head(&mut s);
+        let _ = s.write_all(head.as_bytes());
+        let _ = s.write_all(&z);
+        thread::sleep(Duration::from_millis(200));
+    });
+    let mut core = new_core(0, 0);
+    let mut r = Reader::new(1);
+    let mut most = 0;
+    let mut out = sget(1, addr, DECODE, 5000);
+    let start = Instant::now();
+    while !r.over() {
+        assert!(start.elapsed() < Duration::from_secs(20), "stuck");
+        if r.used < r.body.len() as u64 {
+            r.used = r.body.len() as u64;
+            out.extend(q_credit(1, r.used));
+        }
+        let n = r.run(&mut core, &out);
+        out.clear();
+        for (_, c) in core.conns.iter_mut() {
+            if let Some(inflate) = c.down.as_mut().and_then(|d| d.inflate.as_mut()) {
+                most = most.max(inflate.feed_mut().buf.len());
+            }
+        }
+        if n == 0 && core.again.is_empty() {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    assert!(r.ended && r.body == text);
+    assert!(most <= HIGH + READ_MAX, "{most}");
+}
+
+/// A streamed body has no 4 GiB limit: only a whole body must fit in one
+/// record.
+#[test]
+fn a_streamed_body_can_be_over_4_gib() {
+    let head = "HTTP/1.1 200 OK\r\ncontent-length: 5000000000\r\n\r\n";
+    assert!(matches!(
+        parse_head(head.as_bytes(), false, MAX_BODY),
+        Err(E_BIG)
+    ));
+    let (addr, _) = server(move |mut s, _| {
+        read_head(&mut s);
+        let _ = s.write_all(head.as_bytes());
+        let _ = s.write_all(&[7u8; 1000]);
+        thread::sleep(Duration::from_millis(300));
+    });
+    let mut core = new_core(0, 0);
+    let mut r = Reader::new(1);
+    r.until(&mut core, &sget(1, addr, 0, 5000), true, |r| {
+        r.body.len() >= 1000 || r.error.is_some()
+    });
+    assert_eq!((r.status, r.error), (Some(200), None));
+    assert!(r.lines.contains("content-length:5000000000"));
+    r.run(&mut core, &q_cancel(1));
+    // with a limit from Dart, the body fails when it is over it
+    let mut core = new_core(0, 500);
+    let mut r = Reader::new(1);
+    r.until(&mut core, &sget(1, addr, 0, 5000), true, |r| r.over());
+    assert_eq!(r.error, Some(E_BIG));
+}
+
+#[test]
 fn a_streamed_brotli_answer_is_decoded() {
     let mut a = format!(
         "HTTP/1.1 200 OK\r\nContent-Encoding: br\r\nContent-Length: {}\r\n\r\n",

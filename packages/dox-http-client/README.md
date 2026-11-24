@@ -191,7 +191,7 @@ The rules:
 - A request with no `body` follows redirects like `send`. A request with a `body` never follows redirects, because the stream can not be read again. You get the redirect answer.
 - The client sends a request with a `body` only once. It does not send it again when a kept connection was closed.
 - If the `body` stream gives more or fewer bytes than `contentLength`, the request fails with `badRequestBody`. If the `body` stream fails with an error, the request fails with that error. In both cases the client closes the connection.
-- The server can answer before the whole `body` went out, for example with 401 or 413. The client cancels the `body` subscription and gives you that answer. The connection is not used again.
+- The server can answer before the whole `body` went out, for example with 401 or 413. The client cancels the `body` subscription and gives you that answer. The connection is not used again. This also applies to an answer with status 200: the client does not send a body and read the answer body at the same time.
 - The headers `content-length` and `transfer-encoding` are not allowed. Use `contentLength`.
 - `close()` fails open streams with `clientClosed`.
 
