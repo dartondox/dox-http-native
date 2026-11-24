@@ -160,7 +160,7 @@ jobs:
           fi
           git commit -am "Hashes of the $GITHUB_REF_NAME libraries"
           # main moved after the fetch: put the commit on top and try again
-          for try in 1 2 3; do
+          for _ in 1 2 3; do
             if git push origin main; then
               exit 0
             fi
