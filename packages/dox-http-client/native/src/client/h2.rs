@@ -63,6 +63,8 @@ const OUT_HIGH: usize = 256 * 1024;
 /// A server that makes us answer (PING, SETTINGS) and does not read: the
 /// connection closes when the answers in `out` are over this.
 const OUT_MAX: usize = 4 << 20;
+/// No stream gets this number or a higher one (the highest is 2^31 - 1).
+const LAST_STREAM: u32 = 0x7fff_fff0;
 /// Most open streams before the SETTINGS frame of the server came.
 const EARLY_STREAMS: u32 = 100;
 /// Most bytes of one header block (HEADERS and its CONTINUATION frames).
@@ -142,8 +144,9 @@ pub(super) struct H2 {
     pub(super) goaway: bool,
     /// A connection error: the caller closes the connection.
     dead: bool,
-    /// Bytes in `out` that answer frames of the server (ACK,
-    /// WINDOW_UPDATE, RST_STREAM), since `out` was empty.
+    /// Bytes that answered frames of the server (ACK, WINDOW_UPDATE,
+    /// RST_STREAM), less the bytes that the socket took since. Over
+    /// [`OUT_MAX`]: the server makes us write and does not read.
     replies: usize,
 }
 
@@ -205,6 +208,13 @@ impl H2 {
         }
     }
 
+    /// The socket took the first `n` bytes of `out`.
+    pub(super) fn wrote(&mut self, n: usize) {
+        let n = n.min(self.out.len());
+        self.out.drain(..n);
+        self.replies = self.replies.saturating_sub(n);
+    }
+
     /// True when `open` may be called.
     pub(super) fn capacity(&self) -> bool {
         // before its SETTINGS the limit of the server is not known: not
@@ -217,7 +227,7 @@ impl H2 {
         !self.goaway
             && !self.dead
             && self.streams.len() < max as usize
-            && self.next_id < 0x7fff_fff0
+            && self.next_id < LAST_STREAM
     }
 
     /// The streams that are open.
@@ -231,6 +241,11 @@ impl H2 {
     pub(super) fn open(&mut self, fields: &[(&[u8], &[u8])], end: bool) -> u32 {
         let id = self.next_id;
         self.next_id += 2;
+        // no stream numbers are left after this one: as after a GOAWAY, the
+        // connection ends its requests and the next ones get a new one
+        if self.next_id >= LAST_STREAM {
+            self.goaway = true;
+        }
         let mut block = Vec::new();
         for (name, value) in fields {
             hpack::encode_field(name, value, &mut block);
@@ -386,6 +401,12 @@ impl H2 {
         }
     }
 
+    /// The next stream gets the last number.
+    #[cfg(test)]
+    pub(super) fn skip_to_last_stream(&mut self) {
+        self.next_id = LAST_STREAM - 1;
+    }
+
     /// The request body bytes of `stream` that are not in frames yet.
     #[cfg(test)]
     pub(super) fn waiting(&self, stream: u32) -> usize {
@@ -400,10 +421,6 @@ impl H2 {
     pub(super) fn recv(&mut self, input: &[u8]) -> Result<usize, ()> {
         if self.dead {
             return Err(());
-        }
-        // the socket took all that was there
-        if self.out.is_empty() {
-            self.replies = 0;
         }
         let mut p = 0;
         while input.len() - p >= 9 {
@@ -424,7 +441,8 @@ impl H2 {
             if let Err(code) = self.on_frame(ty, flags, stream, payload) {
                 return self.die(code);
             }
-            // only the bytes that the server made us write count
+            // only the bytes that the server made us write count, and only
+            // while they wait in `out`
             self.replies += self.out.len() - before;
             if self.replies > OUT_MAX {
                 return self.die(ENHANCE_YOUR_CALM);

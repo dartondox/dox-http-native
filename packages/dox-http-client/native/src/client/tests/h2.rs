@@ -1231,7 +1231,13 @@ fn h2_a_connection_that_fails_fails_its_requests() {
 
 #[test]
 fn h2_the_stream_limit_of_the_server_makes_requests_wait() {
-    let s = h2_server(&[(3, 1)], echo);
+    // a server that needs a moment for each answer
+    let s = h2_server(&[(3, 1)], |peer, _| {
+        while let Some((stream, fields, _)) = peer.request() {
+            thread::sleep(Duration::from_millis(30));
+            peer.answer(stream, "200", &[], field(&fields, ":path").as_bytes());
+        }
+    });
     let config = tls_config(s.pem.as_bytes(), true).unwrap();
     let mut core = Core::new(1, 0, None, config).unwrap();
     run_until(&mut core, &get_path(1, s.addr, "/"), 1);
@@ -1545,4 +1551,83 @@ fn h2_a_whole_coded_answer_stays_when_the_connection_closes() {
             .iter()
             .all(|(_, c)| c.h2.as_ref().is_some_and(|m| !m.gone))
     );
+}
+
+#[test]
+fn h2_a_connection_that_went_dead_gets_no_new_request() {
+    let s = h2_server(&[], |peer, n| {
+        if n > 0 {
+            return echo(peer, n);
+        }
+        let Some((stream, _, _)) = peer.request() else {
+            return;
+        };
+        peer.answer(stream, "200", &[], b"first");
+        // from now on the server reads nothing and sends nothing, and the
+        // socket stays open
+        thread::sleep(Duration::from_secs(3));
+    });
+    let mut core = h2_core(&s.pem);
+    assert_eq!(
+        run_until(&mut core, &get_path(1, s.addr, "/"), 1)[0].status,
+        200
+    );
+    let slow = |id: u64| {
+        let request = "POST /x HTTP/1.1\r\nhost: localhost\r\ncontent-length: 0\r\n\r\n";
+        req(id, s.addr, 0, 150, request)
+    };
+    // the first one finds out: no byte came for it
+    let a = run_until(&mut core, &slow(2), 1);
+    assert_eq!((a[0].status, a[0].error), (0, E_TIMEOUT));
+    assert!(shared(&core).is_empty());
+    // the next one gets a new connection
+    let a = run_until(&mut core, &slow(3), 1);
+    assert_eq!(
+        (a[0].status, a[0].body.as_slice()),
+        (200, &b"POST /x 0"[..])
+    );
+    assert_eq!(s.count.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn proto_answers_to_the_server_have_a_limit_only_while_they_wait() {
+    let ping = {
+        let mut b = Vec::new();
+        frame(&mut b, 6, 0, 0, b"12345678");
+        b
+    };
+    // a long upload: `out` is never empty, but the socket takes the bytes
+    let mut h = H2::new();
+    h.recv(&hello()).unwrap();
+    let stream = h.open(GET, false);
+    h.send(stream, &[1u8; 30_000], false);
+    for _ in 0..400_000 {
+        assert_eq!(h.recv(&ping), Ok(ping.len()));
+        // all but one byte: `out` is never empty
+        let n = h.out.len() - 1;
+        h.wrote(n);
+    }
+    // a server that sends PING and reads nothing
+    let mut h = H2::new();
+    h.recv(&hello()).unwrap();
+    let mut pings = 0;
+    while h.recv(&ping).is_ok() {
+        pings += 1;
+        assert!(pings < 1_000_000);
+    }
+    assert!(h.out.len() < 5 << 20);
+    assert!(pings > 100_000);
+}
+
+#[test]
+fn proto_a_connection_with_no_stream_numbers_left_takes_no_request() {
+    let mut h = H2::new();
+    h.recv(&hello()).unwrap();
+    assert!(h.capacity() && !h.goaway);
+    h.skip_to_last_stream();
+    assert!(h.capacity());
+    h.open(GET, true);
+    assert!(!h.capacity());
+    // as after a GOAWAY: the client makes a new connection
+    assert!(h.goaway);
 }

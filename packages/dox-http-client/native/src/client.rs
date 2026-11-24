@@ -785,6 +785,8 @@ struct Mux {
     /// The connection is closed. It stays for the answers that are whole
     /// and that Dart did not read to their end yet.
     gone: bool,
+    /// when bytes of the server came last
+    last_read: Instant,
 }
 
 /// One request on an HTTP/2 connection.
@@ -804,6 +806,8 @@ struct Sub {
     released: u64,
     /// the server ended the answer: Dart may still have to use bytes
     ended: bool,
+    /// when the request went on the connection
+    since: Instant,
 }
 
 impl Sub {
@@ -1434,6 +1438,7 @@ impl Core {
             mux.gone = true;
             mux.proto.goaway = true;
             let _ = self.poll.registry().deregister(&mut c.stream);
+            let _ = c.stream.shutdown(std::net::Shutdown::Both);
             let key = c.key.clone();
             let mut lost: Vec<u32> = mux
                 .subs
@@ -1599,6 +1604,7 @@ impl Core {
         let leaving = self.leaving(&key);
         let host = self.hosts.entry(key.clone()).or_default();
         if self.max_per_host == 0 || host.count - leaving < self.max_per_host {
+            // (`leaving` is not more than `max_per_host`)
             self.connect(key, req);
         } else {
             host.queue.push_back(req);
@@ -1946,7 +1952,9 @@ impl Core {
             let mux = self.conns.get(**idx).and_then(|c| c.h2.as_ref());
             mux.is_some_and(|mux| mux.proto.goaway)
         };
-        host.h2.iter().filter(leaves).count()
+        // not without end: a server that says GOAWAY on each connection
+        // gets at most the limit one more time
+        host.h2.iter().filter(leaves).count().min(self.max_per_host)
     }
 
     /// An HTTP/2 connection for `key` that can take one more request.
@@ -1973,6 +1981,7 @@ impl Core {
             subs: HashMap::new(),
             idle: false,
             gone: false,
+            last_read: self.now,
         }));
         self.hosts.entry(key.clone()).or_default().h2.push(idx);
         if let Some(req) = req {
@@ -2022,6 +2031,7 @@ impl Core {
                 down: None,
                 released: 0,
                 ended: false,
+                since: self.now,
             },
         );
     }
@@ -2042,11 +2052,14 @@ impl Core {
                 }
                 break key;
             }
+            let had = c.filled;
             let (fail, eof, _) = c.io(READ_MAX);
             let Some(mux) = c.h2.as_mut() else { return };
+            if c.filled > had {
+                mux.last_read = self.now;
+            }
             // what went out
-            let sent = c.sent.min(mux.proto.out.len());
-            mux.proto.out.drain(..sent);
+            mux.proto.wrote(c.sent);
             c.sent = 0;
             let waits = mux.proto.out.len();
             let Ok(used) = mux.proto.recv(&c.buf[..c.filled]) else {
@@ -2563,8 +2576,9 @@ impl Core {
             .map(|(idx, _)| idx)
             .collect();
         for idx in old {
+            // a request may wait for the place of this connection
             if let Some(conn) = self.close(idx) {
-                self.forget(&conn.key);
+                self.pump(&conn.key);
             }
         }
     }
@@ -2622,6 +2636,13 @@ impl Core {
             let Some(mux) = c.h2.as_mut() else { continue };
             if let Some(sub) = mux.subs.remove(&stream) {
                 mux.proto.reset(stream, h2::CANCEL);
+                // Not one byte came from the server since the request
+                // started: the connection may be dead (HTTP/2 does not
+                // close it for a timeout). As after a GOAWAY, it ends its
+                // requests, and the next ones get a new connection.
+                if sub.status == 0 && mux.last_read < sub.since {
+                    mux.proto.goaway = true;
+                }
                 self.failed(sub.req.id, E_TIMEOUT);
             }
             self.drive(idx);

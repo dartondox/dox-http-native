@@ -205,7 +205,7 @@ With HTTP/1.1, the client sends a request again one time when a kept connection 
 On an `https://` URL, the client asks the server for HTTP/2 during the TLS handshake (ALPN). If the server has HTTP/2, the client uses it. If not, the client uses HTTP/1.1. You do not change your code: `get`, `send`, `sendStreamed` and the others work the same with the two protocols.
 
 - With HTTP/2, the requests to one server share one connection. Each request is a stream on it. When many requests to a new server start at the same time, each of them can open a connection. The connections that are not necessary close when they are idle.
-- A request that fails or gets a timeout stops only its stream. The other requests on the connection continue.
+- A request that fails or gets a timeout stops only its stream. The other requests on the connection continue. If no byte came from the server for a request that got a timeout, the client does not give that connection a new request. The next request opens a new connection.
 - If the server permits no more streams on the connection, the client opens one more connection. With `maxConnectionsPerHost`, the request waits for a free stream when the limit of connections is reached.
 - If the server tells the client that it did not work on a request (a refused stream, or a GOAWAY frame for an earlier stream), the client sends the request again one time. This is safe for each method. It does not apply to a request with a body stream.
 - If the connection closes before the head of an answer comes, the client sends the request again one time, and only for `GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS` and `TRACE`. The server can have received the first one.
