@@ -186,7 +186,8 @@ The rules:
 - When you cancel `res.body` before its end, the client closes the connection. The connection is not used again.
 - A failure after the head is an error event on `res.body`, then the stream closes. The causes are a closed connection, a chunk that is not correct, gzip data that is not correct and a body over `maxResponseSize`.
 - The client decodes a gzip or brotli body in parts. `maxResponseSize` is the limit for all decoded bytes.
-- `timeout` is for the time until the head of the answer is there. After the head, there is no timeout. A request with a big `body` can need more time to send it than the timeout. Then set a longer `timeout`, or `Duration.zero`.
+- `timeout` is for the time until the head of the answer is there. After the head, there is no timeout.
+- With a `body`, the timeout starts again each time bytes of the body go out. Thus a big body can need more time than the timeout. The request fails when no bytes go out for the timeout.
 - A request with no `body` follows redirects like `send`. A request with a `body` never follows redirects, because the stream can not be read again. You get the redirect answer.
 - The client sends a request with a `body` only once. It does not send it again when a kept connection was closed.
 - If the `body` stream gives more or fewer bytes than `contentLength`, the request fails with `badRequestBody`. If the `body` stream fails with an error, the request fails with that error. In both cases the client closes the connection.

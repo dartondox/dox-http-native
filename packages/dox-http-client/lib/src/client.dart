@@ -846,9 +846,9 @@ class DoxHttpClient implements Finalizable {
   /// [close].
   ///
   /// [timeout] is for the time until the head of the answer is there. After
-  /// it, there is no timeout: a big body can take long. A request with a
-  /// [body] that needs more time than the timeout to go out needs a longer
-  /// [timeout], or `Duration.zero`.
+  /// it, there is no timeout: a big body can take long. With a [body], the
+  /// timeout starts again each time bytes of the body go out. Thus a big
+  /// body can go out, and a server that does not read fails the request.
   ///
   /// With [followRedirects], a request with no [body] goes to the new
   /// address of a redirect like [send]. A request with a [body] never

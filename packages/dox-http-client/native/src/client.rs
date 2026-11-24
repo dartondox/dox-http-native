@@ -172,6 +172,10 @@ struct Req {
     /// it was sent a second time: never a third time
     retried: bool,
     deadline: Option<Instant>,
+    /// The timeout of a request with [UPLOAD]. Its deadline starts again
+    /// each time bytes of the request go out: a big body may need more
+    /// time than the timeout.
+    wait: Option<Duration>,
     bytes: Vec<u8>,
     /// the body comes in [Q_PART] records, until [Q_END]
     more: bool,
@@ -1446,6 +1450,10 @@ impl Core {
             if c.connected && c.wrote > c.told {
                 c.told = c.wrote;
                 push_progress(&mut self.ready, req.id, c.wrote);
+                // `due` may now be too early: then `expire` finds nothing
+                if let (Some(wait), Some(_)) = (req.wait, req.deadline) {
+                    req.deadline = Some(self.now + wait);
+                }
             }
         }
         // A connection that failed is at its end too. The bytes that came
@@ -1806,6 +1814,7 @@ impl Core {
                 flags,
                 retried: false,
                 deadline,
+                wait: (ms > 0 && flags & UPLOAD != 0).then(|| Duration::from_millis(ms)),
                 bytes: rec[REQ_HEAD + name_len..].to_vec(),
                 more: flags & UPLOAD != 0,
                 aborted: false,

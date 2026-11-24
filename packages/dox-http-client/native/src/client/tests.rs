@@ -1975,6 +1975,46 @@ fn an_early_answer_stops_the_upload_and_the_connection_is_not_kept() {
 }
 
 #[test]
+fn the_timeout_of_an_upload_starts_again_with_each_part() {
+    let got = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let addr = upload_server(40, got.clone());
+    let mut core = new_core(0, 0);
+    let mut r = Reader::new(1);
+    let head = "POST / HTTP/1.1\r\nhost: x\r\ncontent-length: 40\r\n\r\n";
+    // the whole upload takes about 600 ms, the timeout is 300 ms
+    let out = record(1, addr, STREAM | UPLOAD, 300, head.as_bytes());
+    r.until(&mut core, &out, true, |r| r.wrote > 0);
+    for part in 0..4 {
+        thread::sleep(Duration::from_millis(150));
+        let mut out = q_part(1, &[b'a' + part; 10]);
+        if part == 3 {
+            out.extend(q_end(1, false));
+        }
+        let sent = r.wrote + 10;
+        r.until(&mut core, &out, true, |r| {
+            r.wrote >= sent || r.error.is_some()
+        });
+        assert_eq!(r.error, None);
+    }
+    r.until(&mut core, &[], true, |r| r.over());
+    assert_eq!((r.status, r.error), (Some(200), None));
+    assert_eq!(got.lock().unwrap().len(), 40);
+
+    // an upload with no byte for the timeout fails
+    let (addr, _) = server(|mut s, _| {
+        read_head(&mut s);
+        thread::sleep(Duration::from_secs(2));
+    });
+    let mut r = Reader::new(2);
+    let out = record(2, addr, STREAM | UPLOAD, 200, head.as_bytes());
+    let start = Instant::now();
+    r.until(&mut core, &out, true, |r| r.over());
+    assert_eq!(r.error, Some(E_TIMEOUT));
+    assert!(start.elapsed() >= Duration::from_millis(200));
+    assert_eq!(core.open, 0);
+}
+
+#[test]
 fn a_cancelled_upload_frees_the_request() {
     let (addr, _) = server(|mut s, _| {
         read_head(&mut s);
