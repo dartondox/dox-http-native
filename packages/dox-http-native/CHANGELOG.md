@@ -1,4 +1,4 @@
-## Unreleased
+## 3.2.5
 
 - Tests: the HTTP server tests of the Dart SDK (`tests/standalone/io`) now run against this server, in `test/dart_io/`.
 - Fix: a client that sent more than 64 pipelined requests and then closed its send side got answers for only the first 64. The server closed the connection and dropped the requests that still waited in its read buffer. Now it reads on and answers all of them.
