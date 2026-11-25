@@ -1211,9 +1211,11 @@ impl Conn {
         }
         if self.eof && self.body.is_some() {
             // the client closed in the middle of a body (or of a chunk
-            // line): it can not end and no handler has seen the request. Drop it, so the connection
-            // closes now, not after `bodyTimeout`.
+            // line): it can not end and no handler has seen the request.
+            // Drop it and its bytes (they are no next request), so the
+            // connection closes now, not after `bodyTimeout`.
             self.body = None;
+            self.rpos = self.rlen;
         }
         Ok(())
     }

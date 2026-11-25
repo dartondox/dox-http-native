@@ -1,0 +1,14 @@
+	GET /ws HTTP/1.1
+Host: /,HTTP/1.1
+Transfer-Encoding: chunked
+
+
+=1
+hello
+0
+T:sion: 1#
+Sec-WebSocket-Key: dGhlI1.1
+Transfer-Encoding: chunked
+
+5;x=1
+on;ection: kee
