@@ -34,7 +34,7 @@ Uint8List pattern(int start, int length) {
 }
 
 /// test app: `/redirect/N?to=URL` answers status N with that location,
-/// `/` hello, `/echo` the request back as json, `/chunked` a
+/// `/` hello, `/echo` the request back as json, `/raw` the body back, `/chunked` a
 /// body with no length, `/slow` waits, `/big` many bytes, `/status/N`,
 /// `/stream/N` N bytes as fast as the client takes them, `/hold` counts a
 /// request body after [holdGate], `/early` answers 401 and reads nothing,
@@ -67,6 +67,8 @@ Future<void> handle(HttpRequest req) async {
             'body': utf8.decode(body),
           }),
         );
+      case 'raw':
+        res.add(await collect(req));
       case 'count':
         res.write('${(await collect(req)).length}');
       case 'chunked':
@@ -158,6 +160,16 @@ Matcher failsWith(DoxHttpFailure failure) {
   );
 }
 
+/// A small class with a `fromJson`, for `jsonAs`.
+class Person {
+  Person.fromJson(Map<String, dynamic> map)
+    : name = map['name'] as String,
+      age = map['age'] as int;
+
+  final String name;
+  final int age;
+}
+
 void main() {
   late HttpServer server;
   late DoxHttpClient client;
@@ -192,6 +204,56 @@ void main() {
       (await client.get(base.resolve('/status/404'))).reasonPhrase,
       'Not Found',
     );
+  });
+
+  test('json gives the body as a JSON object', () async {
+    DoxHttpClientResponse res = await client.post(
+      base.resolve('/echo'),
+      body: 'hi',
+    );
+    Map<String, dynamic> echo = await res.json();
+    expect(echo['method'], 'POST');
+    expect(echo['body'], 'hi');
+    await expectLater(
+      (await client.get(base)).json(),
+      throwsA(isA<FormatException>()),
+    );
+  });
+
+  test('jsonAs makes an object from the JSON object', () async {
+    DoxHttpClientResponse res = await client.post(
+      base.resolve('/raw'),
+      body: '{"name":"Dox","age":3}',
+    );
+    Person person = await res.jsonAs(Person.fromJson);
+    expect(person.name, 'Dox');
+    expect(person.age, 3);
+    DoxHttpClientResponse bad = await client.post(
+      base.resolve('/raw'),
+      body: '{"name":"Dox","age":"three"}',
+    );
+    await expectLater(bad.jsonAs(Person.fromJson), throwsA(isA<TypeError>()));
+  });
+
+  test('json fails when the body is not a JSON object', () async {
+    List<List<int>> bodies = <List<int>>[
+      utf8.encode('[1, 2]'),
+      utf8.encode('null'),
+      utf8.encode('42'),
+      <int>[],
+      <int>[0x7b, 0x22, 0xff, 0x22, 0x3a, 0x31, 0x7d], // {"\xff":1}
+    ];
+    for (List<int> body in bodies) {
+      DoxHttpClientResponse res = await client.post(
+        base.resolve('/raw'),
+        bodyBytes: Uint8List.fromList(body),
+      );
+      await expectLater(
+        res.json(),
+        throwsA(isA<FormatException>()),
+        reason: '$body',
+      );
+    }
   });
 
   test('lookup gives the addresses of a host name', () async {

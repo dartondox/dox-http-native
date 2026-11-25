@@ -1,3 +1,8 @@
+## Unreleased
+
+- `DoxHttpClientResponse.json()` gives the body as a JSON object (`Future<Map<String, dynamic>>`). It decodes the bytes of the body directly, with no `String` of the body between. A body that is not a JSON object fails with a `FormatException`.
+- `DoxHttpClientResponse.jsonAs<T>(fromJson)` gives the body as a `T`. Give it a function that makes a `T` from a `Map<String, dynamic>`, for example `UserInfo.fromJson` or `UserInfo.schema.fromMap` of a Dox DTO.
+
 ## 0.0.5
 
 - Fix (security): a chunked answer with a lone `\n` or `\r`, or another control byte, in a chunk size line or in a trailer line was accepted. Each of these lines must end with `\r\n` now. A proxy that ends a line at a lone `\n` sees another end of the body, so the next answer on the same connection could come from bytes of this body. Now such an answer fails with `badResponse`. A tab is permitted.
