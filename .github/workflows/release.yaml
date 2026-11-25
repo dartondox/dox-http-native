@@ -10,7 +10,9 @@ name: Release
 # 3. upload them to the GitHub release of the tag, with SHA256SUMS (and
 #    THIRD_PARTY_NOTICES for dox_http_client),
 # 4. fill `_sha256` in hook/build.dart from SHA256SUMS, publish the package
-#    to pub.dev, and push the new hashes to main.
+#    to pub.dev, and open a PR with the new hashes. The main ruleset
+#    accepts PRs only. Actions must be allowed to create PRs (org and repo
+#    setting). A PR of github.token starts no CI: merge it with --admin.
 #    The hook downloads these files, so users do not need Rust.
 
 on:
@@ -121,7 +123,8 @@ jobs:
     environment: pub.dev
     permissions:
       id-token: write # pub.dev automated publishing (OIDC)
-      contents: write # push the hashes to main
+      contents: write # push the hashes branch
+      pull-requests: write # open the hashes PR
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -138,7 +141,9 @@ jobs:
       - name: Publish to pub.dev
         working-directory: ${{ needs.check.outputs.folder }}
         run: dart pub publish --force
-      - name: Push the hashes to main
+      - name: Open a PR with the hashes
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -148,7 +153,7 @@ jobs:
             exit 0
           fi
           git stash
-          # the newest main: the release of the other package can push its
+          # the newest main: the release of the other package can merge its
           # hashes while this job runs
           git fetch origin main
           git checkout -B main origin/main
@@ -158,13 +163,15 @@ jobs:
             echo "The hashes on main are up to date."
             exit 0
           fi
+          branch="hashes/$GITHUB_REF_NAME"
+          git checkout -b "$branch"
           git commit -am "Hashes of the $GITHUB_REF_NAME libraries"
-          # main moved after the fetch: put the commit on top and try again
-          for _ in 1 2 3; do
-            if git push origin main; then
-              exit 0
-            fi
-            git pull --rebase origin main
-          done
-          echo "::error::could not push the hashes to main"
-          exit 1
+          # a rerun replaces the branch; its open PR stays
+          git push --force origin "$branch"
+          if [ -n "$(gh pr list --head "$branch" --state open --json number --jq '.[]')" ]; then
+            echo "The PR is open already."
+            exit 0
+          fi
+          gh pr create --base main --head "$branch" \
+            --title "Hashes of the $GITHUB_REF_NAME libraries" \
+            --body "The sha256 of the $GITHUB_REF_NAME libraries in hook/build.dart, the same as the package on pub.dev. A PR of github.token starts no CI, so merge it with --admin."
