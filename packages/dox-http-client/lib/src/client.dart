@@ -182,6 +182,17 @@ class DoxHttpClientResponse extends DoxHttpClientResponseHead {
       'The body is not a JSON object: ${value.runtimeType}',
     );
   }
+
+  /// The body as a [T], made by [fromJson] from the JSON object.
+  ///
+  /// ```dart
+  /// UserInfo user = await res.jsonAs(UserInfo.fromJson);
+  /// ```
+  ///
+  /// It fails like [json], and with each error that [fromJson] throws.
+  Future<T> jsonAs<T>(T Function(Map<String, dynamic>) fromJson) async {
+    return fromJson(await json());
+  }
 }
 
 /// The answer to a request of [DoxHttpClient.sendStreamed]. The future of

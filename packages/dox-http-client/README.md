@@ -116,6 +116,28 @@ The future fails with a `FormatException` when one of these conditions is true:
 
 `json()` does not examine the status. Examine `res.statusCode` before you use the body.
 
+### Read JSON into a class
+
+`jsonAs` gives the body as an object of your class. Give it a function that makes the object from a `Map<String, dynamic>`, for example a `fromJson` constructor:
+
+```dart
+UserInfo user = await res.jsonAs(UserInfo.fromJson);
+```
+
+The `fromJson` constructors of `json_serializable` and `freezed` also work.
+
+A Dox DTO has the `fromMap` method of its `schema`:
+
+```dart
+UserInfo user = await res.jsonAs(UserInfo.schema.fromMap);
+```
+
+`fromMap` does not do the checks of the DTO. A wrong type throws a `TypeError`. If you do not trust the server, use `validateMap` of the DTO. It does all the checks and throws a `ValidationException` with the errors:
+
+```dart
+UserInfo user = await UserInfo.schema.validateMap(await res.json());
+```
+
 ## Failures
 
 When no answer comes, the future fails with a `DoxHttpClientException`. Its `failure` gives the cause:

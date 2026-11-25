@@ -160,6 +160,16 @@ Matcher failsWith(DoxHttpFailure failure) {
   );
 }
 
+/// A small class with a `fromJson`, for `jsonAs`.
+class Person {
+  Person.fromJson(Map<String, dynamic> map)
+    : name = map['name'] as String,
+      age = map['age'] as int;
+
+  final String name;
+  final int age;
+}
+
 void main() {
   late HttpServer server;
   late DoxHttpClient client;
@@ -208,6 +218,21 @@ void main() {
       (await client.get(base)).json(),
       throwsA(isA<FormatException>()),
     );
+  });
+
+  test('jsonAs makes an object from the JSON object', () async {
+    DoxHttpClientResponse res = await client.post(
+      base.resolve('/raw'),
+      body: '{"name":"Dox","age":3}',
+    );
+    Person person = await res.jsonAs(Person.fromJson);
+    expect(person.name, 'Dox');
+    expect(person.age, 3);
+    DoxHttpClientResponse bad = await client.post(
+      base.resolve('/raw'),
+      body: '{"name":"Dox","age":"three"}',
+    );
+    await expectLater(bad.jsonAs(Person.fromJson), throwsA(isA<TypeError>()));
   });
 
   test('json fails when the body is not a JSON object', () async {
