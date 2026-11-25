@@ -242,6 +242,16 @@ impl BodyRead {
                     Ok(httparse::Status::Complete((used, _))) if used > CHUNK_LINE => {
                         return Feed::Fail(400);
                     }
+                    // httparse takes any byte in an extension, also a lone
+                    // `\n`. A proxy that ends the line there sees another
+                    // body end (request smuggling, as CVE-2025-55315).
+                    Ok(httparse::Status::Complete((used, _)))
+                        if avail[..used - 2]
+                            .iter()
+                            .any(|&c| (c < 0x20 && c != b'\t') || c == 0x7f) =>
+                    {
+                        return Feed::Fail(400);
+                    }
                     Ok(httparse::Status::Complete((used, size))) => {
                         *pos += used;
                         b.chunk = Some(if size == 0 {
