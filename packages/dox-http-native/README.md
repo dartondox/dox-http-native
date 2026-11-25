@@ -4,6 +4,8 @@ Native HTTP server for Dart. It speaks HTTP/1.1 and HTTP/2. It is the default HT
 
 [![pub package](https://img.shields.io/pub/v/dox_http_native.svg)](https://pub.dev/packages/dox_http_native)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/dartondox/dox-http-native/blob/main/LICENSE)
+[![CI](https://github.com/dartondox/dox-http-native/actions/workflows/ci.yaml/badge.svg?branch=main)](https://github.com/dartondox/dox-http-native/actions/workflows/ci.yaml?query=branch%3Amain)
+[![Fuzz](https://github.com/dartondox/dox-http-native/actions/workflows/fuzz.yml/badge.svg?branch=main)](https://github.com/dartondox/dox-http-native/actions/workflows/fuzz.yml?query=branch%3Amain)
 
 Part of [Dox](https://dartondox.dev), a web backend framework for Dart.
 Source code: [github.com/dartondox/dox-http-native](https://github.com/dartondox/dox-http-native).
@@ -231,6 +233,34 @@ Uint8List? plain = AesGcm.open(key, sealed, aad);  // null when changed
 - Only `multipart/form-data` gets the multipart body limit. All other content types get the normal body limit.
 - A streamed answer must have exactly the bytes of its `contentLength`. More bytes throw, and fewer bytes make `close()` fail. In the two cases, the server cuts the connection. Thus the client can not read the remaining bytes as the next answer.
 - For the HTTP/2 flood limits, see [HTTP/2](#http2).
+
+## Tests
+
+The CI and Fuzz badges at the top show the last result on `main`. CI runs the tests below on each push and on each pull request. The fuzz tests run only when `native/` changes.
+
+| Test set | Count (2026-11-25) | What it checks |
+| --- | --- | --- |
+| Dart tests of the `dart:io` server, from the Dart SDK | 48 files, 750 tests pass, 69 skipped | The server gives the same results as the `dart:io` server. |
+| Request parser inputs from the Dart SDK (part of the 750 tests) | 519 tests | Bad, split and too large requests. Each request goes in as 1 piece, in 10-byte pieces and in 1-byte pieces. |
+| Other Dart tests of this package | 129 tests | The server, the headers, HTTP/2, WebSocket and AES-GCM. |
+| Rust unit tests | 179 tests | The parser, the body reader, the limits and the HTTP/2 frames. |
+| [h2spec](https://github.com/summerwind/h2spec) (strict mode) | all specs but 1 | The HTTP/2 conformance suite. |
+| Fuzz tests | 6 targets | Random input on the parsers and on a full connection. Refer to [Fuzz tests](#fuzz-tests). |
+
+The SDK tests are in `test/dart_io/`. Each file has the same name as its source file in [`tests/standalone/io`](https://github.com/dart-lang/sdk/tree/main/tests/standalone/io) of the Dart SDK.
+
+- The tests use the `dart:io` client on the server of this package.
+- A skipped test has a reason that starts with `dox_http_native:`. Most reasons are an API that this server does not have, for example `detachSocket`.
+- Refer to [Differences from dart:io](#differences-from-dartio) for the full list.
+
+To run the Dart tests:
+
+```sh
+cd native
+cargo build --release
+cd ..
+dart test -j 4
+```
 
 ## Fuzz tests
 
