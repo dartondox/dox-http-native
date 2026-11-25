@@ -93,3 +93,29 @@ Future<(int, Future<HttpRequest>)> serveFirst({
   }, host: host);
   return (server.port, first.future);
 }
+
+/// A server that upgrades every request to a WebSocket (a request that is no
+/// upgrade gets 400) and gives the socket to [onSocket].
+Future<NativeHttpServer> serveWebSockets(
+  void Function(WebSocket webSocket) onSocket, {
+  String? protocol,
+  int maxMessageSize = 16 * 1024 * 1024,
+}) {
+  return serve((HttpRequest request) async {
+    if (!NativeWebSocket.isUpgradeRequest(request)) {
+      request.response.statusCode = HttpStatus.badRequest;
+      await request.response.close();
+      return;
+    }
+    onSocket(
+      await NativeWebSocket.upgrade(
+        request,
+        protocol: protocol,
+        maxMessageSize: maxMessageSize,
+      ),
+    );
+  });
+}
+
+String wsUrl(NativeHttpServer server, [String path = '/']) =>
+    'ws://127.0.0.1:${server.port}$path';

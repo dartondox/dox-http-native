@@ -45,7 +45,7 @@ void main() {
                   for (int j = 0; j < c.$2; j++) {
                     request.write('Hello, world!');
                   }
-                  request.done.catchError((Object _) => null);
+                  request.done.then<void>((_) {}, onError: (Object _) {});
                   return request.close();
                 })
                 .then(

@@ -292,4 +292,31 @@ void main() {
     }, bytes: 2),
     skip: 'dox_http_native: text is UTF-8, never latin-1',
   );
+
+  test('add refuses a value that is not a byte', () async {
+    Completer<List<Object?>> got = Completer<List<Object?>>();
+    var server = await serve((HttpRequest request) {
+      List<Object?> errors = <Object?>[];
+      for (List<int> bad in <List<int>>[
+        <int>[256],
+        <int>[-1],
+        Uint16List(1)..[0] = 300,
+      ]) {
+        try {
+          request.response.add(bad);
+        } on ArgumentError catch (e) {
+          errors.add(e);
+        }
+      }
+      request.response.add(Uint8ClampedList.fromList(<int>[1, 2]));
+      request.response.close();
+      got.complete(errors);
+    });
+    String text = await raw(
+      server.port,
+      'GET / HTTP/1.1\r\nConnection: close\r\n\r\n',
+    );
+    expect((await got.future).length, 3);
+    expect(text, endsWith('\u0001\u0002'));
+  });
 }

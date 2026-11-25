@@ -153,7 +153,7 @@ void main() {
               request.write('0123456789');
               return request.close();
             })
-            .catchError((Object _) => null);
+            .then<void>((_) {}, onError: (Object _) {});
       }
       await all.future.timeout(const Duration(seconds: 10));
     },

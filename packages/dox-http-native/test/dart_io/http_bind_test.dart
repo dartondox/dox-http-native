@@ -8,8 +8,6 @@ import 'dart:io';
 import 'package:dox_http_native/dox_http_native.dart';
 import 'package:test/test.dart';
 
-import 'util.dart';
-
 Future<bool> supportsIPv6() async {
   try {
     ServerSocket socket = await ServerSocket.bind('::1', 0);

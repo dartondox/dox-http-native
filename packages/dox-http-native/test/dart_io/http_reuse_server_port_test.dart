@@ -8,8 +8,6 @@ import 'dart:io';
 import 'package:dox_http_native/dox_http_native.dart';
 import 'package:test/test.dart';
 
-import 'util.dart';
-
 Future<int> runServer(int port, int connections, bool clean) async {
   Completer<int> completer = Completer<int>();
   NativeHttpServer server = await NativeHttpServer.bind(
