@@ -75,6 +75,20 @@ class NativeWebSocket extends Stream<dynamic> implements WebSocket {
       await request.response.close();
       throw WebSocketException('Invalid WebSocket upgrade request');
     }
+    if (protocol != null) {
+      // RFC 6455 4.2.2: only a protocol that the client offered, like
+      // dart:io. No offer: no protocol in the answer.
+      List<String> offered = _offered(request);
+      if (offered.isEmpty) {
+        protocol = null;
+      } else if (!offered.contains(protocol)) {
+        request.response.statusCode = HttpStatus.internalServerError;
+        await request.response.close();
+        throw WebSocketException(
+          'Selected protocol is not in the list of available protocols',
+        );
+      }
+    }
     NativeHttpServer server = request.server;
     NativeWebSocket ws = NativeWebSocket._(
       server,
@@ -94,6 +108,19 @@ class NativeWebSocket extends Stream<dynamic> implements WebSocket {
       protocol: protocol,
     );
     return ws;
+  }
+
+  /// The protocols in the `Sec-WebSocket-Protocol` lines of [request].
+  static List<String> _offered(HttpRequest request) {
+    List<String> offered = <String>[];
+    for (String line
+        in request.headers['sec-websocket-protocol'] ?? <String>[]) {
+      for (String part in line.split(',')) {
+        String name = part.trim();
+        if (name.isNotEmpty) offered.add(name);
+      }
+    }
+    return offered;
   }
 
   /// Record kinds from Dart to Rust (the kind field of a response record).
@@ -178,6 +205,7 @@ class NativeWebSocket extends Stream<dynamic> implements WebSocket {
     if (data is String) {
       _send(kindText, utf8.encode(data));
     } else if (data is List<int>) {
+      checkBytes(data);
       _send(kindBinary, data);
     } else {
       throw ArgumentError.value(data, 'data', 'must be a String or List<int>');

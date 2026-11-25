@@ -115,6 +115,11 @@ class NativeRequest extends Stream<Uint8List> implements HttpRequest {
 
   @override
   Uri get requestedUri {
+    // an absolute-form target (RFC 9112 3.2.2) is the URI already
+    Uri? absolute = Uri.tryParse(_target);
+    if (absolute != null && absolute.hasScheme && absolute.hasAuthority) {
+      return absolute;
+    }
     String host = headers.value(HttpHeaders.hostHeader) ?? '127.0.0.1';
     return Uri.parse('http://$host$_target');
   }

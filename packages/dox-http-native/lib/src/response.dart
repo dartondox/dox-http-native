@@ -268,6 +268,7 @@ class NativeResponse implements HttpResponse {
     if (_closed) throw StateError('StreamSink is closed');
     // the client is gone: drop it, like the bytes of a closed socket
     if (data.isEmpty || _gone) return;
+    checkBytes(data);
     int? stream = _stream;
     if (stream != null) {
       if (_length >= 0) {
@@ -345,6 +346,14 @@ class NativeResponse implements HttpResponse {
         _closed = true;
         _request.server.endStream(id, ok: false);
         _complete();
+      } else if (!_closed) {
+        // nothing is sent yet: answer 500 now. Else the request waits for
+        // an answer, or a later close sends a short body as a 200.
+        takeBody();
+        statusCode = HttpStatus.internalServerError;
+        headers.contentLength = -1;
+        headers.removeAll(HttpHeaders.contentTypeHeader);
+        end();
       }
       rethrow;
     } finally {

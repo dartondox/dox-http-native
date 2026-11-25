@@ -313,6 +313,23 @@ fn body_limits_and_timeout() {
 }
 
 #[test]
+fn chunked_size_line_needs_a_hex_digit() {
+    let (port, _) = serve(limits());
+    // an empty size line (or one with only an extension) is not the last chunk
+    for body in [
+        "\r\nabc\r\n0\r\n\r\n",
+        ";x\r\nabc\r\n0\r\n\r\n",
+        " 3\r\nabc\r\n0\r\n\r\n",
+    ] {
+        let req = format!(
+            "POST /c HTTP/1.1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{body}"
+        );
+        let r = send(port, req.as_bytes());
+        assert!(r.starts_with("HTTP/1.1 400"), "{body:?} gave {r:?}");
+    }
+}
+
+#[test]
 fn chunked_body_and_expect_continue() {
     let lim = Limits {
         body: 1 << 20,

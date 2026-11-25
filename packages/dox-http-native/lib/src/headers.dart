@@ -13,6 +13,19 @@ String checkHeaderValue(String value) {
   return value;
 }
 
+/// Throws when a value of [data] is not a byte (0 to 255), like dart:io.
+/// Copying it into a byte buffer would cut it (256 becomes 0) and send
+/// other bytes than the app wrote. A [Uint8List] has only bytes: no scan.
+void checkBytes(List<int> data) {
+  if (data is Uint8List || data is Uint8ClampedList) return;
+  for (int i = 0; i < data.length; i++) {
+    int b = data[i];
+    if (b < 0 || b > 255) {
+      throw ArgumentError.value(b, 'data[$i]', 'must be a byte (0 to 255)');
+    }
+  }
+}
+
 /// [HttpHeaders] for the native server.
 ///
 /// Request headers are read from the raw bytes from Rust, one name at a
@@ -289,6 +302,7 @@ class NativeHeaders implements HttpHeaders {
     if (_locked()) return;
     _own().clear();
     _contentLength = -1;
+    _chunked = false;
   }
 
   @override

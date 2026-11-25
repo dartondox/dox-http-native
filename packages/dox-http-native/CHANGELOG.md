@@ -1,3 +1,17 @@
+## Unreleased
+
+- Tests: the HTTP server tests of the Dart SDK (`tests/standalone/io`) now run against this server, in `test/dart_io/`.
+- Fix: a client that sent more than 64 pipelined requests and then closed its send side got answers for only the first 64. The server closed the connection and dropped the requests that still waited in its read buffer. Now it reads on and answers all of them.
+- Fix: a client that closed its connection in the middle of a request body kept the connection open until `bodyTimeout` (120 seconds by default), and a graceful `close()` waited for it. Now the connection closes at once, as no handler saw the request.
+- Fix: `requestedUri` was wrong for a request line with an absolute URI (`GET http://example.com/ HTTP/1.1`). It gave `http://example.comhttp//example.com/`. Now it gives the URI of the request line.
+- Fix: a chunked request body whose chunk size line was empty (`\r\n`) or started with `;` was read as the last chunk. Now the request gets `400`. A proxy that reads such a line as an error or skips it saw another end of the body, which is a request smuggling risk.
+- Fix: a handler that set a `Date` header made an answer with two `Date` headers (RFC 9110 allows one). The server now always sends its own `Date`, as it already did for `Content-Length` and `Transfer-Encoding`.
+- Fix: `response.headers.clear()` did not reset `chunkedTransferEncoding`.
+- Fix: `response.add` and `webSocket.add` with a list that holds a value outside 0 to 255 (for example `[256]` or a `Uint16List`) sent other bytes (256 became 0). Now they throw an `ArgumentError`, as dart:io does. A `Uint8List` is not checked.
+- Fix: the answer to a `HEAD` request with a `contentLength` that the handler set, and no body, had `content-length: 0`. Now it has the length that the handler set, as for dart:io. This also applies to HTTP/2.
+- Fix: `NativeWebSocket.upgrade(protocol:)` sent the protocol also when the client did not offer it (RFC 6455 section 4.2.2). Now, as in dart:io, the request gets `500` and `upgrade` throws a `WebSocketException`. When the client offers no protocol, the answer has no protocol.
+- Fix: when the stream of `addStream` failed before the head went out, the request got no answer. A later `close()` sent the part of the body that came before the error, as a `200`. Now the request gets `500` with no body.
+
 ## 3.2.4
 
 - New releases have the tag `dox_http_native-v<version>`, because the repository now holds more than one package. The build hook downloads the library from this tag first. When it is not there, the hook uses the old tag form `v<version>`.

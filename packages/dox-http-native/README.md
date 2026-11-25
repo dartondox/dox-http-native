@@ -4,6 +4,8 @@ Native HTTP server for Dart. It speaks HTTP/1.1 and HTTP/2. It is the default HT
 
 [![pub package](https://img.shields.io/pub/v/dox_http_native.svg)](https://pub.dev/packages/dox_http_native)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/dartondox/dox-http-native/blob/main/LICENSE)
+[![CI](https://github.com/dartondox/dox-http-native/actions/workflows/ci.yaml/badge.svg?branch=main)](https://github.com/dartondox/dox-http-native/actions/workflows/ci.yaml?query=branch%3Amain)
+[![Fuzz](https://github.com/dartondox/dox-http-native/actions/workflows/fuzz.yml/badge.svg?branch=main)](https://github.com/dartondox/dox-http-native/actions/workflows/fuzz.yml?query=branch%3Amain)
 
 Part of [Dox](https://dartondox.dev), a web backend framework for Dart.
 Source code: [github.com/dartondox/dox-http-native](https://github.com/dartondox/dox-http-native).
@@ -179,6 +181,32 @@ Answers:
 - `response.done` completes with no error when the client is gone. This also applies when the handler does not close the response.
 - A handler that writes from its own timer can stop the timer there: `response.done.then((_) => timer.cancel())`. The server drops writes after that.
 
+## Differences from dart:io
+
+The server implements the `dart:io` API. These parts are different on purpose. The tests in `test/dart_io/` come from the Dart SDK. Each skipped test there names one of these differences.
+
+- There is no TLS. A proxy ends TLS. `bindSecure` and `listenOn` do not exist.
+- There is no `detachSocket` and no `HttpSession`. `connectionsInfo()` and `sessionTimeout` do nothing. `idleTimeout` is an argument of `bind`.
+- Rust reads the whole request body before your handler runs. A request that the client cuts short never reaches the handler. The connection closes at once.
+- A custom `reasonPhrase` is not sent. The answer has the standard phrase of the status code.
+- A text body is always UTF-8, also when the content type is missing or has no charset.
+- `HttpResponse.deadline` has no effect.
+- `bufferOutput` has no effect. A buffered body goes out on `close`. Use `flush()` to start the answer at once. `addStream` starts the answer after 64 KB or on `flush()`.
+- The server sets `Content-Length` and the framing from the real body. A `contentLength` that is too small for a buffered body does not throw. The answer has the real length. `Transfer-Encoding` that your handler sets is ignored.
+- The server sends its own `Date` header. A `Date` header that your handler sets is ignored.
+- A `HEAD` answer with no body keeps the `contentLength` that your handler set.
+- An HTTP/1.0 request with `Connection: keep-alive` can stay open, when the answer has a length.
+- `request.contentLength` is the length of the body. It is `0`, not `-1`, when there is no `Content-Length` header.
+- A request header value is not split on commas. You get one list entry for each header line.
+- `response.persistentConnection` is `true` until you set it. The server still closes the connection after a request with `Connection: close`.
+- `requestedUri` does not use `x-forwarded-proto` or `x-forwarded-host`. A client can send them.
+- A header name is always lower case. `preserveHeaderCase` and `noFolding` have no effect.
+- A folded request header (obs-fold) gets `400`.
+- `flush()` and `addStream()` complete with `null`, not with the response.
+- A failed `addStream` before the head goes out gives a `500` with no body. dart:io cuts the connection. After the head, both cut the connection.
+- `response.add` and `webSocket.add` throw an `ArgumentError` for a value that is not a byte. `dart:io` fails `done`.
+- `NativeWebSocket.upgrade` takes a `protocol`, not a `protocolSelector`. As in dart:io, a `protocol` that the client did not offer gives a `500` and a `WebSocketException`. When the client offers no protocol, the answer has no protocol.
+
 ## AES-GCM
 
 `AesGcm` is AES-256-GCM in Rust. It uses the AES instructions and the carry-less multiply instructions of the CPU. `dox_core` uses it for encrypted cookies. It works without a server.
@@ -206,6 +234,34 @@ Uint8List? plain = AesGcm.open(key, sealed, aad);  // null when changed
 - Only `multipart/form-data` gets the multipart body limit. All other content types get the normal body limit.
 - A streamed answer must have exactly the bytes of its `contentLength`. More bytes throw, and fewer bytes make `close()` fail. In the two cases, the server cuts the connection. Thus the client can not read the remaining bytes as the next answer.
 - For the HTTP/2 flood limits, see [HTTP/2](#http2).
+
+## Tests
+
+The CI and Fuzz badges at the top show the last result on `main`. CI runs the tests below on each push and on each pull request. The fuzz tests run only when `native/` changes.
+
+| Test set | Count (2026-11-25) | What it checks |
+| --- | --- | --- |
+| Dart tests of the `dart:io` server, from the Dart SDK | 48 files, 755 tests pass, 66 skipped | The server gives the same results as the `dart:io` server. |
+| Request parser inputs from the Dart SDK (part of the 755 tests) | 519 tests | Bad, split and too large requests. Each request goes in as 1 piece, in 10-byte pieces and in 1-byte pieces. |
+| Other Dart tests of this package | 129 tests | The server, the headers, HTTP/2, WebSocket and AES-GCM. |
+| Rust unit tests | 179 tests | The parser, the body reader, the limits and the HTTP/2 frames. |
+| [h2spec](https://github.com/summerwind/h2spec) (strict mode) | all specs but 1 | The HTTP/2 conformance suite. |
+| Fuzz tests | 6 targets | Random input on the parsers and on a full connection. Refer to [Fuzz tests](#fuzz-tests). |
+
+The SDK tests are in `test/dart_io/`. Each file has the same name as its source file in [`tests/standalone/io`](https://github.com/dart-lang/sdk/tree/main/tests/standalone/io) of the Dart SDK.
+
+- The tests use the `dart:io` client on the server of this package.
+- A skipped test has a reason that starts with `dox_http_native:`. Most reasons are an API that this server does not have, for example `detachSocket`.
+- Refer to [Differences from dart:io](#differences-from-dartio) for the full list.
+
+To run the Dart tests:
+
+```sh
+cd native
+cargo build --release
+cd ..
+dart test -j 4
+```
 
 ## Fuzz tests
 

@@ -230,6 +230,12 @@ impl BodyRead {
                         }
                     }
                 }
+                // a size line starts with a hex digit. httparse reads an empty
+                // size (`\r\n` or `;ext`) as 0: the last chunk. A proxy that
+                // reads it as an error or skips it would see another body end.
+                Some(Chunk::Size) if avail.first().is_some_and(|c| !c.is_ascii_hexdigit()) => {
+                    return Feed::Fail(400);
+                }
                 Some(Chunk::Size) => match httparse::parse_chunk_size(avail) {
                     // a longer line is refused also when it came whole, so
                     // the answer does not hang on how the bytes were split
@@ -537,7 +543,13 @@ fn no_body(status: u16) -> bool {
 
 /// Writes a whole answer with this body.
 fn render(buf: &mut Vec<u8>, status: u16, lines: &[u8], body: &[u8], date: &[u8], w: Way) {
-    render_head(buf, status, lines, b"", date, w, Len::Exact(body.len()));
+    // a HEAD answer with no body keeps the length that Dart set (the length
+    // a GET would have). Dart then put the content-length line in `lines`.
+    let len = match length_line(lines) {
+        Some(Some(_)) if w.head && body.is_empty() => Len::Open,
+        _ => Len::Exact(body.len()),
+    };
+    render_head(buf, status, lines, b"", date, w, len);
     let no_body = status < 200 || status == 204 || status == 304;
     if !no_body && !w.head {
         buf.extend_from_slice(body);
@@ -1195,6 +1207,14 @@ impl Conn {
             && self.slots.is_empty()
         {
             // the client closed in the middle of a request
+            self.rpos = self.rlen;
+        }
+        if self.eof && self.body.is_some() {
+            // the client closed in the middle of a body (or of a chunk
+            // line): it can not end and no handler has seen the request.
+            // Drop it and its bytes (they are no next request), so the
+            // connection closes now, not after `bodyTimeout`.
+            self.body = None;
             self.rpos = self.rlen;
         }
         Ok(())
@@ -2049,7 +2069,9 @@ impl Core {
             c.paused = false;
             linger = true;
             go_on = true;
-        } else if c.finished() {
+        } else if c.finished() && !go_on {
+            // not when it reads on: requests that the client sent before it
+            // closed can wait in the buffer (more than MAX_INFLIGHT)
             self.kill(idx);
             return;
         }
@@ -3910,6 +3932,10 @@ pub mod fuzz {
     fn dechunk(s: &[u8]) -> Option<(Vec<u8>, usize)> {
         let (mut body, mut p) = (Vec::new(), 0);
         loop {
+            // a size line starts with a hex digit, like `BodyRead::feed`
+            if !s.get(p).is_some_and(u8::is_ascii_hexdigit) {
+                return None;
+            }
             let Ok(httparse::Status::Complete((used, size))) = httparse::parse_chunk_size(&s[p..])
             else {
                 return None;
