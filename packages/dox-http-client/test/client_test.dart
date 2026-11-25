@@ -211,11 +211,24 @@ void main() {
   });
 
   test('json fails when the body is not a JSON object', () async {
-    DoxHttpClientResponse res = await client.post(
-      base.resolve('/raw'),
-      body: '[1, 2]',
-    );
-    await expectLater(res.json(), throwsA(isA<FormatException>()));
+    List<List<int>> bodies = <List<int>>[
+      utf8.encode('[1, 2]'),
+      utf8.encode('null'),
+      utf8.encode('42'),
+      <int>[],
+      <int>[0x7b, 0x22, 0xff, 0x22, 0x3a, 0x31, 0x7d], // {"\xff":1}
+    ];
+    for (List<int> body in bodies) {
+      DoxHttpClientResponse res = await client.post(
+        base.resolve('/raw'),
+        bodyBytes: Uint8List.fromList(body),
+      );
+      await expectLater(
+        res.json(),
+        throwsA(isA<FormatException>()),
+        reason: '$body',
+      );
+    }
   });
 
   test('lookup gives the addresses of a host name', () async {
