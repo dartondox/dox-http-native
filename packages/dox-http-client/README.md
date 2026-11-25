@@ -96,6 +96,26 @@ res.url; // the URL that gave this answer
 
 An answer with an error status, for example 404 or 500, is an answer and not an exception.
 
+## Read JSON
+
+`json()` gives the body as a JSON object:
+
+```dart
+DoxHttpClientResponse res = await client.get(
+  Uri.parse('https://api.example.com/users/1'),
+);
+Map<String, dynamic> user = await res.json();
+```
+
+The client decodes the bytes of the body directly. It does not make a `String` of the body first.
+
+The future fails with a `FormatException` when one of these conditions is true:
+
+- The body is not correct UTF-8 or not correct JSON.
+- The body is JSON, but it is not an object. For example, it is a list.
+
+`json()` does not examine the status. Examine `res.statusCode` before you use the body.
+
 ## Failures
 
 When no answer comes, the future fails with a `DoxHttpClientException`. Its `failure` gives the cause:

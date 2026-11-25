@@ -34,7 +34,7 @@ Uint8List pattern(int start, int length) {
 }
 
 /// test app: `/redirect/N?to=URL` answers status N with that location,
-/// `/` hello, `/echo` the request back as json, `/chunked` a
+/// `/` hello, `/echo` the request back as json, `/raw` the body back, `/chunked` a
 /// body with no length, `/slow` waits, `/big` many bytes, `/status/N`,
 /// `/stream/N` N bytes as fast as the client takes them, `/hold` counts a
 /// request body after [holdGate], `/early` answers 401 and reads nothing,
@@ -67,6 +67,8 @@ Future<void> handle(HttpRequest req) async {
             'body': utf8.decode(body),
           }),
         );
+      case 'raw':
+        res.add(await collect(req));
       case 'count':
         res.write('${(await collect(req)).length}');
       case 'chunked':
@@ -192,6 +194,28 @@ void main() {
       (await client.get(base.resolve('/status/404'))).reasonPhrase,
       'Not Found',
     );
+  });
+
+  test('json gives the body as a JSON object', () async {
+    DoxHttpClientResponse res = await client.post(
+      base.resolve('/echo'),
+      body: 'hi',
+    );
+    Map<String, dynamic> echo = await res.json();
+    expect(echo['method'], 'POST');
+    expect(echo['body'], 'hi');
+    await expectLater(
+      (await client.get(base)).json(),
+      throwsA(isA<FormatException>()),
+    );
+  });
+
+  test('json fails when the body is not a JSON object', () async {
+    DoxHttpClientResponse res = await client.post(
+      base.resolve('/raw'),
+      body: '[1, 2]',
+    );
+    await expectLater(res.json(), throwsA(isA<FormatException>()));
   });
 
   test('lookup gives the addresses of a host name', () async {

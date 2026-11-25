@@ -148,6 +148,11 @@ abstract class DoxHttpClientResponseHead {
   }
 }
 
+/// Bytes to JSON in one pass, with no `String` of the whole body between.
+final Converter<List<int>, Object?> _utf8Json = const Utf8Decoder().fuse(
+  const JsonDecoder(),
+);
+
 /// The answer to a request of a [DoxHttpClient].
 class DoxHttpClientResponse extends DoxHttpClientResponseHead {
   DoxHttpClientResponse._(
@@ -162,6 +167,21 @@ class DoxHttpClientResponse extends DoxHttpClientResponseHead {
 
   /// The body as text (UTF-8).
   late final String body = utf8.decode(bodyBytes, allowMalformed: true);
+
+  /// The body as a JSON object.
+  ///
+  /// The future fails with a [FormatException] when the body is not
+  /// correct UTF-8 or JSON, or is JSON but not an object (for example a
+  /// list).
+  // ponytail: decodes on this isolate; the Future leaves room to move big
+  // bodies to another isolate later without an API change.
+  Future<Map<String, dynamic>> json() async {
+    Object? value = _utf8Json.convert(bodyBytes);
+    if (value is Map<String, dynamic>) return value;
+    throw FormatException(
+      'The body is not a JSON object: ${value.runtimeType}',
+    );
+  }
 }
 
 /// The answer to a request of [DoxHttpClient.sendStreamed]. The future of
