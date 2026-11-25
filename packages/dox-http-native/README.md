@@ -241,8 +241,8 @@ The CI and Fuzz badges at the top show the last result on `main`. CI runs the te
 
 | Test set | Count (2026-11-25) | What it checks |
 | --- | --- | --- |
-| Dart tests of the `dart:io` server, from the Dart SDK | 48 files, 750 tests pass, 69 skipped | The server gives the same results as the `dart:io` server. |
-| Request parser inputs from the Dart SDK (part of the 750 tests) | 519 tests | Bad, split and too large requests. Each request goes in as 1 piece, in 10-byte pieces and in 1-byte pieces. |
+| Dart tests of the `dart:io` server, from the Dart SDK | 48 files, 755 tests pass, 66 skipped | The server gives the same results as the `dart:io` server. |
+| Request parser inputs from the Dart SDK (part of the 755 tests) | 519 tests | Bad, split and too large requests. Each request goes in as 1 piece, in 10-byte pieces and in 1-byte pieces. |
 | Other Dart tests of this package | 129 tests | The server, the headers, HTTP/2, WebSocket and AES-GCM. |
 | Rust unit tests | 179 tests | The parser, the body reader, the limits and the HTTP/2 frames. |
 | [h2spec](https://github.com/summerwind/h2spec) (strict mode) | all specs but 1 | The HTTP/2 conformance suite. |
