@@ -605,8 +605,11 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
 
   void _line(String name, String value) {
     if (name == HttpHeaders.contentLengthHeader ||
-        name == HttpHeaders.transferEncodingHeader) {
-      return; // Rust sets these from the body
+        name == HttpHeaders.transferEncodingHeader ||
+        name == HttpHeaders.dateHeader) {
+      // Rust sets these (the length and the framing from the body, the date
+      // from its clock). A second `date` line would break RFC 9110 6.6.1.
+      return;
     }
     if (name == HttpHeaders.connectionHeader &&
         value.toLowerCase().contains('close')) {

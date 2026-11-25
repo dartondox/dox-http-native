@@ -289,6 +289,7 @@ class NativeHeaders implements HttpHeaders {
     if (_locked()) return;
     _own().clear();
     _contentLength = -1;
+    _chunked = false;
   }
 
   @override
