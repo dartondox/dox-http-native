@@ -1,4 +1,4 @@
-## Unreleased
+## 0.0.6
 
 - `DoxHttpClientResponse.json()` gives the body as a JSON object (`Future<Map<String, dynamic>>`). It decodes the bytes of the body directly, with no `String` of the body between. A body that is not a JSON object fails with a `FormatException`.
 - `DoxHttpClientResponse.jsonAs<T>(fromJson)` gives the body as a `T`. Give it a function that makes a `T` from a `Map<String, dynamic>`, for example `UserInfo.fromJson` or `UserInfo.schema.fromMap` of a Dox DTO.
