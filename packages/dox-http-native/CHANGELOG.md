@@ -9,6 +9,8 @@
 - Fix: `response.headers.clear()` did not reset `chunkedTransferEncoding`.
 - Fix: `response.add` and `webSocket.add` with a list that holds a value outside 0 to 255 (for example `[256]` or a `Uint16List`) sent other bytes (256 became 0). Now they throw an `ArgumentError`, as dart:io does. A `Uint8List` is not checked.
 - Fix: the answer to a `HEAD` request with a `contentLength` that the handler set, and no body, had `content-length: 0`. Now it has the length that the handler set, as for dart:io. This also applies to HTTP/2.
+- Fix: `NativeWebSocket.upgrade(protocol:)` sent the protocol also when the client did not offer it (RFC 6455 section 4.2.2). Now, as in dart:io, the request gets `500` and `upgrade` throws a `WebSocketException`. When the client offers no protocol, the answer has no protocol.
+- Fix: when the stream of `addStream` failed before the head went out, the request got no answer. A later `close()` sent the part of the body that came before the error, as a `200`. Now the request gets `500` with no body.
 
 ## 3.2.4
 

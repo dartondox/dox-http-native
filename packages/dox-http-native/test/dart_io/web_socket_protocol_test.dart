@@ -38,18 +38,40 @@ void main() {
     });
   }
 
-  test('protocol the client did not offer is refused by the client', skip: 'dox_http_native: upgrade(protocol:) is sent as given, it is not checked against the protocols that the client offered (RFC 6455 4.2.2) (unsure, see report)', () async {
+  test('protocol the client did not offer: 500 and an error', () async {
+    Object? error;
+    NativeHttpServer server = await serve((HttpRequest request) async {
+      try {
+        await NativeWebSocket.upgrade(request, protocol: 'v2.example.com');
+      } on WebSocketException catch (e) {
+        error = e;
+      }
+    });
+    await expectLater(
+      WebSocket.connect(wsUrl(server), protocols: <String>['v1.example.com']),
+      throwsA(isA<WebSocketException>()),
+    );
+    expect(error, isA<WebSocketException>());
+    String text = await raw(
+      server.port,
+      'GET / HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\n'
+      'Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n'
+      'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n'
+      'Sec-WebSocket-Protocol: v1.example.com\r\n\r\n',
+    );
+    expect(statusOf(text), 500);
+    await server.close();
+  });
+
+  test('client offered no protocol: the answer has none', () async {
     NativeHttpServer server = await serveWebSockets(
       (WebSocket ws) => ws.close(),
       protocol: 'v2.example.com',
     );
-    expect(
-      () => WebSocket.connect(
-        wsUrl(server),
-        protocols: <String>['v1.example.com'],
-      ),
-      throwsA(isA<WebSocketException>()),
-    );
+    WebSocket client = await WebSocket.connect(wsUrl(server));
+    expect(client.protocol, isNull);
+    await client.close();
+    await server.close();
   });
 
   test('protocol with a line break is refused', () async {

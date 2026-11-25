@@ -202,9 +202,10 @@ The server implements the `dart:io` API. These parts are different on purpose. T
 - `requestedUri` does not use `x-forwarded-proto` or `x-forwarded-host`. A client can send them.
 - A header name is always lower case. `preserveHeaderCase` and `noFolding` have no effect.
 - A folded request header (obs-fold) gets `400`.
-- `flush()` and `addStream()` complete with `null`, not with the response. After a failed `addStream`, the response stays open.
+- `flush()` and `addStream()` complete with `null`, not with the response.
+- A failed `addStream` before the head goes out gives a `500` with no body. dart:io cuts the connection. After the head, both cut the connection.
 - `response.add` and `webSocket.add` throw an `ArgumentError` for a value that is not a byte. `dart:io` fails `done`.
-- `NativeWebSocket.upgrade` takes a `protocol`, not a `protocolSelector`.
+- `NativeWebSocket.upgrade` takes a `protocol`, not a `protocolSelector`. As in dart:io, a `protocol` that the client did not offer gives a `500` and a `WebSocketException`. When the client offers no protocol, the answer has no protocol.
 
 ## AES-GCM
 

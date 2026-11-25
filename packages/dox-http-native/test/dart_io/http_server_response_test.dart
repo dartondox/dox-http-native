@@ -76,7 +76,6 @@ void main() {
     );
     test(
       'pipe of a missing file',
-      skip: 'dox_http_native: after a failed addStream the response stays open (no answer, no close), dart:io cuts the connection',
       () => run((NativeHttpServer s, HttpRequest r, void Function() finish) {
         File('__nonexistent_file_')
             .openRead()
@@ -140,7 +139,6 @@ void main() {
     );
     test(
       'missing file',
-      skip: 'dox_http_native: after a failed addStream the response stays open (no answer, no close), dart:io cuts the connection',
       () => run((NativeHttpServer s, HttpRequest r, void Function() finish) {
         r.response
             .addStream(File('__nonexistent_file_').openRead())
@@ -320,4 +318,30 @@ void main() {
     expect((await got.future).length, 3);
     expect(text, endsWith('\u0001\u0002'));
   });
+
+  test(
+    'a failed addStream before the head: 500, then close does nothing',
+    () async {
+      NativeHttpServer server = await serve((HttpRequest r) async {
+        r.response
+          ..headers.contentType = ContentType.binary
+          ..contentLength = 100
+          ..add(<int>[1, 2, 3]);
+        try {
+          await r.response.addStream(File('__nonexistent_file_').openRead());
+        } on FileSystemException {
+          // like dox_core: report it, then close
+        }
+        await r.response.close();
+      });
+      String text = await raw(
+        server.port,
+        'GET / HTTP/1.1\r\nConnection: close\r\n\r\n',
+      );
+      expect(statusOf(text), 500);
+      expect(text.toLowerCase(), contains('content-length: 0'));
+      expect(text.toLowerCase(), isNot(contains('application/octet-stream')));
+      await server.close();
+    },
+  );
 }

@@ -346,6 +346,14 @@ class NativeResponse implements HttpResponse {
         _closed = true;
         _request.server.endStream(id, ok: false);
         _complete();
+      } else if (!_closed) {
+        // nothing is sent yet: answer 500 now. Else the request waits for
+        // an answer, or a later close sends a short body as a 200.
+        takeBody();
+        statusCode = HttpStatus.internalServerError;
+        headers.contentLength = -1;
+        headers.removeAll(HttpHeaders.contentTypeHeader);
+        end();
       }
       rethrow;
     } finally {
