@@ -6,6 +6,7 @@
 - Fix: `requestedUri` was wrong for a request line with an absolute URI (`GET http://example.com/ HTTP/1.1`). It gave `http://example.comhttp//example.com/`. Now it gives the URI of the request line.
 - Fix: a handler that set a `Date` header made an answer with two `Date` headers (RFC 9110 allows one). The server now always sends its own `Date`, as it already did for `Content-Length` and `Transfer-Encoding`.
 - Fix: `response.headers.clear()` did not reset `chunkedTransferEncoding`.
+- Fix: `response.add` and `webSocket.add` with a list that holds a value outside 0 to 255 (for example `[256]` or a `Uint16List`) sent other bytes (256 became 0). Now they throw an `ArgumentError`, as dart:io does. A `Uint8List` is not checked.
 - Fix: the answer to a `HEAD` request with a `contentLength` that the handler set, and no body, had `content-length: 0`. Now it has the length that the handler set, as for dart:io. This also applies to HTTP/2.
 
 ## 3.2.4

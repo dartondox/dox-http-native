@@ -178,6 +178,7 @@ class NativeWebSocket extends Stream<dynamic> implements WebSocket {
     if (data is String) {
       _send(kindText, utf8.encode(data));
     } else if (data is List<int>) {
+      checkBytes(data);
       _send(kindBinary, data);
     } else {
       throw ArgumentError.value(data, 'data', 'must be a String or List<int>');
