@@ -324,6 +324,9 @@ fn chunked_size_line_needs_a_hex_digit() {
         "3;a\nb\r\nabc\r\n0\r\n\r\n",
         "3;a\x00\r\nabc\r\n0\r\n\r\n",
         "3;a\x7f\r\nabc\r\n0\r\n\r\n",
+        // a lone LF or CR in a trailer: a proxy can end the body there
+        "3\r\nabc\r\n0\r\nX: a\n\r\nGET /evil HTTP/1.1\r\n\r\n",
+        "3\r\nabc\r\n0\r\nX: a\rb\r\n\r\n",
     ] {
         let req = format!(
             "POST /c HTTP/1.1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{body}"

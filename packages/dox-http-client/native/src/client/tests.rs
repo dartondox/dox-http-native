@@ -306,6 +306,20 @@ fn chunked_bad_bodies() {
         new_chunked().step(&[b'1'; CHUNK_LINE + 1], MAX_BODY),
         Err(E_BAD)
     );
+    // a lone LF or CR, or a control byte, in a size or trailer line
+    for wire in [
+        &b"3\nabc\r\n0\r\n\r\n"[..],
+        b"3;a\nb\r\nabc\r\n0\r\n\r\n",
+        b"3;a\rb\r\nabc\r\n0\r\n\r\n",
+        b"3;a\x00\r\nabc\r\n0\r\n\r\n",
+        b"3\r\nabc\r\n0\r\nX: a\n\r\n",
+        b"3\r\nabc\r\n0\r\n\n",
+    ] {
+        assert_eq!(new_chunked().step(wire, MAX_BODY), Err(E_BAD), "{wire:?}");
+    }
+    // a tab is fine
+    let ok = b"3;a=\tb\r\nabc\r\n0\r\nX:\t1\r\n\r\n";
+    assert_eq!(new_chunked().step(ok, MAX_BODY), Ok(Some(ok.len())));
     // over the limit, in one chunk and in two
     assert_eq!(new_chunked().step(b"b\r\n", 10), Err(E_BIG));
     assert_eq!(new_chunked().step(b"6\r\nabcdef\r\n5\r\n", 10), Err(E_BIG));
