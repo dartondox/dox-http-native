@@ -1209,9 +1209,9 @@ impl Conn {
             // the client closed in the middle of a request
             self.rpos = self.rlen;
         }
-        if self.eof && self.body.is_some() && self.rpos >= self.rlen {
-            // the client closed in the middle of a body: it can not end and
-            // no handler has seen the request. Drop it, so the connection
+        if self.eof && self.body.is_some() {
+            // the client closed in the middle of a body (or of a chunk
+            // line): it can not end and no handler has seen the request. Drop it, so the connection
             // closes now, not after `bodyTimeout`.
             self.body = None;
         }
@@ -3930,6 +3930,10 @@ pub mod fuzz {
     fn dechunk(s: &[u8]) -> Option<(Vec<u8>, usize)> {
         let (mut body, mut p) = (Vec::new(), 0);
         loop {
+            // a size line starts with a hex digit, like `BodyRead::feed`
+            if !s.get(p).is_some_and(u8::is_ascii_hexdigit) {
+                return None;
+            }
             let Ok(httparse::Status::Complete((used, size))) = httparse::parse_chunk_size(&s[p..])
             else {
                 return None;

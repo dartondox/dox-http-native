@@ -85,6 +85,29 @@ void main() {
     expectRequest: true,
   );
 
+  // a cut body can not end: the connection closes at once, not after
+  // `bodyTimeout`, so a graceful close does not wait for it
+  for (String cut in <String>[
+    'POST / HTTP/1.1\r\nContent-Length: 100\r\n\r\n1',
+    'POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n3',
+    'POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r',
+    'POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r',
+  ]) {
+    test('cut body closes at once: ${cut.split('\r\n\r\n').last}', () async {
+      NativeHttpServer server = await serve((HttpRequest request) {
+        request.response.close();
+      });
+      Socket socket = await Socket.connect('127.0.0.1', server.port);
+      socket.listen((_) {}, onError: (Object _) {});
+      socket.write(cut);
+      await socket.flush();
+      await socket.close();
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      await server.close().timeout(const Duration(seconds: 5));
+      socket.destroy();
+    });
+  }
+
   test('early close while the answer is a file', () async {
     int done = 0;
     NativeHttpServer server = await serve((HttpRequest request) {

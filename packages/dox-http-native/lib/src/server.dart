@@ -636,6 +636,8 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
     if (h.version != _defaultVersion) {
       BytesBuilder sb = BytesBuilder();
       h.forEachLine((String name, String value) {
+        // Rust sends its own `date`, as for the lines that `_line` skips
+        if (name == HttpHeaders.dateHeader) return;
         sb.add('$name: $value\r\n'.codeUnits);
       });
       _defaultLines = sb.takeBytes();
@@ -655,7 +657,10 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
     if (!identical(type, _typedFor) || h.version != _typedVersion) {
       BytesBuilder sb = BytesBuilder();
       h.forEachLine((String name, String value) {
-        if (name == HttpHeaders.contentTypeHeader) return;
+        if (name == HttpHeaders.contentTypeHeader ||
+            name == HttpHeaders.dateHeader) {
+          return;
+        }
         sb.add('$name: $value\r\n'.codeUnits);
       });
       sb.add('${HttpHeaders.contentTypeHeader}: $type\r\n'.codeUnits);
@@ -730,9 +735,15 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
     int start = _startRecord(req.id, res.statusCode, zip ? 0x100 : 0);
     _closeLine = false;
     _headerLines(res);
-    // a HEAD answer has no body: it keeps the length the handler set
+    // a HEAD answer has no body: it keeps the length the handler set.
+    // 1xx, 204 and 304 have no length (like the streamed answer)
     int length = res.headers.contentLength;
-    if (req.method == 'HEAD' && body.isEmpty && length > 0) _lengthLine(length);
+    int status = res.statusCode;
+    bool noBody =
+        (status >= 100 && status < 200) || status == 204 || status == 304;
+    if (req.method == 'HEAD' && body.isEmpty && length > 0 && !noBody) {
+      _lengthLine(length);
+    }
     // kind bit 9: the lines say `connection: close`, Rust closes after
     if (_closeLine) {
       _outData.setUint16(start + 10, (zip ? 0x100 : 0) | 0x200, Endian.little);

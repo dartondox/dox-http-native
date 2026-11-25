@@ -73,4 +73,49 @@ void main() {
         'dox_http_native: HEAD answers carry the real Content-Length of '
         'the body (valid, RFC 9110 9.3.2), not chunked',
   );
+
+  test(
+    'HEAD with a set contentLength and status 204 sends no length',
+    () async {
+      NativeHttpServer server = await serve((HttpRequest request) {
+        request.response
+          ..statusCode = 204
+          ..contentLength = 5
+          ..close();
+      });
+      String text = await raw(
+        server.port,
+        'HEAD / HTTP/1.1\r\nConnection: close\r\n\r\n',
+      );
+      expect(statusOf(text), 204);
+      expect(text.toLowerCase(), isNot(contains('content-length')));
+      await server.close();
+    },
+  );
+
+  test('a date in defaultResponseHeaders gives one Date header', () async {
+    NativeHttpServer server = await serve((HttpRequest request) {
+      // `/json` takes the other path: defaults with another content type
+      if (request.uri.path == '/json') {
+        request.response.headers.contentType = ContentType.json;
+      }
+      request.response.close();
+    });
+    server.defaultResponseHeaders.set(HttpHeaders.dateHeader, DateTime(2000));
+    for (String path in <String>['/', '/json']) {
+      String text = await raw(
+        server.port,
+        'GET $path HTTP/1.1\r\nConnection: close\r\n\r\n',
+      );
+      expect(
+        RegExp(
+          '^date:',
+          caseSensitive: false,
+          multiLine: true,
+        ).allMatches(text).length,
+        1,
+      );
+    }
+    await server.close();
+  });
 }
