@@ -230,6 +230,12 @@ impl BodyRead {
                         }
                     }
                 }
+                // a size line starts with a hex digit. httparse reads an empty
+                // size (`\r\n` or `;ext`) as 0: the last chunk. A proxy that
+                // reads it as an error or skips it would see another body end.
+                Some(Chunk::Size) if avail.first().is_some_and(|c| !c.is_ascii_hexdigit()) => {
+                    return Feed::Fail(400);
+                }
                 Some(Chunk::Size) => match httparse::parse_chunk_size(avail) {
                     // a longer line is refused also when it came whole, so
                     // the answer does not hang on how the bytes were split
