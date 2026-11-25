@@ -2,6 +2,8 @@
 
 - Tests: the HTTP server tests of the Dart SDK (`tests/standalone/io`) now run against this server, in `test/dart_io/`.
 - Fix: a client that sent more than 64 pipelined requests and then closed its send side got answers for only the first 64. The server closed the connection and dropped the requests that still waited in its read buffer. Now it reads on and answers all of them.
+- Fix: a client that closed its connection in the middle of a request body kept the connection open until `bodyTimeout` (120 seconds by default), and a graceful `close()` waited for it. Now the connection closes at once, as no handler saw the request.
+- Fix: `requestedUri` was wrong for a request line with an absolute URI (`GET http://example.com/ HTTP/1.1`). It gave `http://example.comhttp//example.com/`. Now it gives the URI of the request line.
 - Fix: the answer to a `HEAD` request with a `contentLength` that the handler set, and no body, had `content-length: 0`. Now it has the length that the handler set, as for dart:io. This also applies to HTTP/2.
 
 ## 3.2.4
