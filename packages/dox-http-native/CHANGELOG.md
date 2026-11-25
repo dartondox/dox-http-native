@@ -1,10 +1,11 @@
-## Unreleased
+## 3.2.5
 
 - Tests: the HTTP server tests of the Dart SDK (`tests/standalone/io`) now run against this server, in `test/dart_io/`.
 - Fix: a client that sent more than 64 pipelined requests and then closed its send side got answers for only the first 64. The server closed the connection and dropped the requests that still waited in its read buffer. Now it reads on and answers all of them.
 - Fix: a client that closed its connection in the middle of a request body kept the connection open until `bodyTimeout` (120 seconds by default), and a graceful `close()` waited for it. Now the connection closes at once, as no handler saw the request.
 - Fix: `requestedUri` was wrong for a request line with an absolute URI (`GET http://example.com/ HTTP/1.1`). It gave `http://example.comhttp//example.com/`. Now it gives the URI of the request line.
 - Fix: a chunked request body whose chunk size line was empty (`\r\n`) or started with `;` was read as the last chunk. Now the request gets `400`. A proxy that reads such a line as an error or skips it saw another end of the body, which is a request smuggling risk.
+- Fix (security): a chunked request body with a control byte in a chunk size line or in a trailer was accepted, for example a lone `\n` in a chunk extension or in a trailer line. A proxy that ends the line at the lone `\n` sees another end of the body. This is a request smuggling risk (the same type as CVE-2025-55315). Now the request gets `400`. A tab is permitted.
 - Fix: a handler that set a `Date` header made an answer with two `Date` headers (RFC 9110 allows one). The server now always sends its own `Date`, as it already did for `Content-Length` and `Transfer-Encoding`.
 - Fix: `response.headers.clear()` did not reset `chunkedTransferEncoding`.
 - Fix: `response.add` and `webSocket.add` with a list that holds a value outside 0 to 255 (for example `[256]` or a `Uint16List`) sent other bytes (256 became 0). Now they throw an `ArgumentError`, as dart:io does. A `Uint8List` is not checked.

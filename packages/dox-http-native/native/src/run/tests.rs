@@ -320,6 +320,13 @@ fn chunked_size_line_needs_a_hex_digit() {
         "\r\nabc\r\n0\r\n\r\n",
         ";x\r\nabc\r\n0\r\n\r\n",
         " 3\r\nabc\r\n0\r\n\r\n",
+        // a control byte in an extension (a lone LF ends the line for some proxies)
+        "3;a\nb\r\nabc\r\n0\r\n\r\n",
+        "3;a\x00\r\nabc\r\n0\r\n\r\n",
+        "3;a\x7f\r\nabc\r\n0\r\n\r\n",
+        // a lone LF or CR in a trailer: a proxy can end the body there
+        "3\r\nabc\r\n0\r\nX: a\n\r\nGET /evil HTTP/1.1\r\n\r\n",
+        "3\r\nabc\r\n0\r\nX: a\rb\r\n\r\n",
     ] {
         let req = format!(
             "POST /c HTTP/1.1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{body}"
@@ -336,7 +343,7 @@ fn chunked_body_and_expect_continue() {
         ..limits()
     };
     let (port, _) = serve(lim);
-    let req = b"POST /c HTTP/1.1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n2;x=y\r\nde\r\n0\r\nTrailer: 1\r\n\r\n";
+    let req = b"POST /c HTTP/1.1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n2;x=y\tz\r\nde\r\n0\r\nTrailer: 1\r\n\r\n";
     let r = send(port, req);
     assert!(
         r.starts_with("HTTP/1.1 200") && r.ends_with("/cabcde"),

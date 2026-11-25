@@ -129,6 +129,18 @@ pub(crate) const MAX_HEADERS: usize = 100;
 /// most bytes of a chunk size line, with its extensions
 const CHUNK_LINE: usize = 1024;
 
+/// A chunk size line or a trailer block has a control byte that is not a
+/// tab or a `\r\n` pair. A lone `\n` (or `\r`) ends a line for some proxies,
+/// so they would see another end of the body (request smuggling).
+fn bad_line_bytes(s: &[u8]) -> bool {
+    s.iter().enumerate().any(|(i, &c)| match c {
+        b'\t' => false,
+        b'\r' => s.get(i + 1) != Some(&b'\n'),
+        b'\n' => i == 0 || s[i - 1] != b'\r',
+        _ => c < 0x20 || c == 0x7f,
+    })
+}
+
 /// One request that waits for its answer, in the order of the connection.
 #[derive(Default)]
 struct Slot {
@@ -242,6 +254,14 @@ impl BodyRead {
                     Ok(httparse::Status::Complete((used, _))) if used > CHUNK_LINE => {
                         return Feed::Fail(400);
                     }
+                    // httparse takes any byte in an extension, also a lone
+                    // `\n`. A proxy that ends the line there sees another
+                    // body end (request smuggling, as CVE-2025-55315).
+                    Ok(httparse::Status::Complete((used, _)))
+                        if bad_line_bytes(&avail[..used - 2]) =>
+                    {
+                        return Feed::Fail(400);
+                    }
                     Ok(httparse::Status::Complete((used, size))) => {
                         *pos += used;
                         b.chunk = Some(if size == 0 {
@@ -275,6 +295,8 @@ impl BodyRead {
                     match avail.windows(4).position(|w| w == b"\r\n\r\n") {
                         // too long also when it came whole (see above)
                         Some(at) if at + 4 > MAX_HEAD => return Feed::Fail(431),
+                        // a lone `\n` in a trailer: a proxy can end the body there
+                        Some(at) if bad_line_bytes(&avail[..at + 4]) => return Feed::Fail(400),
                         Some(at) => {
                             *pos += at + 4;
                             break;
@@ -3943,6 +3965,10 @@ pub mod fuzz {
             if used > CHUNK_LINE {
                 return None;
             }
+            // a control byte (but a tab) in the line is bad, like the server
+            if super::bad_line_bytes(&s[p..p + used - 2]) {
+                return None;
+            }
             p += used;
             if size == 0 {
                 // no trailer: an empty line. Else lines up to an empty one.
@@ -3950,7 +3976,8 @@ pub mod fuzz {
                     return Some((body, p + 2));
                 }
                 let at = s[p..].windows(4).position(|w| w == b"\r\n\r\n")?;
-                return (at + 4 <= MAX_HEAD).then_some((body, p + at + 4));
+                let ok = at + 4 <= MAX_HEAD && !super::bad_line_bytes(&s[p..p + at + 4]);
+                return ok.then_some((body, p + at + 4));
             }
             let n = usize::try_from(size).ok()?;
             let data = s.get(p..p.checked_add(n)?.checked_add(2)?)?;

@@ -1,3 +1,7 @@
+## 0.0.5
+
+- Fix (security): a chunked answer with a lone `\n` or `\r`, or another control byte, in a chunk size line or in a trailer line was accepted. Each of these lines must end with `\r\n` now. A proxy that ends a line at a lone `\n` sees another end of the body, so the next answer on the same connection could come from bytes of this body. Now such an answer fails with `badResponse`. A tab is permitted.
+
 ## 0.0.4
 
 - `DoxHttpPackageClient` now passes all tests of the Dart team for clients of `package:http` (`http_client_conformance_tests`), with each optional group on. The tests run in the CI of this package.

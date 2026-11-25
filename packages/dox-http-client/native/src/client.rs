@@ -209,6 +209,16 @@ enum ChunkState {
     Trailer,
 }
 
+/// A chunk size line or a trailer line (up to its `\n`) that does not end
+/// in `\r`, or has another control byte than a tab. A proxy that reads a
+/// lone `\n` or `\r` as a line end would see another end of the body.
+fn bad_line(line: &[u8]) -> bool {
+    let Some((&b'\r', text)) = line.split_last() else {
+        return true;
+    };
+    text.iter().any(|&c| (c < 0x20 && c != b'\t') || c == 0x7f)
+}
+
 /// Reads a chunked body in steps, as the bytes come.
 struct Chunked {
     /// the next byte to read in the buffer
@@ -235,7 +245,10 @@ impl Chunked {
                     if nl > CHUNK_LINE {
                         return Err(E_BAD);
                     }
-                    let line = &rest[..nl];
+                    if bad_line(&rest[..nl]) {
+                        return Err(E_BAD);
+                    }
+                    let line = &rest[..nl - 1];
                     let hex = line.split(|&c| c == b';').next().unwrap_or(&[]);
                     let hex = hex.trim_ascii();
                     if hex.is_empty() || hex.len() > 16 || !hex.iter().all(u8::is_ascii_hexdigit) {
@@ -285,7 +298,10 @@ impl Chunked {
                     if nl > MAX_HEAD {
                         return Err(E_BAD);
                     }
-                    let empty = nl == 0 || (nl == 1 && rest[0] == b'\r');
+                    if bad_line(&rest[..nl]) {
+                        return Err(E_BAD);
+                    }
+                    let empty = nl == 1;
                     self.pos += nl + 1;
                     if empty {
                         return Ok(Some(self.pos));
