@@ -727,6 +727,9 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
     int start = _startRecord(req.id, res.statusCode, zip ? 0x100 : 0);
     _closeLine = false;
     _headerLines(res);
+    // a HEAD answer has no body: it keeps the length the handler set
+    int length = res.headers.contentLength;
+    if (req.method == 'HEAD' && body.isEmpty && length > 0) _lengthLine(length);
     // kind bit 9: the lines say `connection: close`, Rust closes after
     if (_closeLine) {
       _outData.setUint16(start + 10, (zip ? 0x100 : 0) | 0x200, Endian.little);

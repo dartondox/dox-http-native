@@ -537,7 +537,13 @@ fn no_body(status: u16) -> bool {
 
 /// Writes a whole answer with this body.
 fn render(buf: &mut Vec<u8>, status: u16, lines: &[u8], body: &[u8], date: &[u8], w: Way) {
-    render_head(buf, status, lines, b"", date, w, Len::Exact(body.len()));
+    // a HEAD answer with no body keeps the length that Dart set (the length
+    // a GET would have). Dart then put the content-length line in `lines`.
+    let len = match length_line(lines) {
+        Some(Some(_)) if w.head && body.is_empty() => Len::Open,
+        _ => Len::Exact(body.len()),
+    };
+    render_head(buf, status, lines, b"", date, w, len);
     let no_body = status < 200 || status == 204 || status == 304;
     if !no_body && !w.head {
         buf.extend_from_slice(body);
@@ -2049,7 +2055,9 @@ impl Core {
             c.paused = false;
             linger = true;
             go_on = true;
-        } else if c.finished() {
+        } else if c.finished() && !go_on {
+            // not when it reads on: requests that the client sent before it
+            // closed can wait in the buffer (more than MAX_INFLIGHT)
             self.kill(idx);
             return;
         }

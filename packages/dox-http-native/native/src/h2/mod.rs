@@ -1582,7 +1582,11 @@ impl H2 {
         };
         let status = final_status(status);
         let no_body = status == 204 || status == 304;
-        let len = (!no_body).then_some(body.len() as u64);
+        // a HEAD answer with no body keeps the length that Dart set
+        let len = (!no_body).then(|| match length_line(lines) {
+            Some(Some(n)) if s.head && body.is_empty() => n,
+            _ => body.len() as u64,
+        });
         let silent = no_body || s.head || body.is_empty();
         let block = head_block(status, lines, len, date);
         frame::write_headers(out, id, &block, silent, self.peer_frame);
