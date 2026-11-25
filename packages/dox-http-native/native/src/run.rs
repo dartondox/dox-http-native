@@ -3953,6 +3953,13 @@ pub mod fuzz {
             if used > CHUNK_LINE {
                 return None;
             }
+            // a control byte (but a tab) in the line is bad, like the server
+            if s[p..p + used - 2]
+                .iter()
+                .any(|&c| (c < 0x20 && c != b'\t') || c == 0x7f)
+            {
+                return None;
+            }
             p += used;
             if size == 0 {
                 // no trailer: an empty line. Else lines up to an empty one.
