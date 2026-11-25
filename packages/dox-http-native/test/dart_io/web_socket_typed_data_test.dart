@@ -2,6 +2,7 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/web_socket_typed_data_test.dart.
+// ignore_for_file: unawaited_futures
 import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
@@ -23,7 +24,7 @@ void main() {
     Future<void> echoTest(List<int> expected, List<List<int>> testData) async {
       int serverCount = 0;
       Completer<void> serverDone = Completer<void>();
-      var server = await serveWebSockets((WebSocket ws) {
+      NativeHttpServer server = await serveWebSockets((WebSocket ws) {
         ws.listen(
           (dynamic m) {
             expect(m, expected);
@@ -80,7 +81,7 @@ void main() {
     test(
       'out of range data from the client (compression: $compression)',
       () async {
-        var server = await serveWebSockets((WebSocket ws) {
+        NativeHttpServer server = await serveWebSockets((WebSocket ws) {
           ws.listen((_) => fail('No message expected'));
         });
         List<List<int>> bad = <List<int>>[

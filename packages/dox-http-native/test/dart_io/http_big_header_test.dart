@@ -2,10 +2,12 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/http_big_header_test.dart.
+// ignore_for_file: unawaited_futures
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:dox_http_native/src/server.dart';
 import 'package:test/test.dart';
 
 import 'util.dart';
@@ -15,7 +17,7 @@ void main() {
   // writes big response headers: it must not crash or hang, and must serve on.
   test('server writes a big response head and keeps serving', () async {
     String str = 'a' * 1000;
-    var server = await serve((HttpRequest request) async {
+    NativeHttpServer server = await serve((HttpRequest request) async {
       if (request.uri.path == '/big') {
         for (int i = 0; i < 2000; i++) {
           request.response.headers.add('dummy', str);
@@ -40,7 +42,7 @@ void main() {
   // The server limits the size of a request head (16 KB on the native server).
   for (int size in <int>[64, 6400, 640000, 64000000]) {
     test('request head with $size bytes of headers', () async {
-      var server = await serve((HttpRequest request) async {
+      NativeHttpServer server = await serve((HttpRequest request) async {
         await request.response.close();
       });
       String str = 'a' * 1000;
@@ -68,7 +70,7 @@ void main() {
 
   test('request head over the limit is never given to the handler', () async {
     int handled = 0;
-    var server = await serve((HttpRequest request) async {
+    NativeHttpServer server = await serve((HttpRequest request) async {
       handled++;
       await request.response.close();
     });
@@ -80,7 +82,7 @@ void main() {
 
   test('obs-fold at the head limit is refused, not crashed', () async {
     const int limit = 1024 * 1024;
-    var server = await serve((HttpRequest request) async {
+    NativeHttpServer server = await serve((HttpRequest request) async {
       await request.response.close();
     });
     String head = 'GET / HTTP/1.1\r\nX: ${'a' * (limit - 4)}\r\n b\r\n\r\n';

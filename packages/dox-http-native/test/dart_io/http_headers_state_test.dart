@@ -2,9 +2,11 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/http_headers_state_test.dart.
+// ignore_for_file: unawaited_futures
 import 'dart:async';
 import 'dart:io';
 
+import 'package:dox_http_native/src/server.dart';
 import 'package:test/test.dart';
 
 import 'util.dart';
@@ -16,7 +18,7 @@ void main() {
       List<String> problems = <String>[];
       Completer<void> served = Completer<void>();
       int count = 0;
-      var server = await serve((HttpRequest request) {
+      NativeHttpServer server = await serve((HttpRequest request) {
         HttpResponse response = request.response;
         // cannot mutate request headers
         expect(
@@ -95,7 +97,7 @@ void main() {
     'response head is locked once data is written (state errors)',
     () async {
       List<String> problems = <String>[];
-      var server = await serve((HttpRequest request) {
+      NativeHttpServer server = await serve((HttpRequest request) {
         HttpResponse response = request.response;
         response.write('hello');
         try {

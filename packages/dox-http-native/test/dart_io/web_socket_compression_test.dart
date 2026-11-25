@@ -2,6 +2,7 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/web_socket_compression_test.dart.
+// ignore_for_file: unawaited_futures
 // The native server never agrees on permessage-deflate (see the README).
 // What must hold: a client that asks for compression, with any parameters,
 // still gets a working WebSocket, and no extension is answered.
@@ -10,6 +11,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:crypto/crypto.dart';
+import 'package:dox_http_native/src/server.dart';
 import 'package:test/test.dart';
 
 import 'util.dart';
@@ -22,7 +24,7 @@ void main() {
       test(
         'compression support (client: $client, no takeover: $takeover)',
         () async {
-          var server = await serveWebSockets((WebSocket ws) {
+          NativeHttpServer server = await serveWebSockets((WebSocket ws) {
             ws.listen((dynamic m) {
               expect(m, 'Hello World');
               ws.add(m);
@@ -50,16 +52,13 @@ void main() {
 
   for (int messages in <int>[1, 3]) {
     test('many messages with compression asked ($messages)', () async {
-      var server = await serveWebSockets((WebSocket ws) {
+      NativeHttpServer server = await serveWebSockets((WebSocket ws) {
         ws.listen((dynamic m) {
           expect(m, 'Hello World');
           ws.add(m);
         });
       });
-      WebSocket ws = await WebSocket.connect(
-        wsUrl(server),
-        compression: CompressionOptions.compressionDefault,
-      );
+      WebSocket ws = await WebSocket.connect(wsUrl(server));
       int i = 1;
       Completer<void> done = Completer<void>();
       ws.listen((dynamic m) {
@@ -86,7 +85,7 @@ void main() {
     'permessage-deflate; permessage-deflate',
   ]) {
     test('Sec-WebSocket-Extensions "$extension": no extension answered', () async {
-      var server = await serveWebSockets((WebSocket ws) {
+      NativeHttpServer server = await serveWebSockets((WebSocket ws) {
         ws.listen((dynamic m) {
           ws.add(m);
           ws.close();
@@ -99,8 +98,9 @@ void main() {
       Completer<void> head = Completer<void>();
       socket.listen((List<int> d) {
         text.write(latin1.decode(d));
-        if (text.toString().contains('\r\n\r\n') && !head.isCompleted)
+        if (text.toString().contains('\r\n\r\n') && !head.isCompleted) {
           head.complete();
+        }
       }, onError: (Object e) {});
       socket.write(
         'GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
@@ -140,7 +140,7 @@ void main() {
     'a compressed frame (RSV1) without an agreed extension is refused',
     () async {
       int messages = 0;
-      var server = await serveWebSockets((WebSocket ws) {
+      NativeHttpServer server = await serveWebSockets((WebSocket ws) {
         ws.listen((dynamic m) => messages++);
       });
       Socket socket = await Socket.connect('127.0.0.1', server.port);

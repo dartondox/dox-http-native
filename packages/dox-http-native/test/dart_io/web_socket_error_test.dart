@@ -2,9 +2,11 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/web_socket_error_test.dart.
+// ignore_for_file: unawaited_futures
 import 'dart:async';
 import 'dart:io';
 
+import 'package:dox_http_native/src/server.dart';
 import 'package:test/test.dart';
 
 import 'util.dart';
@@ -22,7 +24,7 @@ void main() {
     const int total = 10;
     int upgraded = 0;
     Completer<void> allUp = Completer<void>();
-    var server = await serveWebSockets((WebSocket ws) {
+    NativeHttpServer server = await serveWebSockets((WebSocket ws) {
       ws.listen((_) {});
       if (++upgraded == total) allUp.complete();
     });

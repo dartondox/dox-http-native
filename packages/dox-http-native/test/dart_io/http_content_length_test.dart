@@ -2,9 +2,11 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/http_content_length_test.dart.
+// ignore_for_file: unawaited_futures
 import 'dart:async';
 import 'dart:io';
 
+import 'package:dox_http_native/src/server.dart';
 import 'package:test/test.dart';
 
 import 'util.dart';
@@ -17,7 +19,7 @@ void main() {
         () async {
           int count = 0;
           Completer<void> all = Completer<void>();
-          var server = await serve((HttpRequest request) {
+          NativeHttpServer server = await serve((HttpRequest request) {
             expect(request.headers.value('content-length'), isNull);
             HttpResponse response = request.response;
             response.contentLength = 0;
@@ -62,7 +64,7 @@ void main() {
   }
 
   test('no body with content length 0: the answer has no body', () async {
-    var server = await serve((HttpRequest request) {
+    NativeHttpServer server = await serve((HttpRequest request) {
       request.response.contentLength = 0;
       request.response.write('x');
       request.response.close();
@@ -84,7 +86,7 @@ void main() {
         const int total = 5;
         int serverCount = 0;
         Completer<void> all = Completer<void>();
-        var server = await serve((HttpRequest request) {
+        NativeHttpServer server = await serve((HttpRequest request) {
           expect(request.headers.value('content-length'), '2');
           expect(request.contentLength, 2);
           HttpResponse response = request.response;
@@ -149,7 +151,7 @@ void main() {
       'chunked body, content length set too (useHeader: $useHeader)',
       () async {
         const int total = 5;
-        var server = await serve((HttpRequest request) {
+        NativeHttpServer server = await serve((HttpRequest request) {
           expect(request.headers.value('content-length'), isNull);
           HttpResponse response = request.response;
           if (useHeader) {
@@ -208,7 +210,7 @@ void main() {
   }
 
   test('set content length', () async {
-    var server = await serve((HttpRequest request) {
+    NativeHttpServer server = await serve((HttpRequest request) {
       HttpResponse response = request.response;
       expect(response.headers.value('content-length'), isNull);
       expect(response.contentLength, -1);
@@ -228,7 +230,7 @@ void main() {
   test(
     'content length and chunked set together: framing stays valid',
     () async {
-      var server = await serve((HttpRequest request) {
+      NativeHttpServer server = await serve((HttpRequest request) {
         request.response.headers.set('content-length', 2);
         request.response.headers.set('transfer-encoding', 'chunked');
         request.response.write('xxx');

@@ -2,8 +2,10 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/http_100_continue_test.dart.
+// ignore_for_file: unawaited_futures
 import 'dart:io';
 
+import 'package:dox_http_native/src/server.dart';
 import 'package:test/test.dart';
 
 import 'util.dart';
@@ -12,7 +14,7 @@ import 'util.dart';
 // server side: how it answers a request with `Expect: 100-continue`.
 void main() {
   test('Expect: 100-continue gets a 100, then the final answer', () async {
-    var server = await serve((HttpRequest request) async {
+    NativeHttpServer server = await serve((HttpRequest request) async {
       List<int> body = <int>[for (List<int> c in await request.toList()) ...c];
       request.response.write('got ${body.length}');
       await request.response.close();
@@ -28,7 +30,7 @@ void main() {
   });
 
   test('Expect: 100-continue with HttpClient', () async {
-    var server = await serve((HttpRequest request) async {
+    NativeHttpServer server = await serve((HttpRequest request) async {
       await request.drain<void>();
       request.response.write('ok');
       await request.response.close();
@@ -50,7 +52,7 @@ void main() {
   test(
     'Expect: 100-continue with a body that is too big gets 413 first',
     () async {
-      var server = await serve((HttpRequest request) async {
+      NativeHttpServer server = await serve((HttpRequest request) async {
         await request.response.close();
       }, maxBodySize: 10);
       String text = await raw(

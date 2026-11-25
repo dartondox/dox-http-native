@@ -2,9 +2,11 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/http_10_test.dart.
+// ignore_for_file: unawaited_futures
 import 'dart:async';
 import 'dart:io';
 
+import 'package:dox_http_native/src/server.dart';
 import 'package:test/test.dart';
 
 import 'util.dart';
@@ -14,7 +16,7 @@ void main() {
     'content length smaller than the body: done completes with HttpException',
     () async {
       Completer<Object?> result = Completer<Object?>();
-      var server = await serve((HttpRequest request) {
+      NativeHttpServer server = await serve((HttpRequest request) {
         HttpResponse response = request.response;
         response.contentLength = 1;
         response.done.then<void>(
@@ -36,7 +38,7 @@ void main() {
   test(
     'request.contentLength is -1 without Content-Length',
     () async {
-      var server = await serve((HttpRequest request) {
+      NativeHttpServer server = await serve((HttpRequest request) {
         request.response.write('${request.contentLength}');
         request.response.close();
       });
@@ -52,7 +54,7 @@ void main() {
   // The server sets a content length but still must close the connection as
   // there is no keep alive.
   test('HTTP/1.0 without keep-alive closes', () async {
-    var server = await serve((HttpRequest request) {
+    NativeHttpServer server = await serve((HttpRequest request) {
       expect(request.headers.value('content-length'), isNull);
       HttpResponse response = request.response;
       response.contentLength = 1;
@@ -74,7 +76,7 @@ void main() {
 
   // No content length: the server closes the connection to end the answer.
   test('HTTP/1.0 keep-alive request, no content length: server closes', skip: 'dox_http_native: it buffers the body, sets Content-Length and keeps the HTTP/1.0 connection alive (valid)', () async {
-    var server = await serve((HttpRequest request) {
+    NativeHttpServer server = await serve((HttpRequest request) {
       expect(request.headers.value('content-length'), isNull);
       request.listen(
         (_) {},
@@ -97,7 +99,7 @@ void main() {
   });
 
   test('HTTP/1.0 keep-alive with a content length is reused', () async {
-    var server = await serve((HttpRequest request) {
+    NativeHttpServer server = await serve((HttpRequest request) {
       expect(request.headers.value('content-length'), isNull);
       HttpResponse response = request.response;
       response.contentLength = 1;
@@ -134,7 +136,7 @@ void main() {
   });
 
   test('HTTP/1.0 keep-alive, no content length: no keep-alive answer', skip: 'dox_http_native: it buffers the body, sets Content-Length and keeps the HTTP/1.0 connection alive (valid)', () async {
-    var server = await serve((HttpRequest request) {
+    NativeHttpServer server = await serve((HttpRequest request) {
       expect(request.headers.value('content-length'), isNull);
       expect(request.protocolVersion, '1.0');
       request.response.write('Z');

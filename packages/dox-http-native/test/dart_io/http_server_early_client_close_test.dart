@@ -2,6 +2,7 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/http_server_early_client_close_test.dart.
+// ignore_for_file: unawaited_futures
 import 'dart:async';
 import 'dart:io';
 
@@ -86,7 +87,7 @@ void main() {
 
   test('early close while the answer is a file', () async {
     int done = 0;
-    var server = await serve((HttpRequest request) {
+    NativeHttpServer server = await serve((HttpRequest request) {
       File('pubspec.yaml')
           .openRead()
           .cast<List<int>>()
@@ -109,7 +110,7 @@ void main() {
 
   test('cancel of the request subscription does not error', () async {
     int requests = 0;
-    var server = await serve((HttpRequest request) {
+    NativeHttpServer server = await serve((HttpRequest request) {
       requests++;
       StreamSubscription<List<int>> subscription = request.listen(
         (_) {},

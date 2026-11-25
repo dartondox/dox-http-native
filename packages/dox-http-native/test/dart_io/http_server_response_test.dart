@@ -2,6 +2,7 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/http_server_response_test.dart.
+// ignore_for_file: unawaited_futures
 import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
@@ -65,9 +66,9 @@ void main() {
   group('response done', () {
     test(
       'close',
-      () => run((s, r, finish) {
+      () => run((NativeHttpServer s, HttpRequest r, void Function() finish) {
         r.response.close();
-        r.response.done.then((response) {
+        r.response.done.then<void>((Object? response) {
           expect(response, r.response);
           finish();
         });
@@ -76,7 +77,7 @@ void main() {
     test(
       'pipe of a missing file',
       skip: 'dox_http_native: after a failed addStream the response stays open (no answer, no close), dart:io cuts the connection',
-      () => run((s, r, finish) {
+      () => run((NativeHttpServer s, HttpRequest r, void Function() finish) {
         File('__nonexistent_file_')
             .openRead()
             .cast<List<int>>()
@@ -86,7 +87,7 @@ void main() {
     );
     test(
       'content length 0',
-      () => run((s, r, finish) {
+      () => run((NativeHttpServer s, HttpRequest r, void Function() finish) {
         r.response.done.then((_) => finish());
         r.response.contentLength = 0;
         r.response.close();
@@ -98,9 +99,9 @@ void main() {
     int bytes = scriptSource.lengthSync();
     test(
       'one file',
-      () => run((s, r, finish) {
-        r.response.addStream(scriptSource.openRead()).then((response) {
-          response.close();
+      () => run((NativeHttpServer s, HttpRequest r, void Function() finish) {
+        r.response.addStream(scriptSource.openRead()).then((Object? response) {
+          (response as HttpResponse).close();
           response.done.then((_) => finish());
         });
       }, bytes: bytes),
@@ -108,7 +109,7 @@ void main() {
     );
     test(
       'one file (no result used)',
-      () => run((s, r, finish) {
+      () => run((NativeHttpServer s, HttpRequest r, void Function() finish) {
         r.response.addStream(scriptSource.openRead()).then((_) {
           r.response.close();
           r.response.done.then((_) => finish());
@@ -117,7 +118,7 @@ void main() {
     );
     test(
       'two files',
-      () => run((s, r, finish) {
+      () => run((NativeHttpServer s, HttpRequest r, void Function() finish) {
         r.response.addStream(scriptSource.openRead()).then((_) {
           r.response.addStream(scriptSource.openRead()).then((_) {
             r.response.close();
@@ -128,7 +129,7 @@ void main() {
     );
     test(
       'empty sync stream',
-      () => run((s, r, finish) {
+      () => run((NativeHttpServer s, HttpRequest r, void Function() finish) {
         StreamController<List<int>> c = StreamController<List<int>>(sync: true);
         r.response.addStream(c.stream).then((_) {
           r.response.close();
@@ -140,7 +141,7 @@ void main() {
     test(
       'missing file',
       skip: 'dox_http_native: after a failed addStream the response stays open (no answer, no close), dart:io cuts the connection',
-      () => run((s, r, finish) {
+      () => run((NativeHttpServer s, HttpRequest r, void Function() finish) {
         r.response
             .addStream(File('__nonexistent_file_').openRead())
             .catchError((Object e) => finish());
@@ -151,7 +152,7 @@ void main() {
   group('addStream, client closed', () {
     test(
       'one file',
-      () => run((s, r, finish) {
+      () => run((NativeHttpServer s, HttpRequest r, void Function() finish) {
         r.response.addStream(scriptSource.openRead()).then((_) {
           r.response.close();
           r.response.done.then((_) => finish());
@@ -160,7 +161,7 @@ void main() {
     );
     test(
       '1000 files',
-      () => run((s, r, finish) {
+      () => run((NativeHttpServer s, HttpRequest r, void Function() finish) {
         int count = 0;
         void write() {
           r.response.addStream(scriptSource.openRead()).then((_) {
@@ -182,7 +183,7 @@ void main() {
   group('add, client closed', () {
     test(
       'one add',
-      () => run((s, r, finish) {
+      () => run((NativeHttpServer s, HttpRequest r, void Function() finish) {
         r.response.add(scriptSource.readAsBytesSync());
         r.response.close();
         r.response.done.then((_) => finish());
@@ -190,7 +191,7 @@ void main() {
     );
     test(
       '1000 adds',
-      () => run((s, r, finish) {
+      () => run((NativeHttpServer s, HttpRequest r, void Function() finish) {
         for (int i = 0; i < 1000; i++) {
           r.response.add(scriptSource.readAsBytesSync());
         }
@@ -200,7 +201,7 @@ void main() {
     );
     test(
       '1000 adds, one for each turn',
-      () => run((s, r, finish) {
+      () => run((NativeHttpServer s, HttpRequest r, void Function() finish) {
         int count = 0;
         void write() {
           r.response.add(scriptSource.readAsBytesSync());
@@ -223,7 +224,7 @@ void main() {
     void bad(String name, void Function(HttpResponse) body) {
       test(
         name,
-        () => run((s, r, finish) {
+        () => run((NativeHttpServer s, HttpRequest r, void Function() finish) {
           body(r.response);
           r.response.close();
           r.response.done.catchError(
@@ -239,36 +240,36 @@ void main() {
 
     bad(
       '0 and one byte',
-      (r) => r
+      (HttpResponse r) => r
         ..contentLength = 0
         ..add(<int>[0]),
     );
     bad(
       '5 and 6 bytes',
-      (r) => r
+      (HttpResponse r) => r
         ..contentLength = 5
         ..add(<int>[0, 0, 0])
         ..add(<int>[0, 0, 0]),
     );
     bad(
       '0 and 192 KiB',
-      (r) => r
+      (HttpResponse r) => r
         ..contentLength = 0
         ..add(Uint8List(64 * 1024))
         ..add(Uint8List(64 * 1024))
         ..add(Uint8List(64 * 1024)),
     );
-    bad('5 and no bytes', (r) => r.contentLength = 5);
+    bad('5 and no bytes', (HttpResponse r) => r.contentLength = 5);
     bad(
       '5 and one byte',
-      (r) => r
+      (HttpResponse r) => r
         ..contentLength = 5
         ..add(<int>[0]),
     );
   });
 
   test('request data is ignored', () async {
-    var server = await serve((HttpRequest request) {
+    NativeHttpServer server = await serve((HttpRequest request) {
       request.response.write('all-okay');
       request.response.close();
     });
@@ -285,7 +286,7 @@ void main() {
 
   test(
     'writeCharCode is latin-1 without a content type',
-    () => run((s, r, finish) {
+    () => run((NativeHttpServer s, HttpRequest r, void Function() finish) {
       r.response.writeCharCode(0xFF);
       r.response.writeCharCode(0xFF);
       r.response.close().then((_) => finish());
@@ -295,7 +296,7 @@ void main() {
 
   test('add refuses a value that is not a byte', () async {
     Completer<List<Object?>> got = Completer<List<Object?>>();
-    var server = await serve((HttpRequest request) {
+    NativeHttpServer server = await serve((HttpRequest request) {
       List<Object?> errors = <Object?>[];
       for (List<int> bad in <List<int>>[
         <int>[256],

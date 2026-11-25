@@ -2,11 +2,13 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/https_server_test.dart.
+// ignore_for_file: unawaited_futures
 // dox_http_native has no TLS: a proxy ends it (see the README). The TLS tests
 // of the SDK are skipped. What stays: a client that sends bytes that are not
 // HTTP (a TLS handshake that goes to a plain port) must not hurt the server.
 import 'dart:io';
 
+import 'package:dox_http_native/src/server.dart';
 import 'package:test/test.dart';
 
 import 'util.dart';
@@ -20,7 +22,7 @@ void main() {
 
   test('early client close with an invalid TLS handshake', () async {
     int requests = 0;
-    var server = await serve((HttpRequest request) {
+    NativeHttpServer server = await serve((HttpRequest request) {
       requests++;
       request.response.close();
     });
@@ -42,7 +44,7 @@ void main() {
   test(
     'a real TLS ClientHello on the plain port gets 400 or a close',
     () async {
-      var server = await serve(
+      NativeHttpServer server = await serve(
         (HttpRequest request) => request.response.close(),
       );
       List<int> hello = <int>[

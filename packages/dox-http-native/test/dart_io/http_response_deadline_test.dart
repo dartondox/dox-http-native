@@ -2,16 +2,18 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/http_response_deadline_test.dart.
+// ignore_for_file: unawaited_futures
 import 'dart:async';
 import 'dart:io';
 
+import 'package:dox_http_native/src/server.dart';
 import 'package:test/test.dart';
 
 import 'util.dart';
 
 void main() {
   test('simple deadline', () async {
-    var server = await serve((HttpRequest request) {
+    NativeHttpServer server = await serve((HttpRequest request) {
       request.response.deadline = const Duration(seconds: 1000);
       request.response.write('stuff');
       request.response.close();
@@ -27,7 +29,7 @@ void main() {
   });
 
   test('exceeded deadline ends the answer with an error', () async {
-    var server = await serve((HttpRequest request) {
+    NativeHttpServer server = await serve((HttpRequest request) {
       request.response.deadline = const Duration(milliseconds: 100);
       request.response.contentLength = 10000;
       request.response.write('stuff');

@@ -2,9 +2,11 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/web_socket_ping_test.dart.
+// ignore_for_file: unawaited_futures
 import 'dart:async';
 import 'dart:io';
 
+import 'package:dox_http_native/src/server.dart';
 import 'package:test/test.dart';
 
 import 'util.dart';
@@ -15,7 +17,7 @@ void main() {
   // not answer pings is closed, and a client that answers keeps the socket.
   test('server pingInterval: a client that answers keeps the socket', () async {
     Completer<void> pings = Completer<void>();
-    var server = await serveWebSockets((WebSocket ws) {
+    NativeHttpServer server = await serveWebSockets((WebSocket ws) {
       ws.pingInterval = const Duration(milliseconds: 100);
       ws.listen((_) {});
     });
@@ -35,7 +37,7 @@ void main() {
 
   test('a client that never answers a ping is closed', () async {
     Completer<void> closed = Completer<void>();
-    var server = await serveWebSockets((WebSocket ws) {
+    NativeHttpServer server = await serveWebSockets((WebSocket ws) {
       ws.pingInterval = const Duration(milliseconds: 100);
       ws.listen((_) {}, onDone: closed.complete);
     });
@@ -52,7 +54,7 @@ void main() {
 
   test('ping timer is cancelled on close', () async {
     Completer<void> done = Completer<void>();
-    var server = await serveWebSockets((WebSocket ws) {
+    NativeHttpServer server = await serveWebSockets((WebSocket ws) {
       ws.listen((_) {});
     });
     WebSocket client = await WebSocket.connect(wsUrl(server));

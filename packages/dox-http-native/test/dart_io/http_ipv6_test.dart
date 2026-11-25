@@ -2,8 +2,10 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/http_ipv6_test.dart.
+// ignore_for_file: unawaited_futures
 import 'dart:io';
 
+import 'package:dox_http_native/src/server.dart';
 import 'package:test/test.dart';
 
 import 'util.dart';
@@ -16,7 +18,7 @@ void main() {
       return; // no IPv6 here
     }
     late int port;
-    var server = await serve((HttpRequest request) {
+    NativeHttpServer server = await serve((HttpRequest request) {
       expect(request.headers['host']![0], '[::1]:$port');
       expect(request.requestedUri.host, '::1');
       request.response.close();

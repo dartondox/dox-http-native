@@ -2,11 +2,13 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/http_server_encoding_test.dart.
+// ignore_for_file: unawaited_futures
 // The server response body follows the defaults or the charset of the
 // Content-Type header.
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:dox_http_native/src/server.dart';
 import 'package:test/test.dart';
 
 import 'util.dart';
@@ -15,7 +17,7 @@ void main() {
   Future<(List<String>, List<int>)> answer(
     void Function(HttpResponse) write,
   ) async {
-    var server = await serve((HttpRequest request) {
+    NativeHttpServer server = await serve((HttpRequest request) {
       write(request.response);
       request.response.close();
     });
@@ -41,24 +43,28 @@ void main() {
     expect(utf8.decode(b), '日本語');
   });
   test('writeln without content type, Japanese', () async {
-    var (ct, b) = await answer((HttpResponse r) => r.writeln('日本語'));
+    var (List<String> ct, List<int> b) = await answer(
+      (HttpResponse r) => r.writeln('日本語'),
+    );
     expect(ct, plainUtf8);
     expect(utf8.decode(b), '日本語\n');
   });
   test('writeAll without content type, Japanese', () async {
-    var (ct, b) = await answer(
+    var (List<String> ct, List<int> b) = await answer(
       (HttpResponse r) => r.writeAll(<String>['日', '本', '語']),
     );
     expect(ct, plainUtf8);
     expect(utf8.decode(b), '日本語');
   });
   test('writeCharCode without content type, Japanese', () async {
-    var (ct, b) = await answer((HttpResponse r) => r.writeCharCode(0x65E5));
+    var (List<String> ct, List<int> b) = await answer(
+      (HttpResponse r) => r.writeCharCode(0x65E5),
+    );
     expect(ct, plainUtf8);
     expect(utf8.decode(b), '日');
   });
   test('write with charset, Japanese', () async {
-    var (ct, b) = await answer(
+    var (List<String> ct, List<int> b) = await answer(
       (HttpResponse r) => r
         ..headers.contentType = utf8Type()
         ..write('日本語'),
@@ -68,7 +74,7 @@ void main() {
   });
   // regression: https://github.com/dart-lang/sdk/issues/59719
   test('writeln with charset, Japanese', () async {
-    var (ct, b) = await answer(
+    var (List<String> ct, List<int> b) = await answer(
       (HttpResponse r) => r
         ..headers.contentType = utf8Type()
         ..writeln('日本語'),
@@ -77,7 +83,7 @@ void main() {
     expect(utf8.decode(b), '日本語\n');
   });
   test('writeAll with charset, Japanese', () async {
-    var (ct, b) = await answer(
+    var (List<String> ct, List<int> b) = await answer(
       (HttpResponse r) => r
         ..headers.contentType = utf8Type()
         ..writeAll(<String>['日', '本', '語']),
@@ -86,7 +92,7 @@ void main() {
     expect(utf8.decode(b), '日本語');
   });
   test('writeCharCode with charset, Japanese', () async {
-    var (ct, b) = await answer(
+    var (List<String> ct, List<int> b) = await answer(
       (HttpResponse r) => r
         ..headers.contentType = utf8Type()
         ..writeCharCode(0x65E5),
@@ -97,7 +103,7 @@ void main() {
 
   // German
   test('write without charset, German', () async {
-    var (ct, b) = await answer(
+    var (List<String> ct, List<int> b) = await answer(
       (HttpResponse r) => r
         ..headers.contentType = ContentType('text', 'plain')
         ..write('Löscherstraße'),
@@ -107,7 +113,7 @@ void main() {
   });
   // if the charset is not recognized the text is encoded with ISO-8859-1
   test('write with an unrecognized charset, German', () async {
-    var (ct, b) = await answer(
+    var (List<String> ct, List<int> b) = await answer(
       (HttpResponse r) => r
         ..headers.contentType = ContentType('text', 'plain', charset: '123')
         ..write('Löscherstraße'),
@@ -116,7 +122,9 @@ void main() {
     expect(latin1.decode(b), 'Löscherstraße');
   });
   test('write without content type, German', () async {
-    var (ct, b) = await answer((HttpResponse r) => r.write('Löscherstraße'));
+    var (List<String> ct, List<int> b) = await answer(
+      (HttpResponse r) => r.write('Löscherstraße'),
+    );
     expect(ct, plainUtf8);
     expect(utf8.decode(b), 'Löscherstraße');
   });

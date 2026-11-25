@@ -2,8 +2,10 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/http_connection_header_test.dart.
+// ignore_for_file: unawaited_futures
 import 'dart:io';
 
+import 'package:dox_http_native/src/server.dart';
 import 'package:test/test.dart';
 
 import 'util.dart';
@@ -44,7 +46,7 @@ void main() {
   test(
     'response.persistentConnection starts as the one of the request',
     () async {
-      var server = await serve((HttpRequest request) {
+      NativeHttpServer server = await serve((HttpRequest request) {
         request.response.write('${request.response.persistentConnection}');
         request.response.close();
       });
@@ -62,7 +64,7 @@ void main() {
   test(
     'request header values are split on commas',
     () async {
-      var server = await serve((HttpRequest request) {
+      NativeHttpServer server = await serve((HttpRequest request) {
         request.response.write('${request.headers['accept']!.length}');
         request.response.close();
       });
@@ -79,7 +81,7 @@ void main() {
 
   for (bool persistent in <bool>[false, true]) {
     test('connection headers (client persistent: $persistent)', () async {
-      var server = await serve((HttpRequest request) {
+      NativeHttpServer server = await serve((HttpRequest request) {
         expect(request.persistentConnection, persistent);
         checkExpectedConnectionHeaders(
           request.headers,

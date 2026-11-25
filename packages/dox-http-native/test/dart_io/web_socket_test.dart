@@ -2,6 +2,7 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/web_socket_test.dart.
+// ignore_for_file: unawaited_futures
 // Over plain ws only: there is no TLS in dox_http_native.
 import 'dart:async';
 import 'dart:convert';
@@ -23,7 +24,7 @@ void checkCloseStatus(WebSocket ws, int? status, String? reason) {
 }
 
 void main() {
-  for (var c in <(int?, String?, int)>[
+  for ((int?, String?, int) c in <(int?, String?, int)>[
     (null, null, 1),
     (3001, null, 2),
     (3002, 'Got tired', 3),
@@ -31,7 +32,7 @@ void main() {
     test('request/response, client closes (${c.$1}, ${c.$2})', () async {
       Completer<void> serverDone = Completer<void>();
       int serverClosed = 0;
-      var server = await serveWebSockets((WebSocket ws) {
+      NativeHttpServer server = await serveWebSockets((WebSocket ws) {
         ws.listen(
           ws.add,
           onDone: () {
@@ -68,7 +69,7 @@ void main() {
     });
   }
 
-  for (var c in <(int?, String?)>[
+  for ((int?, String?) c in <(int?, String?)>[
     (null, null),
     (3001, null),
     (3002, 'Got tired'),
@@ -76,7 +77,7 @@ void main() {
     test('request/response, server closes (${c.$1}, ${c.$2})', () async {
       Completer<void> serverDone = Completer<void>();
       int closed = 0;
-      var server = await serveWebSockets((WebSocket ws) {
+      NativeHttpServer server = await serveWebSockets((WebSocket ws) {
         int count = 0;
         ws.listen(
           (dynamic m) {
@@ -115,7 +116,7 @@ void main() {
   for (int length in <int>[125, 126, 127, 65535, 65536]) {
     test('message length $length', () async {
       Uint8List original = Uint8List(length);
-      var server = await serveWebSockets((WebSocket ws) {
+      NativeHttpServer server = await serveWebSockets((WebSocket ws) {
         ws.listen((dynamic m) {
           expect(m, original);
           ws.add(m);
@@ -137,7 +138,7 @@ void main() {
     bool clientFirst = true,
   }) async {
     Completer<void> done = Completer<void>();
-    var server = await serveWebSockets((WebSocket ws) {
+    NativeHttpServer server = await serveWebSockets((WebSocket ws) {
       body(ws, ws);
       done.complete();
     });
@@ -168,7 +169,7 @@ void main() {
   );
   test('listen after close throws', skip: 'dox_http_native: drain after close does not throw StateError (the socket is already closed)', () async {
     Completer<void> done = Completer<void>();
-    var server = await serveWebSockets((WebSocket ws) {
+    NativeHttpServer server = await serveWebSockets((WebSocket ws) {
       ws.close();
       expect(() => ws.drain<void>(), throwsStateError);
       done.complete();
@@ -184,7 +185,7 @@ void main() {
     Completer<Object> localError = Completer<Object>();
     await runZonedGuarded(
       () async {
-        var server = await serve((HttpRequest request) async {
+        NativeHttpServer server = await serve((HttpRequest request) async {
           WebSocket ws = await NativeWebSocket.upgrade(request);
           ws.addError('local error');
           await ws.close();
@@ -208,7 +209,7 @@ void main() {
 
   test('double close, client', () async {
     Completer<void> done = Completer<void>();
-    var server = await serveWebSockets((WebSocket ws) {
+    NativeHttpServer server = await serveWebSockets((WebSocket ws) {
       ws.listen(
         (_) {},
         onDone: () {
@@ -223,7 +224,7 @@ void main() {
     await done.future.timeout(limit);
   });
   test('double close, server', () async {
-    var server = await serveWebSockets((WebSocket ws) {
+    NativeHttpServer server = await serveWebSockets((WebSocket ws) {
       ws.listen((_) {}, onDone: ws.close);
       ws.close();
     });
@@ -239,7 +240,7 @@ void main() {
     await done.future.timeout(limit);
   });
   test('immediate close, server', () async {
-    var server = await serveWebSockets((WebSocket ws) {
+    NativeHttpServer server = await serveWebSockets((WebSocket ws) {
       ws.listen((_) => fail('Unexpected message'));
       ws.close();
     });
@@ -251,7 +252,7 @@ void main() {
   });
   test('immediate close, client', () async {
     Completer<void> done = Completer<void>();
-    var server = await serveWebSockets((WebSocket ws) {
+    NativeHttpServer server = await serveWebSockets((WebSocket ws) {
       ws.listen(
         (_) => fail('Unexpected message'),
         onDone: () {
@@ -267,7 +268,7 @@ void main() {
   });
 
   test('no upgrade: the 404 reaches the client', () async {
-    var server = await serve((HttpRequest request) {
+    NativeHttpServer server = await serve((HttpRequest request) {
       request.response.statusCode = HttpStatus.notFound;
       request.response.close();
     });
@@ -281,7 +282,7 @@ void main() {
 
   test('POST is a bad request, not an upgrade', () async {
     Completer<Object?> upgraded = Completer<Object?>();
-    var server = await serve((HttpRequest request) async {
+    NativeHttpServer server = await serve((HttpRequest request) async {
       try {
         await NativeWebSocket.upgrade(request);
         upgraded.complete('upgraded');
@@ -301,7 +302,7 @@ void main() {
   test('10 connections, events in order, close code and reason', () async {
     Completer<void> serverDone = Completer<void>();
     int closeCount = 0;
-    var server = await serveWebSockets((WebSocket ws) {
+    NativeHttpServer server = await serveWebSockets((WebSocket ws) {
       int count = 0;
       ws.listen(
         (dynamic m) {
@@ -346,7 +347,7 @@ void main() {
   });
 
   test('upgrade and plain requests on one server', () async {
-    var server = await serve((HttpRequest request) async {
+    NativeHttpServer server = await serve((HttpRequest request) async {
       if (NativeWebSocket.isUpgradeRequest(request)) {
         WebSocket ws = await NativeWebSocket.upgrade(request);
         ws.listen((_) => ws.close());
@@ -384,7 +385,7 @@ void main() {
   );
 
   test('additional request headers reach the handler', () async {
-    var server = await serve((HttpRequest request) async {
+    NativeHttpServer server = await serve((HttpRequest request) async {
       expect(NativeWebSocket.isUpgradeRequest(request), isTrue);
       expect(request.headers['My-Header']![0], 'my-value');
       expect(
@@ -412,7 +413,7 @@ void main() {
 
   test('basic authentication header reaches the handler', () async {
     String userInfo = 'user:password';
-    var server = await serve((HttpRequest request) async {
+    NativeHttpServer server = await serve((HttpRequest request) async {
       expect(
         request.headers['Authorization']![0],
         'Basic ${base64.encode(utf8.encode(userInfo))}',
@@ -442,7 +443,7 @@ void main() {
   for (bool autoCompress in <bool>[false, true]) {
     test('upgrade response headers (autoCompress: $autoCompress)', () async {
       Completer<void> serverDone = Completer<void>();
-      var server = await serve((HttpRequest request) async {
+      NativeHttpServer server = await serve((HttpRequest request) async {
         WebSocket ws = await NativeWebSocket.upgrade(request);
         ws.listen(null, onDone: serverDone.complete);
       }, autoCompress: autoCompress);

@@ -2,6 +2,7 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/http_shutdown_test.dart.
+// ignore_for_file: unawaited_futures
 import 'dart:async';
 import 'dart:io';
 
@@ -13,7 +14,7 @@ import 'util.dart';
 void main() {
   for (int total in <int>[1, 10]) {
     test('shutdown 1: server answers at once ($total)', () async {
-      var server = await serve(
+      NativeHttpServer server = await serve(
         (HttpRequest request) => request.response.close(),
       );
       HttpClient client = newClient();
@@ -31,7 +32,7 @@ void main() {
     test(
       'shutdown 2: server answers before the body (${c.$1}, ${c.$2})',
       () async {
-        var server = await serve((HttpRequest request) {
+        NativeHttpServer server = await serve((HttpRequest request) {
           request.response.write('!dlrow ,olleH');
           request.response.close();
         });
@@ -60,7 +61,7 @@ void main() {
 
   for (int total in <int>[1, 10]) {
     test('shutdown 3: server answers after the body ($total)', () async {
-      var server = await serve((HttpRequest request) {
+      NativeHttpServer server = await serve((HttpRequest request) {
         request.listen(
           (_) {},
           onDone: () {

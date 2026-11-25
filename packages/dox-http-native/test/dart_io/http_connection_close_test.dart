@@ -2,9 +2,11 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/http_connection_close_test.dart.
+// ignore_for_file: unawaited_futures
 import 'dart:async';
 import 'dart:io';
 
+import 'package:dox_http_native/src/server.dart';
 import 'package:test/test.dart';
 
 import 'util.dart';
@@ -14,7 +16,7 @@ void main() {
     'flush and addStream complete with the response',
     () async {
       Completer<List<Object?>> got = Completer<List<Object?>>();
-      var server = await serve((HttpRequest request) async {
+      NativeHttpServer server = await serve((HttpRequest request) async {
         HttpResponse response = request.response;
         Object? flushed = await response.flush();
         Object? added = await response.addStream(
@@ -37,7 +39,9 @@ void main() {
 
   for (bool closeRequest in <bool>[false, true]) {
     test('HTTP/1.0 close (closeRequest: $closeRequest)', () async {
-      var server = await serve((HttpRequest r) => r.response.close());
+      NativeHttpServer server = await serve(
+        (HttpRequest r) => r.response.close(),
+      );
       Socket socket = await Socket.connect('127.0.0.1', server.port);
       Completer<void> done = Completer<void>();
       socket.listen((_) {}, onDone: done.complete);
@@ -48,7 +52,9 @@ void main() {
     });
 
     test('HTTP/1.1 Connection: close (closeRequest: $closeRequest)', () async {
-      var server = await serve((HttpRequest r) => r.response.close());
+      NativeHttpServer server = await serve(
+        (HttpRequest r) => r.response.close(),
+      );
       Socket socket = await Socket.connect('127.0.0.1', server.port);
       Completer<void> done = Completer<void>();
       socket.listen((_) {}, onDone: done.complete);
@@ -61,7 +67,7 @@ void main() {
 
   test('stream response, client closes', () async {
     Completer<void> done = Completer<void>();
-    var server = await serve((HttpRequest request) {
+    NativeHttpServer server = await serve((HttpRequest request) {
       Timer timer = Timer.periodic(Duration.zero, (_) {
         request.response.write(
           'data:${DateTime.now().millisecondsSinceEpoch}\n\n',
@@ -100,7 +106,7 @@ void main() {
   test('writes, flushes and close stay silent after a disconnect', () async {
     Completer<Object?> doneValue = Completer<Object?>();
     Completer<void> finished = Completer<void>();
-    var server = await serve((HttpRequest request) async {
+    NativeHttpServer server = await serve((HttpRequest request) async {
       HttpResponse response = request.response..bufferOutput = false;
       unawaited(response.done.then(doneValue.complete));
       while (!doneValue.isCompleted) {
@@ -122,7 +128,7 @@ void main() {
   test('close inside the done callback during a flush', () async {
     Completer<Object?> closeFromDone = Completer<Object?>();
     Completer<void> finished = Completer<void>();
-    var server = await serve((HttpRequest request) async {
+    NativeHttpServer server = await serve((HttpRequest request) async {
       HttpResponse response = request.response..bufferOutput = false;
       unawaited(
         response.done.then((_) {
@@ -146,7 +152,7 @@ void main() {
     'flush and addStream after an unflushed write and a disconnect',
     () async {
       Completer<void> finished = Completer<void>();
-      var server = await serve((HttpRequest request) async {
+      NativeHttpServer server = await serve((HttpRequest request) async {
         HttpResponse response = request.response..bufferOutput = false;
         bool isDone = false;
         unawaited(response.done.then((_) => isDone = true));
@@ -176,7 +182,7 @@ void main() {
   test('addStream and a disconnect: done completes first', skip: 'dox_http_native: addStream starts the answer after 64 KB, not at once (call flush first)', () async {
     Completer<Object?> doneValue = Completer<Object?>();
     Completer<void> finished = Completer<void>();
-    var server = await serve((HttpRequest request) async {
+    NativeHttpServer server = await serve((HttpRequest request) async {
       HttpResponse response = request.response..bufferOutput = false;
       unawaited(response.done.then(doneValue.complete));
       Stream<List<int>> stream = Stream<List<int>>.periodic(
@@ -200,7 +206,7 @@ void main() {
     Completer<void> clientDestroyed = Completer<void>();
     Completer<Object?> doneValue = Completer<Object?>();
     Completer<void> finished = Completer<void>();
-    var server = await serve((HttpRequest request) async {
+    NativeHttpServer server = await serve((HttpRequest request) async {
       HttpResponse response = request.response..bufferOutput = false;
       unawaited(response.done.then(doneValue.complete));
       response.write('data: unread-before-rst\n\n');

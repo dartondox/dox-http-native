@@ -2,17 +2,21 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/http_date_test.dart.
+// ignore_for_file: unawaited_futures
 // HttpDate is part of dart:io, not of the server. Server side: the Date and
 // Expires headers that the server sends.
 import 'dart:io';
 
+import 'package:dox_http_native/src/server.dart';
 import 'package:test/test.dart';
 
 import 'util.dart';
 
 void main() {
   test('Date header is a valid, current HTTP date', () async {
-    var server = await serve((HttpRequest request) => request.response.close());
+    NativeHttpServer server = await serve(
+      (HttpRequest request) => request.response.close(),
+    );
     HttpClient client = newClient();
     HttpClientRequest request = await client.get('127.0.0.1', server.port, '/');
     HttpClientResponse response = await request.close();
@@ -26,7 +30,7 @@ void main() {
 
   test('Expires set by the handler goes out in HTTP date format', () async {
     DateTime date = DateTime.utc(1999, DateTime.june, 11, 18, 46, 53);
-    var server = await serve((HttpRequest request) {
+    NativeHttpServer server = await serve((HttpRequest request) {
       request.response.headers.expires = date;
       request.response.close();
     });

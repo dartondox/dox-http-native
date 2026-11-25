@@ -2,9 +2,11 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/http_read_test.dart.
+// ignore_for_file: unawaited_futures
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:dox_http_native/src/server.dart';
 import 'package:test/test.dart';
 
 import 'util.dart';
@@ -13,7 +15,7 @@ void main() {
   for (bool chunked in <bool>[true, false]) {
     test('read the request body and echo it (chunked: $chunked)', () async {
       String data = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-      var server = await serve((HttpRequest request) {
+      NativeHttpServer server = await serve((HttpRequest request) {
         HttpResponse response = request.response;
         if (request.uri.path == '/echo') {
           expect(request.method, 'POST');

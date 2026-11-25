@@ -2,18 +2,20 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/http_server_close_response_after_error_test.dart.
+// ignore_for_file: unawaited_futures
 // The SDK test starts a client process that makes a request and cuts the
 // connection, and the server closes its response in `onDone`. Here the client
 // is a raw socket.
 import 'dart:io';
 
+import 'package:dox_http_native/src/server.dart';
 import 'package:test/test.dart';
 
 import 'util.dart';
 
 void main() {
   test('request cut short: the server survives and closes', () async {
-    var server = await serve((HttpRequest request) {
+    NativeHttpServer server = await serve((HttpRequest request) {
       request.listen(
         null,
         onError: (Object e) {},

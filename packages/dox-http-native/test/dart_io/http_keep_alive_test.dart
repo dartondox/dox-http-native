@@ -2,8 +2,10 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/http_keep_alive_test.dart.
+// ignore_for_file: unawaited_futures
 import 'dart:io';
 
+import 'package:dox_http_native/src/server.dart';
 import 'package:test/test.dart';
 
 import 'util.dart';
@@ -25,7 +27,7 @@ void main() {
   }
 
   Future<int> start() async {
-    var server = await serve((HttpRequest request) {
+    NativeHttpServer server = await serve((HttpRequest request) {
       bool chunked = request.uri.queryParameters['chunked'] == 'true';
       int length = int.parse(request.uri.queryParameters['length']!);
       if (!chunked) request.response.contentLength = length;

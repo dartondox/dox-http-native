@@ -2,15 +2,17 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/http_head_test.dart.
+// ignore_for_file: unawaited_futures
 import 'dart:io';
 
+import 'package:dox_http_native/src/server.dart';
 import 'package:test/test.dart';
 
 import 'util.dart';
 
 void main() {
   test('HEAD requests', () async {
-    var server = await serve((HttpRequest request) {
+    NativeHttpServer server = await serve((HttpRequest request) {
       HttpResponse response = request.response;
       switch (request.uri.path) {
         case '/test100':
@@ -57,7 +59,7 @@ void main() {
   test(
     'HEAD without content length: dart:io sends no length',
     () async {
-      var server = await serve((HttpRequest request) {
+      NativeHttpServer server = await serve((HttpRequest request) {
         request.response.add(List<int>.filled(100, 0));
         request.response.close();
       });

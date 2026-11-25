@@ -2,10 +2,12 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/http_parser_connect_method_test.dart.
+// ignore_for_file: unawaited_futures
 // The SDK test is about the client parser. Server side: a CONNECT request
 // reaches the handler, and the answer is a normal one.
 import 'dart:io';
 
+import 'package:dox_http_native/src/server.dart';
 import 'package:test/test.dart';
 
 import 'util.dart';
@@ -18,7 +20,7 @@ void main() {
   };
   cases.forEach((String header, String value) {
     test('CONNECT request, answer with $header', () async {
-      var server = await serve((HttpRequest request) {
+      NativeHttpServer server = await serve((HttpRequest request) {
         expect(request.method, 'CONNECT');
         request.response.statusCode = 200;
         request.response.headers.add(header, value);
@@ -40,7 +42,7 @@ void main() {
   });
 
   test('CONNECT with the HttpClient (origin form)', () async {
-    var server = await serve((HttpRequest request) {
+    NativeHttpServer server = await serve((HttpRequest request) {
       expect(request.method, 'CONNECT');
       request.response.close();
     });

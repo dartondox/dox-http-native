@@ -2,9 +2,11 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/http_compression_test.dart.
+// ignore_for_file: unawaited_futures
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:dox_http_native/src/server.dart';
 import 'package:test/test.dart';
 
 import 'util.dart';
@@ -22,7 +24,7 @@ void main() {
           'My raw server provided data'.codeUnits,
           long,
         ]) {
-          var server = await serve((HttpRequest request) {
+          NativeHttpServer server = await serve((HttpRequest request) {
             request.response.add(data);
             request.response.close();
           }, autoCompress: true);
@@ -58,7 +60,7 @@ void main() {
     for (int i = 0; i < data.length; i++) {
       data[i] = i & 0xFF;
     }
-    var server = await serve((HttpRequest request) {
+    NativeHttpServer server = await serve((HttpRequest request) {
       request.response.add(data);
       request.response.close();
     }, autoCompress: true);
@@ -88,7 +90,7 @@ void main() {
   };
   encodings.forEach((String encoding, bool valid) {
     test('Accept-Encoding "$encoding"', () async {
-      var server = await serve((HttpRequest request) {
+      NativeHttpServer server = await serve((HttpRequest request) {
         request.response.write('data' * 100);
         request.response.close();
       }, autoCompress: true);
@@ -101,7 +103,7 @@ void main() {
   });
 
   test('autoCompress is off by default', () async {
-    var server = await serve((HttpRequest request) {
+    NativeHttpServer server = await serve((HttpRequest request) {
       expect(request.headers.value(HttpHeaders.acceptEncodingHeader), 'gzip');
       request.response.write('data' * 100);
       request.response.close();

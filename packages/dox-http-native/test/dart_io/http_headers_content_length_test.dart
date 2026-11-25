@@ -2,6 +2,7 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/http_headers_content_length_test.dart.
+// ignore_for_file: unawaited_futures
 import 'dart:io';
 
 import 'package:test/test.dart';

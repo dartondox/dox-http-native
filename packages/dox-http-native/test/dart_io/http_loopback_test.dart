@@ -2,18 +2,20 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/http_loopback_test.dart.
+// ignore_for_file: unawaited_futures
 // The SDK test checks `RawServerSocket` and `RawSocket` on loopback
 // addresses. It has no HTTP server. Here: a native server on the IPv4
 // loopback address is not reachable over IPv6, and the reverse.
 import 'dart:io';
 
+import 'package:dox_http_native/src/server.dart';
 import 'package:test/test.dart';
 
 import 'util.dart';
 
 void main() {
   Future<void> failure(String serverHost, InternetAddress clientAddr) async {
-    var server = await serve(
+    NativeHttpServer server = await serve(
       (HttpRequest r) => r.response.close(),
       host: serverHost,
     );
@@ -52,7 +54,7 @@ void main() {
   for (String host in <String>['127.0.0.1', '::1']) {
     test('server on $host answers on $host', () async {
       if (host == '::1' && !await hasV6()) return;
-      var server = await serve(
+      NativeHttpServer server = await serve(
         (HttpRequest r) => r.response.close(),
         host: host,
       );

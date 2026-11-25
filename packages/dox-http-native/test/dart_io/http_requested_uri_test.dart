@@ -2,9 +2,11 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/http_requested_uri_test.dart.
+// ignore_for_file: unawaited_futures
 import 'dart:async';
 import 'dart:io';
 
+import 'package:dox_http_native/src/server.dart';
 import 'package:test/test.dart';
 
 import 'util.dart';
@@ -15,7 +17,7 @@ void main() {
 
   Future<void> check(String expected, Map<String, String?> headers) async {
     Completer<String> seen = Completer<String>();
-    var server = await serve((HttpRequest request) {
+    NativeHttpServer server = await serve((HttpRequest request) {
       seen.complete(request.requestedUri.toString());
       request.response.close();
     }, host: 'localhost');
@@ -62,7 +64,7 @@ void main() {
   );
   test('requestedUri with no Host header', () async {
     Completer<Uri> seen = Completer<Uri>();
-    var server = await serve((HttpRequest request) {
+    NativeHttpServer server = await serve((HttpRequest request) {
       seen.complete(request.requestedUri);
       request.response.close();
     });
@@ -73,7 +75,7 @@ void main() {
 
   test('absolute URI in the request line', () async {
     Completer<Uri> seen = Completer<Uri>();
-    var server = await serve((HttpRequest request) {
+    NativeHttpServer server = await serve((HttpRequest request) {
       seen.complete(request.requestedUri);
       request.response.close();
     });

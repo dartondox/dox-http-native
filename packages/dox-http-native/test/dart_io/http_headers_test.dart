@@ -2,6 +2,7 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/http_headers_test.dart.
+// ignore_for_file: unawaited_futures
 // The SDK test uses the private `_HttpHeaders` of dart:io. Here the same
 // checks run on the headers of a native response (`NativeHeaders`), and the
 // header injection checks also run over the wire. `HeaderValue`,
@@ -96,17 +97,17 @@ void main() {
   dateTest(
     HttpHeaders.dateHeader,
     (HttpHeaders h) => h.date,
-    (h, d) => h.date = d,
+    (HttpHeaders h, DateTime? d) => h.date = d,
   );
   dateTest(
     HttpHeaders.expiresHeader,
     (HttpHeaders h) => h.expires,
-    (h, d) => h.expires = d,
+    (HttpHeaders h, DateTime? d) => h.expires = d,
   );
   dateTest(
     HttpHeaders.ifModifiedSinceHeader,
     (HttpHeaders h) => h.ifModifiedSince,
-    (h, d) => h.ifModifiedSince = d,
+    (HttpHeaders h, DateTime? d) => h.ifModifiedSince = d,
   );
 
   test(
@@ -240,7 +241,7 @@ void main() {
         () => headers.set('content-length', <Object>[bad]),
         throwsA(
           isA<HttpException>().having(
-            (e) => e.message,
+            (HttpException e) => e.message,
             'message',
             contains('Content-Length must contain only digits'),
           ),
@@ -252,7 +253,7 @@ void main() {
       () => headers.set('content-length', <Object>[<Object>[]]),
       throwsA(
         isA<HttpException>().having(
-          (e) => e.message,
+          (HttpException e) => e.message,
           'message',
           contains('Unexpected type for header named content-length'),
         ),
@@ -276,10 +277,18 @@ void main() {
   });
 
   test('header lists', () {
-    HttpHeaders.generalHeaders.forEach((_) => null);
-    HttpHeaders.entityHeaders.forEach((_) => null);
-    HttpHeaders.responseHeaders.forEach((_) => null);
-    HttpHeaders.requestHeaders.forEach((_) => null);
+    for (String _ in HttpHeaders.generalHeaders) {
+      null;
+    }
+    for (String _ in HttpHeaders.entityHeaders) {
+      null;
+    }
+    for (String _ in HttpHeaders.responseHeaders) {
+      null;
+    }
+    for (String _ in HttpHeaders.requestHeaders) {
+      null;
+    }
   });
 
   test('invalid field names', skip: 'dox_http_native: remove and removeAll with a bad name do not throw (add and set do)', () {
@@ -351,7 +360,7 @@ void main() {
   });
 
   test('response header with a line break never reaches the wire', () async {
-    var server = await serve((HttpRequest request) {
+    NativeHttpServer server = await serve((HttpRequest request) {
       try {
         request.response.headers.set('x-a', 'b\r\nInjected: yes');
       } on FormatException {

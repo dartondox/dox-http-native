@@ -2,9 +2,11 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 // Ported from dart-lang/sdk tests/standalone/io/web_socket_pipe_test.dart.
+// ignore_for_file: unawaited_futures
 import 'dart:async';
 import 'dart:io';
 
+import 'package:dox_http_native/src/server.dart';
 import 'package:test/test.dart';
 
 import 'util.dart';
@@ -26,7 +28,7 @@ void main() {
     for (int messages in <int>[0, 1, 10]) {
       test('pipe (messages: $messages, transform: $transform)', () async {
         Completer<void> piped = Completer<void>();
-        var server = await serveWebSockets((WebSocket ws) {
+        NativeHttpServer server = await serveWebSockets((WebSocket ws) {
           (transform ? ws.transform(reverseStrings()) : ws)
               .pipe(ws)
               .then((_) => piped.complete());
