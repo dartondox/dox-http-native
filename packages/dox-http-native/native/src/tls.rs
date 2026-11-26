@@ -42,6 +42,14 @@ pub(crate) struct Tls {
     /// all TLS bytes written to the socket: progress for the send stall
     /// and idle timers, which `held` shows only per rustls buffer
     pub(crate) sent: u64,
+    /// raw bytes [read] may still take from the socket in this turn. The
+    /// caller sets it before a turn: records with no plain text (eg.
+    /// KeyUpdates) must not hold the loop, as the plain text limits do
+    /// not see them.
+    pub(crate) left: usize,
+    /// [read] stopped at `left`: bytes may wait, queue the connection
+    /// again (mio gives no new event for them)
+    pub(crate) more: bool,
 }
 
 impl Tls {
@@ -51,6 +59,8 @@ impl Tls {
             held: 0,
             picked: false,
             sent: 0,
+            left: usize::MAX,
+            more: false,
         })
     }
 
@@ -164,6 +174,11 @@ fn same_file(p: &Path) -> PathBuf {
 /// All [Keys] of this process that a server still uses.
 static ALL: Mutex<Vec<Weak<Keys>>> = Mutex::new(Vec::new());
 
+/// One read and store at a time, so an older read never overwrites a
+/// newer one. Not `ALL` and not `Keys::now`: a handshake (`resolve`) never
+/// waits for a file read.
+static RELOAD: Mutex<()> = Mutex::new(());
+
 /// The TLS config of one server.
 pub(crate) struct Certs {
     /// the config holds it too: here only for the tests
@@ -177,6 +192,7 @@ impl Certs {
     /// [Keys], so this is also the reload for all of them. On an error
     /// nothing changes.
     pub(crate) fn share(cert: &Path, key: &Path, http2: bool) -> Result<Arc<Certs>, i64> {
+        let _one = RELOAD.lock().unwrap();
         let now = load(cert, key)?;
         let files = (same_file(cert), same_file(key));
         let mut all = ALL.lock().unwrap();
@@ -219,12 +235,14 @@ impl Certs {
 /// `WouldBlock`, as on plain TCP. So the edge of mio is never lost: either
 /// bytes come back (the caller reads again), or the socket is empty.
 /// Ok(0): the client closed (with or without `close_notify`). A TLS error
-/// queues an alert, writes it and fails.
+/// queues an alert, writes it and fails. Over `left` raw bytes it stops
+/// with `WouldBlock` and sets `more`.
 pub(crate) fn read<S: Read + Write>(
-    tls: &mut ServerConnection,
+    t: &mut Tls,
     sock: &mut S,
     buf: &mut [u8],
 ) -> io::Result<usize> {
+    let tls = &mut t.conn;
     loop {
         match tls.reader().read(buf) {
             Ok(n) => return Ok(n),
@@ -233,8 +251,13 @@ pub(crate) fn read<S: Read + Write>(
             Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(0),
             Err(e) => return Err(e),
         }
+        if t.left == 0 {
+            t.more = true;
+            return Err(ErrorKind::WouldBlock.into());
+        }
         // Ok(0) is the end of the socket: the next reader call says so
-        tls.read_tls(sock)?;
+        let k = tls.read_tls(sock)?;
+        t.left = t.left.saturating_sub(k);
         if let Err(e) = tls.process_new_packets() {
             // eg. plain HTTP on the TLS port: the client gets an alert
             let _ = tls.write_tls(sock);

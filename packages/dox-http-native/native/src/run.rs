@@ -742,7 +742,7 @@ impl Read for WsIo<'_> {
         let mut sock = self.sock;
         let k = match self.tls {
             None => sock.read(&mut buf[..max])?,
-            Some(t) => tls::read(&mut t.conn, &mut sock, &mut buf[..max])?,
+            Some(t) => tls::read(t, &mut sock, &mut buf[..max])?,
         };
         self.left -= k;
         Ok(k)
@@ -841,6 +841,15 @@ impl Conn {
         self.wbuf.len() - self.wpos
     }
 
+    /// TLS after the handshake, with no partial request: an end of the
+    /// server gets `close_notify`, so the client sees a clean end.
+    fn clean_tls_close(&self) -> bool {
+        self.tls.as_ref().is_some_and(|t| !t.conn.is_handshaking())
+            && self.rpos == self.rlen
+            && self.body.is_none()
+            && !self.shut
+    }
+
     /// Bytes that went to the socket so far: plain bytes, or TLS bytes.
     /// It grows with each socket write, so the timers see progress. Only
     /// for "did it grow", not for the stream marks (see `written`).
@@ -871,6 +880,9 @@ impl Conn {
 
     /// Reads what the socket has. False on a socket error.
     fn read(&mut self) -> bool {
+        if let Some(t) = self.tls.as_mut() {
+            t.left = WS_READ; // see `Tls::left`
+        }
         loop {
             if self.rpos == self.rlen {
                 self.rpos = 0;
@@ -897,7 +909,7 @@ impl Conn {
             }
             let got = match self.tls.as_mut() {
                 None => (&self.sock).read(&mut self.rbuf[self.rlen..]),
-                Some(t) => tls::read(&mut t.conn, &mut &self.sock, &mut self.rbuf[self.rlen..]),
+                Some(t) => tls::read(t, &mut &self.sock, &mut self.rbuf[self.rlen..]),
             };
             match got {
                 Ok(0) => {
@@ -1845,6 +1857,13 @@ impl Core {
                             self.kill(idx);
                         }
                     }
+                    // TLS keep-alive idle (no partial head): close with
+                    // `close_notify` first. The send stall timer bounds it.
+                    Due::Head if c.clean_tls_close() => {
+                        c.closing = true;
+                        c.shut = true;
+                        self.service(idx);
+                    }
                     _ => self.kill(idx),
                 },
                 _ => {}
@@ -2177,6 +2196,11 @@ impl Core {
         } else if c.finished() && !go_on {
             // not when it reads on: requests that the client sent before it
             // closed can wait in the buffer (more than MAX_INFLIGHT)
+            if c.clean_tls_close() {
+                // the client closed its side: end ours with `close_notify`
+                c.shut = true;
+                return self.service(idx);
+            }
             self.kill(idx);
             return;
         }
@@ -2221,6 +2245,9 @@ impl Core {
             ..
         } = c;
         let ws = ws.as_mut().unwrap();
+        if let Some(t) = tls.as_mut() {
+            t.left = WS_READ; // see `Tls::left`
+        }
         let mut io = WsIo {
             sock,
             tls,
@@ -2255,7 +2282,8 @@ impl Core {
                 Ok(_) => {}
                 Err(WsError::Io(e)) if e.kind() == ErrorKind::WouldBlock => {
                     // the share of this turn is used up: more may wait
-                    again = io.left == 0;
+                    again = io.left == 0
+                        || io.tls.as_mut().is_some_and(|t| std::mem::take(&mut t.more));
                     break None;
                 }
                 Err(WsError::Io(e)) if e.kind() == ErrorKind::Interrupted => {}
@@ -2793,6 +2821,11 @@ impl Core {
                     self.kill(idx);
                     continue;
                 }
+                if c.tls.as_mut().is_some_and(|t| std::mem::take(&mut t.more)) {
+                    // the next call reads on (see `Tls::left`)
+                    c.queued = true;
+                    self.ready.push_back(idx);
+                }
                 if c.finished() {
                     self.kill(idx);
                 } else if c.eof {
@@ -2827,10 +2860,14 @@ impl Core {
             let c = &mut self.conns[idx];
             c.queued = false;
             self.ready.pop_front();
+            let more = c.tls.as_mut().is_some_and(|t| std::mem::take(&mut t.more));
             if c.eof || c.h2.is_some() || c.body.as_ref().is_some_and(|b| b.last == self.now) {
                 self.arm_timer(idx); // `Due::Gone`, `Due::Body` or `Due::H2Body`
             }
             self.service(idx);
+            if more {
+                self.queue(idx); // TLS read budget used up: the next call reads on
+            }
         }
         self.kill_dead();
         // the WebSocket and stream messages, whole records only
@@ -4452,7 +4489,7 @@ pub mod fuzz {
         let mut plain = 0;
         while p.next_piece() {
             loop {
-                match tls::read(&mut t.conn, p, &mut buf) {
+                match tls::read(&mut t, p, &mut buf) {
                     Ok(0) => return (false, !t.conn.is_handshaking(), plain),
                     Ok(k) => plain += k,
                     Err(e) if e.kind() == ErrorKind::WouldBlock => break,

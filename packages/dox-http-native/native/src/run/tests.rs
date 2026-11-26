@@ -2660,7 +2660,12 @@ fn tls_goaway_and_drain_send_close_notify() {
         got_tx.send(s.read_to_end(&mut all).map(|_| all)).unwrap();
     });
     let end = Instant::now() + Duration::from_secs(5);
-    while core.conns.iter().all(|(_, c)| c.written == 0) {
+    // the HTTP/2 connection may still be in its lingering close
+    while core
+        .conns
+        .iter()
+        .all(|(_, c)| c.written == 0 || c.linger.is_some())
+    {
         turn(&mut core, &mut inb, &mut out, 1000);
         assert!(Instant::now() < end, "no answer");
     }
@@ -2684,4 +2689,129 @@ fn tls_websocket_close_sends_close_notify() {
     }
     let mut b = [0u8; 1];
     assert_eq!(ws.get_mut().read(&mut b).expect("close_notify"), 0);
+}
+
+/// An idle keep-alive TLS connection closes with `close_notify`: the
+/// client sees a clean end (a read gives 0), not a cut.
+#[test]
+fn tls_idle_keep_alive_close_sends_close_notify() {
+    let (mut core, port) = tls_core(limits());
+    let mut inb = vec![0u8; 1 << 18];
+    let mut out = Vec::new();
+    let (tx, got) = mpsc::channel::<std::io::Result<usize>>();
+    std::thread::spawn(move || {
+        let mut s = tls_connect(port, &[]);
+        s.write_all(b"GET /a HTTP/1.1\r\nHost: a\r\n\r\n").unwrap();
+        let mut buf = vec![0u8; 4096];
+        let k = s.read(&mut buf).unwrap();
+        assert!(buf[..k].ends_with(b"/a"));
+        tx.send(s.read(&mut buf)).unwrap();
+    });
+    let end = Instant::now() + Duration::from_secs(5);
+    while core.conns.iter().all(|(_, c)| c.written == 0) {
+        turn(&mut core, &mut inb, &mut out, 1000);
+        assert!(Instant::now() < end, "no answer");
+    }
+    after(&mut core, &mut inb, IDLE + Duration::from_secs(1));
+    let r = tls_wait(&mut core, &mut inb, &got);
+    assert_eq!(r.expect("close_notify"), 0);
+}
+
+/// A flood of TLS records with no plain text (KeyUpdates, with one byte
+/// of the head after each 30, so rustls allows more) does not hold the
+/// loop: one call reads at most `WS_READ` raw bytes of it, queues the
+/// connection again, and another connection gets its answer meanwhile.
+#[test]
+fn tls_records_without_plain_text_do_not_hold_the_loop() {
+    const CYCLES: usize = 1500;
+    let (mut core, port) = tls_core(limits());
+    // the whole flood fits in the socket at once
+    let l = core.listener.as_ref().unwrap();
+    socket2::SockRef::from(l)
+        .set_recv_buffer_size(4 << 20)
+        .unwrap();
+    let mut inb = vec![0u8; 1 << 18];
+    let mut out = Vec::new();
+    let (flood_go, flood_wait) = mpsc::channel::<()>();
+    let (other_go, other_wait) = mpsc::channel::<()>();
+    let (ready_tx, ready) = mpsc::channel::<&str>();
+    let tx = ready_tx.clone();
+    std::thread::spawn(move || {
+        let sock =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        sock.set_send_buffer_size(4 << 20).unwrap();
+        sock.connect(&std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port)).into())
+            .unwrap();
+        let mut s = rustls::StreamOwned::new(tls_client(&[]), StdStream::from(sock));
+        s.write_all(b"GET /").unwrap();
+        tx.send("flood").unwrap();
+        flood_wait.recv().unwrap();
+        let mut blob = Vec::new();
+        for _ in 0..CYCLES {
+            for _ in 0..30 {
+                s.conn.refresh_traffic_keys().unwrap();
+            }
+            s.conn.writer().write_all(b"a").unwrap();
+            while s.conn.wants_write() {
+                s.conn.write_tls(&mut blob).unwrap();
+            }
+        }
+        assert!(blob.len() > 4 * WS_READ);
+        s.sock.write_all(&blob).unwrap();
+        tx.send("flooded").unwrap();
+        let _ = flood_wait.recv();
+    });
+    std::thread::spawn(move || {
+        let mut s = tls_connect(port, &[]);
+        s.conn.complete_io(&mut s.sock).unwrap();
+        ready_tx.send("other").unwrap();
+        other_wait.recv().unwrap();
+        s.write_all(b"GET /other HTTP/1.1\r\nHost: a\r\n\r\n")
+            .unwrap();
+        ready_tx.send("asked").unwrap();
+        let _ = other_wait.recv();
+    });
+    let mut seen = Vec::new();
+    let mut step = |core: &mut Core, inb: &mut [u8], want: &str| {
+        let end = Instant::now() + Duration::from_secs(5);
+        while !seen.contains(&want.to_string()) {
+            if let Ok(w) = ready.try_recv() {
+                seen.push(w.to_string());
+            }
+            turn(core, inb, &mut out, 1000);
+            assert!(Instant::now() < end, "no {want}");
+        }
+    };
+    step(&mut core, &mut inb, "flood");
+    step(&mut core, &mut inb, "other");
+    // the flood connection: the one with a partial head
+    let flood = core
+        .conns
+        .iter()
+        .find(|(_, c)| c.rlen > 0)
+        .map(|(i, _)| i)
+        .unwrap();
+    // both wait in their sockets, then one call
+    let end = Instant::now() + Duration::from_secs(5);
+    let mut got = String::new();
+    flood_go.send(()).unwrap();
+    while ready.recv_timeout(Duration::from_secs(5)).unwrap() != "flooded" {}
+    other_go.send(()).unwrap();
+    while ready.recv_timeout(Duration::from_secs(5)).unwrap() != "asked" {}
+    std::thread::sleep(Duration::from_millis(50));
+    core.wait(Some(Duration::from_millis(100)));
+    let n = core.fill(&mut inb).unwrap();
+    for r in records(&inb[..n]) {
+        got.push_str(&r.target);
+    }
+    assert_eq!(got, "/other", "the other request waited");
+    let c = &core.conns[flood];
+    assert!(c.rlen < 5 + CYCLES, "the whole flood in one call");
+    assert!(core.ready.contains(&flood), "not queued again");
+    // no lost wakeup: later calls read the rest without a new event
+    while core.conns[flood].rlen < 5 + CYCLES {
+        core.fill(&mut inb).unwrap();
+        assert!(Instant::now() < end, "the rest is not read");
+    }
+    drop((flood_go, other_go));
 }
