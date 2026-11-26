@@ -2046,6 +2046,7 @@ impl Core {
             }
         }
         let before = c.progress();
+        let written = c.written;
         let data = c.h2.as_ref().map_or(0, |h| h.data_sent);
         loop {
             if let Some(h2) = c.h2.as_mut() {
@@ -2060,7 +2061,11 @@ impl Core {
                 break;
             }
         }
+        // `moved`: any socket write, also TLS records of rustls alone (eg.
+        // a KeyUpdate). Only progress for the send stall. `wrote`: answer
+        // bytes, which alone count as activity (idle time, h2 ACKs out).
         let moved = c.progress() > before;
+        let wrote = c.written > written;
         if let Some(h2) = c.h2.as_mut() {
             h2.stall_mark(now);
             for (seq, kind, code, data) in h2.to_dart.drain(..) {
@@ -2083,7 +2088,7 @@ impl Core {
                 self.streams.remove(&sid);
             }
             c.shut |= h2.over();
-            if moved {
+            if wrote {
                 h2.flushed(); // our ACKs are on their way
             }
         }
@@ -2103,8 +2108,8 @@ impl Core {
         // see `due`) counts from the last write. HTTP/2: PING and SETTINGS
         // ACKs do not count, only streams that open, close or send.
         let active = match c.h2.as_mut() {
-            Some(h2) => std::mem::take(&mut h2.stirred) || (moved && h2.open() > 0),
-            None => moved,
+            Some(h2) => std::mem::take(&mut h2.stirred) || (wrote && h2.open() > 0),
+            None => wrote,
         };
         if active {
             c.since = now;
@@ -3276,10 +3281,12 @@ pub unsafe extern "C" fn dox_tls(
     let (Ok(cert), Ok(key)) = (path(cert, cert_len), path(key, key_len)) else {
         return -6;
     };
-    let mut core = s.core.lock().unwrap();
-    match Certs::share(&cert, &key, core.limits.http2) {
+    // the files are read without the core: a slow disk must not hold up
+    // the idle helper or Dart
+    let http2 = s.core.lock().unwrap().limits.http2;
+    match Certs::share(&cert, &key, http2) {
         Ok(certs) => {
-            core.certs = Some(certs);
+            s.core.lock().unwrap().certs = Some(certs);
             0
         }
         Err(code) => code,

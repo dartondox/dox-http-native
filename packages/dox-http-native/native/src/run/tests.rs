@@ -2163,15 +2163,22 @@ fn tls_alpn_h2() {
 #[test]
 fn tls_port_refuses_plain_http() {
     let (port, _) = serve_tls(limits());
-    let start = Instant::now();
-    let got = send(port, b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
-    assert!(!got.starts_with("HTTP"), "{got:?}");
-    assert!(start.elapsed() < Duration::from_secs(2), "not closed");
+    let mut s = connect(port);
+    s.write_all(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n").unwrap();
+    let mut got = Vec::new();
+    // an end or a reset, not the read timeout of `connect`
+    if let Err(e) = s.read_to_end(&mut got) {
+        assert!(
+            !matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
+            "not closed"
+        );
+    }
+    assert!(!got.starts_with(b"HTTP"), "{got:?}");
 }
 
-/// Writes one byte at a time with a pause: a handshake in many small
-/// pieces, and slow.
-struct Trickle(StdStream);
+/// Writes one byte at a time, with a short pause after each 8: a handshake
+/// in many small pieces, and slow.
+struct Trickle(StdStream, usize);
 
 impl Read for Trickle {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -2181,7 +2188,10 @@ impl Read for Trickle {
 
 impl Write for Trickle {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        std::thread::sleep(Duration::from_millis(1));
+        self.1 += 1;
+        if self.1.is_multiple_of(8) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         self.0.write(&buf[..buf.len().min(1)])
     }
 
@@ -2193,7 +2203,7 @@ impl Write for Trickle {
 #[test]
 fn tls_handshake_in_pieces() {
     let (port, _) = serve_tls(limits());
-    let mut s = rustls::StreamOwned::new(tls_client(&[]), Trickle(connect(port)));
+    let mut s = rustls::StreamOwned::new(tls_client(&[]), Trickle(connect(port), 0));
     s.write_all(b"GET /slow HTTP/1.1\r\nConnection: close\r\n\r\n")
         .unwrap();
     let mut out = Vec::new();
@@ -2208,17 +2218,17 @@ fn tls_handshake_in_pieces() {
 /// A handshake that does not end in the idle timeout closes.
 #[test]
 fn tls_handshake_times_out() {
-    let (port, _) = serve_tls(Limits {
-        idle: Duration::from_millis(200),
-        ..limits()
-    });
+    let (mut core, port) = tls_core(limits());
+    let mut inb = vec![0u8; 1 << 18];
     let mut s = connect(port);
     // half a record head
     s.write_all(&[0x16, 0x03]).unwrap();
-    let start = Instant::now();
-    let mut out = Vec::new();
-    let _ = s.read_to_end(&mut out);
-    assert!(start.elapsed() < Duration::from_secs(2), "not closed");
+    accept(&mut core, &mut inb, 1);
+    core.run(&[], &mut inb, 1000).unwrap();
+    after(&mut core, &mut inb, IDLE / 2);
+    assert_eq!(core.conns.len(), 1, "too early");
+    after(&mut core, &mut inb, IDLE + Duration::from_secs(1));
+    assert_eq!(core.conns.len(), 0, "not closed");
 }
 
 /// WebSocket over TLS: an echo, and 8 MiB from Dart to a client (more
@@ -2330,7 +2340,9 @@ fn tls_close_notify_after_a_big_answer_to_a_slow_reader() {
             Ok(k) => out.extend_from_slice(&buf[..k]),
             Err(e) => panic!("no close_notify: {e}"),
         }
-        std::thread::sleep(Duration::from_micros(200));
+        if out.len() % (1 << 20) < buf.len() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
     assert!(out.starts_with(b"HTTP/1.1 200"));
     assert!(out.ends_with(&[b'x'; 1024]) && out.len() > 8 << 20);
@@ -2490,4 +2502,186 @@ fn tls_close_waits_for_close_notify_on_a_full_socket() {
         assert!(Instant::now() < end, "no end");
     };
     r.expect("close_notify");
+}
+
+/// A TLS client sends a part of a request head, then KeyUpdate requests
+/// with one more byte each. TLS records that are no answer go out (here
+/// KeyUpdates of the server: rustls 0.23 holds its answer to the client's
+/// request until the next answer bytes), but the idle time still counts
+/// from the start, and the connection closes.
+#[test]
+fn tls_key_updates_do_not_hold_a_partial_head() {
+    let (mut core, port) = tls_core(limits());
+    let mut inb = vec![0u8; 1 << 18];
+    let mut out = Vec::new();
+    let (go, wait) = mpsc::channel::<()>();
+    let (sent_tx, sent) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let mut s = tls_connect(port, &[]);
+        // the target grows by one byte each time: still a partial head
+        s.write_all(b"GET /a").unwrap();
+        sent_tx.send(()).unwrap();
+        while wait.recv().is_ok() {
+            s.conn.refresh_traffic_keys().unwrap();
+            s.write_all(b"a").unwrap();
+            s.flush().unwrap();
+            sent_tx.send(()).unwrap();
+        }
+    });
+    let end = Instant::now() + Duration::from_secs(5);
+    let mut head = false;
+    while !head || core.conns.iter().all(|(_, c)| c.rlen == 0) {
+        head |= sent.try_recv().is_ok();
+        turn(&mut core, &mut inb, &mut out, 1000);
+        assert!(Instant::now() < end, "no head");
+    }
+    let idx = core.conns.iter().next().unwrap().0;
+    let since = core.conns[idx].since;
+    for _ in 0..3 {
+        go.send(()).unwrap();
+        sent.recv().unwrap();
+        // read it at a later time, when an activity would move `since`
+        let rlen = core.conns[idx].rlen;
+        let end = Instant::now() + Duration::from_secs(5);
+        while core.conns[idx].rlen == rlen {
+            core.now = Instant::now() + IDLE * 6 / 10;
+            core.wait(Some(Duration::from_millis(10)));
+            core.fill(&mut inb).unwrap();
+            assert!(Instant::now() < end, "the byte did not come");
+        }
+        let before = core.conns[idx].tls.as_ref().unwrap().sent;
+        let t = core.conns[idx].tls.as_mut().unwrap();
+        t.conn.refresh_traffic_keys().unwrap();
+        core.service(idx);
+        assert!(core.conns[idx].tls.as_ref().unwrap().sent > before);
+        assert_eq!(core.conns[idx].since, since);
+    }
+    after(&mut core, &mut inb, IDLE * 12 / 10);
+    assert!(
+        !core.conns.contains(idx),
+        "the partial head holds the connection"
+    );
+}
+
+/// Waits until the client thread sends its result, with server turns.
+fn tls_wait<T>(core: &mut Core, inb: &mut [u8], got: &mpsc::Receiver<T>) -> T {
+    let mut out = Vec::new();
+    let end = Instant::now() + Duration::from_secs(5);
+    loop {
+        turn(core, inb, &mut out, 1000);
+        if let Ok(r) = got.try_recv() {
+            return r;
+        }
+        assert!(Instant::now() < end, "no result");
+    }
+}
+
+/// The close of a client that never reads: `close_notify` can not go out,
+/// so the send stall timer ends the connection. No busy loop before it.
+#[test]
+fn tls_close_to_a_client_that_never_reads_ends_by_the_stall_timer() {
+    let (mut core, port) = tls_core(limits());
+    let mut inb = vec![0u8; 1 << 18];
+    let mut out = Vec::new();
+    let (done, hold) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        // small socket buffers, so the records rustls holds do not fit
+        let sock =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        sock.set_recv_buffer_size(4096).unwrap();
+        sock.connect(&std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port)).into())
+            .unwrap();
+        let mut s = rustls::StreamOwned::new(tls_client(&[]), StdStream::from(sock));
+        s.write_all(b"GET /large HTTP/1.1\r\nHost: a\r\n\r\n")
+            .unwrap();
+        let _ = hold.recv();
+    });
+    let end = Instant::now() + Duration::from_secs(5);
+    while !core.conns.iter().any(|(_, c)| c.stuck.is_some()) {
+        for (_, c) in core.conns.iter() {
+            let _ = socket2::SockRef::from(&c.sock).set_send_buffer_size(4096);
+        }
+        turn(&mut core, &mut inb, &mut out, 1000);
+        assert!(Instant::now() < end, "the answer never waits");
+    }
+    let idx = core.conns.iter().next().unwrap().0;
+    let c = &mut core.conns[idx];
+    c.wpos = c.wbuf.len();
+    c.tls.as_mut().unwrap().held = 0;
+    c.shut = true;
+    core.service(idx);
+    for _ in 0..3 {
+        turn(&mut core, &mut inb, &mut out, 1000);
+        assert!(core.ready.is_empty(), "a busy loop");
+    }
+    let c = &core.conns[idx];
+    assert!(c.linger.is_none() && c.tls.as_ref().unwrap().conn.wants_write());
+    after(&mut core, &mut inb, SEND_WAIT / 2);
+    assert!(core.conns.contains(idx), "too early");
+    after(&mut core, &mut inb, SEND_WAIT + Duration::from_secs(1));
+    assert!(!core.conns.contains(idx), "not closed");
+    drop(done);
+}
+
+/// HTTP/2 over TLS: the idle GOAWAY close ends with `close_notify`. A
+/// graceful stop of the server too, on HTTP/1.1.
+#[test]
+fn tls_goaway_and_drain_send_close_notify() {
+    use crate::h2::frame;
+    let (mut core, port) = tls_core(limits());
+    let mut inb = vec![0u8; 1 << 18];
+    let (got_tx, got) = mpsc::channel::<std::io::Result<Vec<u8>>>();
+    let tx = got_tx.clone();
+    std::thread::spawn(move || {
+        let mut s = tls_connect(port, &[b"h2"]);
+        let mut req = PREFACE.to_vec();
+        frame::write(&mut req, frame::SETTINGS, 0, 0, b"");
+        s.write_all(&req).unwrap();
+        let mut all = Vec::new();
+        tx.send(s.read_to_end(&mut all).map(|_| all)).unwrap();
+    });
+    let mut out = Vec::new();
+    let end = Instant::now() + Duration::from_secs(5);
+    while !core.conns.iter().any(|(_, c)| c.h2.is_some()) {
+        turn(&mut core, &mut inb, &mut out, 1000);
+        assert!(Instant::now() < end, "no HTTP/2");
+    }
+    after(&mut core, &mut inb, IDLE + Duration::from_secs(1));
+    let all = tls_wait(&mut core, &mut inb, &got).expect("close_notify after GOAWAY");
+    // the last frame is the GOAWAY
+    assert!(all.len() >= frame::HEAD + 8);
+    let goaway = &all[all.len() - frame::HEAD - 8..];
+    assert_eq!(frame::read_head(goaway).unwrap().kind, frame::GOAWAY);
+
+    std::thread::spawn(move || {
+        let mut s = tls_connect(port, &[]);
+        s.write_all(b"GET /a HTTP/1.1\r\nHost: a\r\n\r\n").unwrap();
+        let mut all = Vec::new();
+        got_tx.send(s.read_to_end(&mut all).map(|_| all)).unwrap();
+    });
+    let end = Instant::now() + Duration::from_secs(5);
+    while core.conns.iter().all(|(_, c)| c.written == 0) {
+        turn(&mut core, &mut inb, &mut out, 1000);
+        assert!(Instant::now() < end, "no answer");
+    }
+    core.start_drain();
+    let all = tls_wait(&mut core, &mut inb, &got).expect("close_notify after the drain");
+    assert!(all.ends_with(b"/a"));
+}
+
+/// A clean WebSocket close over TLS ends with `close_notify`.
+#[test]
+fn tls_websocket_close_sends_close_notify() {
+    let (port, _) = serve_tls(limits());
+    let (mut ws, _) = tungstenite::client("wss://localhost/ws", tls_connect(port, &[])).unwrap();
+    ws.close(None).unwrap();
+    loop {
+        match ws.read() {
+            Ok(_) => {}
+            Err(WsError::ConnectionClosed) => break,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    let mut b = [0u8; 1];
+    assert_eq!(ws.get_mut().read(&mut b).expect("close_notify"), 0);
 }
