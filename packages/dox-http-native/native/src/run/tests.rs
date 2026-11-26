@@ -93,7 +93,8 @@ fn ans(out: &mut Vec<u8>, id: u64, status: u16, kind: u16, lines: &[u8], body: &
 /// are echoed. `/stream` sends "ab", "cde" as a streamed body. `/exact`,
 /// `/liar` and `/short` do the same with `content-length` 5, 3 and 9,
 /// `/trailers` with trailers on the end.
-/// `/zip` gzips. Anything else: the target and the body.
+/// `/zip` gzips, `/large` sends 8 MiB. Anything else: the target and the
+/// body.
 fn app(r: &Rec, out: &mut Vec<u8>) {
     match r.kind() {
         0 => match r.target.as_str() {
@@ -145,6 +146,7 @@ fn app(r: &Rec, out: &mut Vec<u8>) {
                 };
                 ans(out, r.id, 0, 8, trailers, b"");
             }
+            "/large" => ans(out, r.id, 200, 0, b"", &vec![b'x'; 8 << 20]),
             "/zip" => ans(
                 out,
                 r.id,
@@ -2270,6 +2272,13 @@ fn tls_reload() {
     let (mut core, port) = new_core(limits());
     core.certs = Some(Certs::share(&cert, &key, true).unwrap());
     let _log = run_app(core);
+    // a server with the same files and HTTP/2 off: the reload reaches it too
+    let (mut core, port2) = new_core(Limits {
+        http2: false,
+        ..limits()
+    });
+    core.certs = Some(Certs::share(&cert, &key, false).unwrap());
+    let _log2 = run_app(core);
     let get = b"GET /a HTTP/1.1\r\nHost: a\r\n\r\n";
     let answer = |s: &mut TlsStream| {
         s.write_all(get).unwrap();
@@ -2291,6 +2300,9 @@ fn tls_reload() {
     answer(&mut new);
     assert_eq!(shown(&new), cert2);
     answer(&mut old);
+    let mut other = tls_connect(port2, &[]);
+    answer(&mut other);
+    assert_eq!(shown(&other), cert2);
 
     // a bad file: an error, and the server keeps the certificate
     std::fs::write(&cert, b"junk").unwrap();
@@ -2299,4 +2311,183 @@ fn tls_reload() {
     answer(&mut after);
     assert_eq!(shown(&after), cert2);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A big answer with `Connection: close` to a client that reads slowly:
+/// the socket is full when the answer is out, and `close_notify` must
+/// still come before the close.
+#[test]
+fn tls_close_notify_after_a_big_answer_to_a_slow_reader() {
+    let (port, _) = serve_tls(limits());
+    let mut s = tls_connect(port, &[]);
+    s.write_all(b"GET /large HTTP/1.1\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        match s.read(&mut buf) {
+            Ok(0) => break,
+            Ok(k) => out.extend_from_slice(&buf[..k]),
+            Err(e) => panic!("no close_notify: {e}"),
+        }
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    assert!(out.starts_with(b"HTTP/1.1 200"));
+    assert!(out.ends_with(&[b'x'; 1024]) && out.len() > 8 << 20);
+}
+
+/// A client that reads slowly, but reads: the send stall timer must not
+/// close it. `tls_write_counts_each_socket_byte` shows that the progress
+/// comes per socket write, not per rustls buffer.
+#[test]
+fn tls_slow_reader_is_not_stalled() {
+    let (mut core, port) = tls_core(limits());
+    let mut inb = vec![0u8; 1 << 18];
+    let mut out = Vec::new();
+    let (go, wait) = mpsc::channel::<()>();
+    let (stop, stopped) = mpsc::channel::<()>();
+    let client = std::thread::spawn(move || {
+        let mut s = tls_connect(port, &[]);
+        s.write_all(b"GET /large HTTP/1.1\r\nHost: a\r\n\r\n")
+            .unwrap();
+        wait.recv().unwrap();
+        // raw TLS bytes, a little at a time, until the test has seen it
+        let mut buf = vec![0u8; 4 * 1024];
+        while stopped.try_recv().is_err() {
+            let _ = s.sock.read(&mut buf);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let _ = wait.recv();
+    });
+    let end = Instant::now() + Duration::from_secs(5);
+    while !core.conns.iter().any(|(_, c)| c.stuck.is_some()) {
+        turn(&mut core, &mut inb, &mut out, 1000);
+        assert!(Instant::now() < end, "the answer never waits");
+    }
+    let idx = core.conns.iter().next().unwrap().0;
+    let old = Instant::now() - Duration::from_secs(20);
+    core.conns[idx].stuck = Some(old);
+    go.send(()).unwrap();
+    let end = Instant::now() + Duration::from_secs(5);
+    while core.conns[idx].stuck == Some(old) {
+        turn(&mut core, &mut inb, &mut out, 1000);
+        assert!(Instant::now() < end, "no progress seen");
+    }
+    stop.send(()).unwrap();
+    // the old stall time is over SEND_WAIT ago 15 s from now, the new is not
+    after(&mut core, &mut inb, Duration::from_secs(15));
+    assert!(core.conns.contains(idx), "closed as stalled");
+    drop(go);
+    drop(core);
+    let _ = client.join();
+}
+
+/// A socket with room for this many more bytes, then WouldBlock.
+struct Room(usize);
+
+impl Write for Room {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.0 == 0 {
+            return Err(ErrorKind::WouldBlock.into());
+        }
+        let k = buf.len().min(self.0);
+        self.0 -= k;
+        Ok(k)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The handshake of `server` and `client` in memory.
+fn handshake(server: &mut rustls::ServerConnection, client: &mut rustls::ClientConnection) {
+    while server.is_handshaking() || client.is_handshaking() {
+        let mut b = Vec::new();
+        while client.wants_write() {
+            client.write_tls(&mut b).unwrap();
+        }
+        let mut r = &b[..];
+        while !r.is_empty() {
+            server.read_tls(&mut r).unwrap();
+        }
+        server.process_new_packets().unwrap();
+        let mut b = Vec::new();
+        while server.wants_write() {
+            server.write_tls(&mut b).unwrap();
+        }
+        let mut r = &b[..];
+        while !r.is_empty() {
+            client.read_tls(&mut r).unwrap();
+        }
+        client.process_new_packets().unwrap();
+    }
+}
+
+/// A slow socket takes a part of one rustls buffer: no answer byte is
+/// written yet (`held` stays), but `sent` grows with each socket write.
+/// The stall and idle timers count `sent` (see `Conn::progress`).
+#[test]
+fn tls_write_counts_each_socket_byte() {
+    let certs = Certs::share(&path("cert1.pem"), &path("key1.pem"), false).unwrap();
+    let mut t = certs.accept().unwrap();
+    let mut client = tls_client(&[]);
+    handshake(&mut t.conn, &mut client);
+    let sent = t.sent;
+    let data = vec![b'x'; 1 << 20];
+    assert_eq!(tls::write(&mut t, &mut Room(1000), &data), Some(0));
+    assert_eq!(t.sent, sent + 1000);
+    assert!(t.held > 0);
+    assert_eq!(tls::write(&mut t, &mut Room(1000), &data), Some(0));
+    assert_eq!(t.sent, sent + 2000);
+    // a big room: the whole rustls buffer goes out
+    let held = t.held;
+    let done = tls::write(&mut t, &mut Room(usize::MAX), &data);
+    assert_eq!(done, Some(data.len()));
+    assert!(held > 0 && t.held == 0);
+}
+
+/// The answer is out (`pending()` is 0) while the socket is full and
+/// rustls still holds records. The close must wait for them and for
+/// `close_notify`: no `shutdown` yet, and the client gets a clean end.
+#[test]
+fn tls_close_waits_for_close_notify_on_a_full_socket() {
+    let (mut core, port) = tls_core(limits());
+    let mut inb = vec![0u8; 1 << 18];
+    let mut out = Vec::new();
+    let (go, wait) = mpsc::channel::<()>();
+    let (got_tx, got) = mpsc::channel::<std::io::Result<usize>>();
+    std::thread::spawn(move || {
+        let mut s = tls_connect(port, &[]);
+        s.write_all(b"GET /large HTTP/1.1\r\nHost: a\r\n\r\n")
+            .unwrap();
+        wait.recv().unwrap();
+        let mut all = Vec::new();
+        got_tx.send(s.read_to_end(&mut all)).unwrap();
+    });
+    let end = Instant::now() + Duration::from_secs(5);
+    while !core.conns.iter().any(|(_, c)| c.stuck.is_some()) {
+        turn(&mut core, &mut inb, &mut out, 1000);
+        assert!(Instant::now() < end, "the answer never waits");
+    }
+    let idx = core.conns.iter().next().unwrap().0;
+    let c = &mut core.conns[idx];
+    // drop the rest of the answer: rustls keeps the records it has
+    c.wpos = c.wbuf.len();
+    c.tls.as_mut().unwrap().held = 0;
+    c.shut = true;
+    core.service(idx);
+    let c = &core.conns[idx];
+    assert!(c.linger.is_none(), "closed before close_notify was out");
+    assert!(c.tls.as_ref().unwrap().conn.wants_write());
+    go.send(()).unwrap();
+    let end = Instant::now() + Duration::from_secs(5);
+    let r = loop {
+        turn(&mut core, &mut inb, &mut out, 1000);
+        if let Ok(r) = got.try_recv() {
+            break r;
+        }
+        assert!(Instant::now() < end, "no end");
+    };
+    r.expect("close_notify");
 }

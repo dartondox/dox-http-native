@@ -841,6 +841,13 @@ impl Conn {
         self.wbuf.len() - self.wpos
     }
 
+    /// Bytes that went to the socket so far: plain bytes, or TLS bytes.
+    /// It grows with each socket write, so the timers see progress. Only
+    /// for "did it grow", not for the stream marks (see `written`).
+    fn progress(&self) -> u64 {
+        self.written + self.tls.as_ref().map_or(0, |t| t.sent)
+    }
+
     /// true while bytes wait for the socket: answer bytes, or TLS records
     /// of rustls alone (eg. the handshake)
     fn unsent(&self) -> bool {
@@ -2038,7 +2045,7 @@ impl Core {
                 }
             }
         }
-        let before = c.written;
+        let before = c.progress();
         let data = c.h2.as_ref().map_or(0, |h| h.data_sent);
         loop {
             if let Some(h2) = c.h2.as_mut() {
@@ -2053,6 +2060,7 @@ impl Core {
                 break;
             }
         }
+        let moved = c.progress() > before;
         if let Some(h2) = c.h2.as_mut() {
             h2.stall_mark(now);
             for (seq, kind, code, data) in h2.to_dart.drain(..) {
@@ -2075,13 +2083,15 @@ impl Core {
                 self.streams.remove(&sid);
             }
             c.shut |= h2.over();
-            if c.written > before {
+            if moved {
                 h2.flushed(); // our ACKs are on their way
             }
         }
         // a write starts to wait: make sure its timer runs
         let blocked = c.h2.as_ref().is_some_and(|h| h.blocked());
-        let wait_starts = c.stuck.is_none() && (c.pending() > 0 || blocked);
+        // TLS: the records of a clean close (`close_notify`) wait too
+        let waits = c.pending() > 0 || (c.shut && c.unsent());
+        let wait_starts = c.stuck.is_none() && (waits || blocked);
         while let Some(&(end, sid, n)) = c.marks.front() {
             if end > c.written {
                 break;
@@ -2093,21 +2103,21 @@ impl Core {
         // see `due`) counts from the last write. HTTP/2: PING and SETTINGS
         // ACKs do not count, only streams that open, close or send.
         let active = match c.h2.as_mut() {
-            Some(h2) => std::mem::take(&mut h2.stirred) || (c.written > before && h2.open() > 0),
-            None => c.written > before,
+            Some(h2) => std::mem::take(&mut h2.stirred) || (moved && h2.open() > 0),
+            None => moved,
         };
         if active {
             c.since = now;
         }
         // HTTP/2: a closed window with data waiting also counts as stuck
-        if c.pending() == 0 && !blocked {
+        if !waits && !blocked {
             c.stuck = None;
         } else if c.stuck.is_none()
             // a blocked HTTP/2 window: ACKs and PINGs are no progress, only DATA is
             || if blocked {
                 c.h2.as_ref().is_some_and(|h| h.data_sent > data)
             } else {
-                c.written > before
+                moved
             }
         {
             c.stuck = Some(now);
@@ -2134,7 +2144,21 @@ impl Core {
         let mut linger = false;
         if c.pending() == 0 && c.shut && c.linger.is_none() {
             if let Some(t) = c.tls.as_mut() {
-                t.close_notify(&mut &c.sock);
+                // once: rustls sends it only one time. Close the socket
+                // only when it is out, else the client sees a cut. A client
+                // that does not read gets the send stall timer.
+                t.conn.send_close_notify();
+                if !c.flush() {
+                    self.kill(idx);
+                    return;
+                }
+                if c.unsent() {
+                    if c.stuck.is_none() {
+                        c.stuck = Some(now);
+                        self.arm_timer(idx);
+                    }
+                    return;
+                }
             }
             if self.stopped || c.ws.is_some() {
                 self.kill(idx);
@@ -4414,7 +4438,7 @@ pub mod fuzz {
         let cfg = CFG.get_or_init(|| {
             let cert = include_bytes!("../../test/certs/cert1.pem");
             let key = include_bytes!("../../test/certs/key1.pem");
-            tls::config(cert, key, true).unwrap()
+            tls::config(tls::Keys::alone(tls::certified(cert, key).unwrap()), true)
         });
         let mut t = Tls::new(rustls::ServerConnection::new(cfg.clone()).unwrap());
         let mut buf = vec![0u8; READ_ROOM];

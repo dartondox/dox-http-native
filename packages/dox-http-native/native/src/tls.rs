@@ -15,9 +15,12 @@ use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 
+use rustls::crypto::CryptoProvider;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::{ServerConfig, ServerConnection};
+use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::sign::CertifiedKey;
+use rustls::{InconsistentKeys, ServerConfig, ServerConnection};
 
 /// Errors of [load], as the FFI returns them.
 pub(crate) const CERT_READ: i64 = -1;
@@ -36,6 +39,9 @@ pub(crate) struct Tls {
     pub(crate) held: usize,
     /// the handshake is over and ALPN picked the protocol
     pub(crate) picked: bool,
+    /// all TLS bytes written to the socket: progress for the send stall
+    /// and idle timers, which `held` shows only per rustls buffer
+    pub(crate) sent: u64,
 }
 
 impl Tls {
@@ -44,6 +50,7 @@ impl Tls {
             conn,
             held: 0,
             picked: false,
+            sent: 0,
         })
     }
 
@@ -55,22 +62,14 @@ impl Tls {
         self.picked = true;
         Some(self.conn.alpn_protocol() == Some(b"h2"))
     }
-
-    /// Queues `close_notify` and tries to write it (and what waits before
-    /// it). Only for a clean end: a cut connection must not look whole.
-    pub(crate) fn close_notify(&mut self, sock: &mut impl Write) {
-        self.conn.send_close_notify();
-        while self.conn.wants_write() {
-            match self.conn.write_tls(sock) {
-                Ok(0) | Err(_) => return,
-                Ok(_) => {}
-            }
-        }
-    }
 }
 
-/// A server config from PEM bytes: a certificate chain and its key.
-pub(crate) fn config(cert: &[u8], key: &[u8], http2: bool) -> Result<Arc<ServerConfig>, i64> {
+fn provider() -> Arc<CryptoProvider> {
+    Arc::new(rustls::crypto::ring::default_provider())
+}
+
+/// A certificate chain and its key from PEM bytes.
+pub(crate) fn certified(cert: &[u8], key: &[u8]) -> Result<Arc<CertifiedKey>, i64> {
     let certs = CertificateDer::pem_slice_iter(cert)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| CERT_BAD)?;
@@ -78,70 +77,140 @@ pub(crate) fn config(cert: &[u8], key: &[u8], http2: bool) -> Result<Arc<ServerC
         return Err(CERT_BAD);
     }
     let key = PrivateKeyDer::from_pem_slice(key).map_err(|_| KEY_BAD)?;
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    // TLS 1.2 and 1.3, the rustls defaults. No cipher options.
-    let mut cfg = ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|_| PAIR_BAD)?
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
+    let signer = provider()
+        .key_provider
+        .load_private_key(key)
         .map_err(|_| PAIR_BAD)?;
+    let ck = CertifiedKey::new(certs, signer);
+    // the same check as `with_single_cert`: a key whose public key rustls
+    // can not get passes
+    match ck.keys_match() {
+        Ok(()) | Err(rustls::Error::InconsistentKeys(InconsistentKeys::Unknown)) => {}
+        Err(_) => return Err(PAIR_BAD),
+    }
+    Ok(Arc::new(ck))
+}
+
+/// A certificate chain and its key from the two PEM files.
+pub(crate) fn load(cert: &Path, key: &Path) -> Result<Arc<CertifiedKey>, i64> {
+    let cert = std::fs::read(cert).map_err(|_| CERT_READ)?;
+    let key = std::fs::read(key).map_err(|_| KEY_READ)?;
+    certified(&cert, &key)
+}
+
+/// A server config that takes its certificate from `keys` at each
+/// handshake, so a reload of `keys` reaches it.
+pub(crate) fn config(keys: Arc<Keys>, http2: bool) -> Arc<ServerConfig> {
+    // TLS 1.2 and 1.3, the rustls defaults. No cipher options.
+    let mut cfg = ServerConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .expect("ring has TLS 1.2 and 1.3")
+        .with_no_client_auth()
+        .with_cert_resolver(keys);
     cfg.alpn_protocols = if http2 {
         vec![b"h2".to_vec(), b"http/1.1".to_vec()]
     } else {
         vec![b"http/1.1".to_vec()]
     };
-    Ok(Arc::new(cfg))
+    Arc::new(cfg)
 }
 
-/// A server config from the two PEM files.
-pub(crate) fn load(cert: &Path, key: &Path, http2: bool) -> Result<Arc<ServerConfig>, i64> {
-    let cert = std::fs::read(cert).map_err(|_| CERT_READ)?;
-    let key = std::fs::read(key).map_err(|_| KEY_READ)?;
-    config(&cert, &key, http2)
+/// The certificate of all TLS servers of this process that use one pair
+/// of files, also with other `http2` values (ALPN is in [Certs]).
+pub(crate) struct Keys {
+    /// the paths as [same_file] gives them: the key in [ALL]
+    files: (PathBuf, PathBuf),
+    now: Mutex<Arc<CertifiedKey>>,
 }
 
-/// The certificate of the TLS servers that use one pair of files.
+impl Keys {
+    /// Keys that are in no list (fuzz).
+    #[cfg(fuzzing)]
+    pub(crate) fn alone(key: Arc<CertifiedKey>) -> Arc<Keys> {
+        Arc::new(Keys {
+            files: (PathBuf::new(), PathBuf::new()),
+            now: Mutex::new(key),
+        })
+    }
+}
+
+impl std::fmt::Debug for Keys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Keys").field("files", &self.files).finish()
+    }
+}
+
+impl ResolvesServerCert for Keys {
+    fn resolve(&self, _: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(self.now.lock().unwrap().clone())
+    }
+}
+
+/// One path for one file: `a/../cert.pem`, a relative path and an
+/// absolute path give the same. The folder is resolved, not the file name:
+/// certbot's `live/x/cert.pem` is a link to a new file after each renewal,
+/// and it must stay the same key.
+fn same_file(p: &Path) -> PathBuf {
+    let dir = match p.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    match (dir.canonicalize(), p.file_name()) {
+        (Ok(d), Some(name)) => d.join(name),
+        _ => p.to_path_buf(),
+    }
+}
+
+/// All [Keys] of this process that a server still uses.
+static ALL: Mutex<Vec<Weak<Keys>>> = Mutex::new(Vec::new());
+
+/// The TLS config of one server.
 pub(crate) struct Certs {
-    cert: PathBuf,
-    key: PathBuf,
-    http2: bool,
-    now: Mutex<Arc<ServerConfig>>,
+    /// the config holds it too: here only for the tests
+    #[cfg(test)]
+    pub(crate) keys: Arc<Keys>,
+    cfg: Arc<ServerConfig>,
 }
-
-/// All [Certs] of this process that a server still uses.
-static ALL: Mutex<Vec<Weak<Certs>>> = Mutex::new(Vec::new());
 
 impl Certs {
-    /// Reads the files. A server that uses the same files gets the same
-    /// [Certs], and the new certificate is used for both. On an error
+    /// Reads the files. Servers that use the same files share their
+    /// [Keys], so this is also the reload for all of them. On an error
     /// nothing changes.
     pub(crate) fn share(cert: &Path, key: &Path, http2: bool) -> Result<Arc<Certs>, i64> {
-        let cfg = load(cert, key, http2)?;
+        let now = load(cert, key)?;
+        let files = (same_file(cert), same_file(key));
         let mut all = ALL.lock().unwrap();
         all.retain(|w| w.strong_count() > 0);
         let same = all
             .iter()
             .filter_map(Weak::upgrade)
-            .find(|c| c.cert == cert && c.key == key && c.http2 == http2);
-        if let Some(c) = same {
-            *c.now.lock().unwrap() = cfg;
-            return Ok(c);
-        }
-        let c = Arc::new(Certs {
-            cert: cert.to_path_buf(),
-            key: key.to_path_buf(),
-            http2,
-            now: Mutex::new(cfg),
-        });
-        all.push(Arc::downgrade(&c));
-        Ok(c)
+            .find(|k| k.files == files);
+        let keys = match same {
+            Some(k) => {
+                *k.now.lock().unwrap() = now;
+                k
+            }
+            None => {
+                let k = Arc::new(Keys {
+                    files,
+                    now: Mutex::new(now),
+                });
+                all.push(Arc::downgrade(&k));
+                k
+            }
+        };
+        let cfg = config(keys.clone(), http2);
+        Ok(Arc::new(Certs {
+            #[cfg(test)]
+            keys,
+            cfg,
+        }))
     }
 
-    /// The TLS state of a new connection, with the current certificate.
+    /// The TLS state of a new connection. It gets the certificate of the
+    /// time of its handshake.
     pub(crate) fn accept(&self) -> Option<Box<Tls>> {
-        let cfg = self.now.lock().unwrap().clone();
-        ServerConnection::new(cfg).ok().map(Tls::new)
+        ServerConnection::new(self.cfg.clone()).ok().map(Tls::new)
     }
 }
 
@@ -185,7 +254,7 @@ pub(crate) fn write<S: Write>(t: &mut Tls, sock: &mut S, data: &[u8]) -> Option<
         while t.conn.wants_write() {
             match t.conn.write_tls(sock) {
                 Ok(0) => return None,
-                Ok(_) => {}
+                Ok(k) => t.sent += k as u64,
                 Err(e) if e.kind() == ErrorKind::WouldBlock => return Some(done),
                 Err(e) if e.kind() == ErrorKind::Interrupted => {}
                 Err(_) => return None,
@@ -222,23 +291,31 @@ pub(crate) mod tests {
     #[test]
     fn bad_files_fail() {
         let none = path("none.pem");
-        assert_eq!(load(&none, &path("key1.pem"), false).err(), Some(CERT_READ));
-        assert_eq!(load(&path("cert1.pem"), &none, false).err(), Some(KEY_READ));
-        assert_eq!(config(b"junk", KEY1, false).err(), Some(CERT_BAD));
-        assert_eq!(config(CERT1, b"junk", false).err(), Some(KEY_BAD));
+        assert_eq!(load(&none, &path("key1.pem")).err(), Some(CERT_READ));
+        assert_eq!(load(&path("cert1.pem"), &none).err(), Some(KEY_READ));
+        assert_eq!(certified(b"junk", KEY1).err(), Some(CERT_BAD));
+        assert_eq!(certified(CERT1, b"junk").err(), Some(KEY_BAD));
         // a key that is not the key of the certificate
-        assert_eq!(config(CERT1, KEY2, false).err(), Some(PAIR_BAD));
-        assert!(config(CERT1, KEY1, true).is_ok());
+        assert_eq!(certified(CERT1, KEY2).err(), Some(PAIR_BAD));
+        assert!(certified(CERT1, KEY1).is_ok());
     }
 
+    /// Same files share one [Keys]: also with another `http2` value, and
+    /// with a relative path that goes another way to the same file.
     #[test]
     fn same_files_share_one_certificate() {
         let (c, k) = (path("cert1.pem"), path("key1.pem"));
         let a = Certs::share(&c, &k, false).unwrap();
-        let b = Certs::share(&c, &k, false).unwrap();
-        assert!(Arc::ptr_eq(&a, &b));
-        // another ALPN list is another config
-        let h2 = Certs::share(&c, &k, true).unwrap();
-        assert!(!Arc::ptr_eq(&a, &h2));
+        let b = Certs::share(&c, &k, true).unwrap();
+        assert!(Arc::ptr_eq(&a.keys, &b.keys));
+        let cwd = std::env::current_dir().unwrap();
+        let rel = |p: &Path| {
+            let up = cwd.components().count() - 1;
+            let mut r = PathBuf::from("../".repeat(up));
+            r.push(p.strip_prefix("/").unwrap());
+            r
+        };
+        let d = Certs::share(&rel(&c), &rel(&k), false).unwrap();
+        assert!(Arc::ptr_eq(&a.keys, &d.keys));
     }
 }
