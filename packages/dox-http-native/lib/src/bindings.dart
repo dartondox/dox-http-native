@@ -72,6 +72,18 @@ external int doxTls(
   int keyLength,
 );
 
+/// Only checks the two files, as [doxTls] reads them. It needs no server
+/// and changes nothing. Returns 0 or the error code of [doxTls].
+@Native<Int64 Function(Pointer<Uint8>, Int64, Pointer<Uint8>, Int64)>(
+  symbol: 'dox_tls_check',
+)
+external int doxTlsCheck(
+  Pointer<Uint8> cert,
+  int certLength,
+  Pointer<Uint8> key,
+  int keyLength,
+);
+
 @Native<Int32 Function(Int64)>(symbol: 'dox_bound_port', isLeaf: true)
 external int doxBoundPort(int handle);
 

@@ -3308,14 +3308,7 @@ pub unsafe extern "C" fn dox_tls(
     key_len: i64,
 ) -> i64 {
     let s = unsafe { &*(handle as *const Native) };
-    if cert.is_null() || key.is_null() {
-        return -6;
-    }
-    let path = |p: *const u8, n: i64| {
-        let b = unsafe { std::slice::from_raw_parts(p, n.max(0) as usize) };
-        std::str::from_utf8(b).map(std::path::PathBuf::from)
-    };
-    let (Ok(cert), Ok(key)) = (path(cert, cert_len), path(key, key_len)) else {
+    let Some((cert, key)) = (unsafe { tls_paths(cert, cert_len, key, key_len) }) else {
         return -6;
     };
     // the files are read without the core: a slow disk must not hold up
@@ -3326,6 +3319,50 @@ pub unsafe extern "C" fn dox_tls(
             s.core.lock().unwrap().certs = Some(certs);
             0
         }
+        Err(code) => code,
+    }
+}
+
+/// The two paths of `dox_tls` and `dox_tls_check`. None: a null pointer,
+/// or a path that is not UTF-8.
+///
+/// # Safety
+/// `cert` and `key` must point to `cert_len` and `key_len` readable bytes.
+unsafe fn tls_paths(
+    cert: *const u8,
+    cert_len: i64,
+    key: *const u8,
+    key_len: i64,
+) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    if cert.is_null() || key.is_null() {
+        return None;
+    }
+    let path = |p: *const u8, n: i64| {
+        let b = unsafe { std::slice::from_raw_parts(p, n.max(0) as usize) };
+        std::str::from_utf8(b).ok().map(std::path::PathBuf::from)
+    };
+    Some((path(cert, cert_len)?, path(key, key_len)?))
+}
+
+/// HTTPS: only checks the certificate chain and the key, as `dox_tls`
+/// reads them. It needs no server and changes nothing. An app uses it to
+/// fail once at its start, before it starts its isolates. Returns 0, or
+/// the error code of `dox_tls`.
+///
+/// # Safety
+/// `cert` and `key` must point to `cert_len` and `key_len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dox_tls_check(
+    cert: *const u8,
+    cert_len: i64,
+    key: *const u8,
+    key_len: i64,
+) -> i64 {
+    let Some((cert, key)) = (unsafe { tls_paths(cert, cert_len, key, key_len) }) else {
+        return -6;
+    };
+    match tls::load(&cert, &key) {
+        Ok(_) => 0,
         Err(code) => code,
     }
 }

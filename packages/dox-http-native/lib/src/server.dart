@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
 import 'dart:isolate';
@@ -234,11 +233,11 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
     }
     if (tls != null) {
       // before the first `dox_run`: no connection gets in without TLS
-      int rc = _setTls(handle, tls);
+      int rc = tlsCall(handle, tls);
       if (rc != 0) {
         doxUnbind(handle);
         receive.close();
-        throw _tlsError(rc, tls);
+        throw tlsError(rc, tls);
       }
     }
     server = NativeHttpServer._(
@@ -251,36 +250,6 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
     // ignore: deprecated_member_use_from_same_package
     server.idleTimeout = idleTimeout;
     return server;
-  }
-
-  /// Gives the certificate files of [tls] to the server [handle] (see
-  /// `doxTls`). Returns 0 or the error code.
-  static int _setTls(int handle, TlsOptions tls) {
-    List<int> cert = utf8.encode(tls.certificatePath);
-    List<int> key = utf8.encode(tls.keyPath);
-    int size = cert.length + key.length;
-    Pointer<Uint8> mem = doxAlloc(size);
-    try {
-      mem.asTypedList(size)
-        ..setRange(0, cert.length, cert)
-        ..setRange(cert.length, size, key);
-      return doxTls(handle, mem, cert.length, mem + cert.length, key.length);
-    } finally {
-      doxFree(mem, size);
-    }
-  }
-
-  static TlsException _tlsError(int code, TlsOptions tls) {
-    String why = switch (code) {
-      -1 => 'can not read the certificate file ${tls.certificatePath}',
-      -2 => 'no PEM certificate in ${tls.certificatePath}',
-      -3 => 'can not read the key file ${tls.keyPath}',
-      -4 => 'no PEM private key in ${tls.keyPath}',
-      -5 => 'the key in ${tls.keyPath} does not fit the certificate',
-      -6 => 'a certificate or key path is not valid UTF-8',
-      _ => 'error $code',
-    };
-    return TlsException('dox_http_native: $why');
   }
 
   /// The certificate files of an HTTPS server, or null for plain HTTP.
@@ -302,8 +271,8 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
     if (_handle == 0) {
       throw StateError('reloadCertificate: the server is closed');
     }
-    int rc = _setTls(_handle, options);
-    if (rc != 0) throw _tlsError(rc, options);
+    int rc = tlsCall(_handle, options);
+    if (rc != 0) throw tlsError(rc, options);
   }
 
   /// null for all interfaces. A host name gives its first address.
