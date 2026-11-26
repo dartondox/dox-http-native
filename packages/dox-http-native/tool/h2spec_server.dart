@@ -1,5 +1,7 @@
 // A small HTTP/2 server for h2spec in CI (see .github/workflows/ci.yaml).
-// Run: dart run tool/h2spec_server.dart <port>
+// Run: dart run tool/h2spec_server.dart <port> [--tls]
+// With --tls the port speaks HTTPS only, with the test certificate of
+// test/certs (h2spec -t -k).
 import 'dart:io';
 
 import 'package:dox_http_native/dox_http_native.dart';
@@ -8,6 +10,12 @@ Future<void> main(List<String> args) async {
   NativeHttpServer server = await NativeHttpServer.bind(
     int.parse(args.first),
     http2: true,
+    tls: args.contains('--tls')
+        ? const TlsOptions(
+            certificatePath: 'test/certs/cert1.pem',
+            keyPath: 'test/certs/key1.pem',
+          )
+        : null,
   );
   server.listen((HttpRequest req) async {
     await req.drain<void>();

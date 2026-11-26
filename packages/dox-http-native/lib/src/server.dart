@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
 import 'dart:isolate';
@@ -8,6 +9,7 @@ import 'package:dox_http_native/src/bindings.dart';
 import 'package:dox_http_native/src/headers.dart';
 import 'package:dox_http_native/src/request.dart';
 import 'package:dox_http_native/src/response.dart';
+import 'package:dox_http_native/src/tls.dart';
 import 'package:dox_http_native/src/websocket.dart';
 
 /// An [HttpServer] where Rust owns the sockets and parses HTTP. The socket
@@ -25,7 +27,13 @@ import 'package:dox_http_native/src/websocket.dart';
 /// Each isolate can bind the same port. The OS shares the connections
 /// between them (`SO_REUSEPORT` on Linux and macOS).
 class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
-  NativeHttpServer._(this._handle, this._receive, this.port, this.address);
+  NativeHttpServer._(
+    this._handle,
+    this._receive,
+    this.port,
+    this.address,
+    this.tls,
+  );
 
   static bool? _available;
   static String? _loadError;
@@ -116,6 +124,14 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   /// once (GOAWAY `ENHANCE_YOUR_CALM`). Behind a proxy (eg. Caddy or
   /// Envoy over h2c) one connection carries many users: raise them when
   /// the proxy sends many cancels.
+  ///
+  /// With [tls], the port speaks HTTPS only (TLS 1.2 and 1.3, rustls in
+  /// Rust). A plain HTTP client gets no answer. The handshake must end in
+  /// [idleTimeout]. With [http2], the client picks HTTP/2 or HTTP/1.1 in
+  /// the handshake (ALPN `h2` or `http/1.1`). `requestedUri` then has the
+  /// `https` scheme. A bad certificate or key file throws a
+  /// [TlsException] here, before the server takes a connection. See
+  /// [reloadCertificate] for a new certificate without a restart.
   static Future<NativeHttpServer> bind(
     int port, {
     Object? address,
@@ -128,6 +144,7 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
     int maxConcurrentStreams = 250,
     int? http2ResetBurst,
     int http2ResetRate = 100,
+    TlsOptions? tls,
   }) async {
     ensureAvailable();
     if (port < 0 || port > 65535) {
@@ -215,15 +232,78 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
         port: port,
       );
     }
+    if (tls != null) {
+      // before the first `dox_run`: no connection gets in without TLS
+      int rc = _setTls(handle, tls);
+      if (rc != 0) {
+        doxUnbind(handle);
+        receive.close();
+        throw _tlsError(rc, tls);
+      }
+    }
     server = NativeHttpServer._(
       handle,
       receive,
       doxBoundPort(handle),
       ip ?? InternetAddress.anyIPv6,
+      tls,
     );
     // ignore: deprecated_member_use_from_same_package
     server.idleTimeout = idleTimeout;
     return server;
+  }
+
+  /// Gives the certificate files of [tls] to the server [handle] (see
+  /// `doxTls`). Returns 0 or the error code.
+  static int _setTls(int handle, TlsOptions tls) {
+    List<int> cert = utf8.encode(tls.certificatePath);
+    List<int> key = utf8.encode(tls.keyPath);
+    int size = cert.length + key.length;
+    Pointer<Uint8> mem = doxAlloc(size);
+    try {
+      mem.asTypedList(size)
+        ..setRange(0, cert.length, cert)
+        ..setRange(cert.length, size, key);
+      return doxTls(handle, mem, cert.length, mem + cert.length, key.length);
+    } finally {
+      doxFree(mem, size);
+    }
+  }
+
+  static TlsException _tlsError(int code, TlsOptions tls) {
+    String why = switch (code) {
+      -1 => 'can not read the certificate file ${tls.certificatePath}',
+      -2 => 'no PEM certificate in ${tls.certificatePath}',
+      -3 => 'can not read the key file ${tls.keyPath}',
+      -4 => 'no PEM private key in ${tls.keyPath}',
+      -5 => 'the key in ${tls.keyPath} does not fit the certificate',
+      -6 => 'a certificate or key path is not valid UTF-8',
+      _ => 'error $code',
+    };
+    return TlsException('dox_http_native: $why');
+  }
+
+  /// The certificate files of an HTTPS server, or null for plain HTTP.
+  final TlsOptions? tls;
+
+  /// Reads the certificate and key files of [tls] again, for example after
+  /// `certbot` renewed them. New connections get the new certificate.
+  /// Open connections keep the old one until they close. When a file is
+  /// bad, it throws a [TlsException] and the server keeps the old
+  /// certificate. All servers of this process that use the same two files
+  /// (eg. one per isolate) get the new certificate, so one call is enough.
+  /// Dox has no file watcher: the app decides when to call it (eg. on
+  /// `SIGHUP`, or from a scheduled task).
+  Future<void> reloadCertificate() async {
+    TlsOptions? options = tls;
+    if (options == null) {
+      throw StateError('reloadCertificate: the server has no tls');
+    }
+    if (_handle == 0) {
+      throw StateError('reloadCertificate: the server is closed');
+    }
+    int rc = _setTls(_handle, options);
+    if (rc != 0) throw _tlsError(rc, options);
   }
 
   /// null for all interfaces. A host name gives its first address.

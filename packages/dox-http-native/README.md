@@ -74,7 +74,7 @@ How it works:
 
 - The same port speaks HTTP/1.1 and HTTP/2 over plain TCP. This is h2c with prior knowledge. `curl --http2-prior-knowledge` is an example of a client.
 - A connection that starts with the HTTP/2 preface is HTTP/2. All other connections are HTTP/1.1.
-- There is no TLS, and browsers use HTTP/2 only with TLS. Thus put a proxy in front, for example Caddy or Envoy. The proxy ends TLS and speaks h2c to the server.
+- Browsers use HTTP/2 only with TLS. Turn on [HTTPS](#https), or put a proxy in front, for example Caddy or Envoy. The proxy ends TLS and speaks h2c to the server.
 - Your handlers stay the same. `request.protocolVersion` is `2.0`. Answers go out in any order.
 
 Requests and answers:
@@ -110,7 +110,56 @@ Flood limits:
 - Too many SETTINGS frames, PING frames or frames with no work also close the connection.
 - The answer bytes that wait for a client that does not read have a limit of 32 MiB for each connection. Over the limit, new streams get `REFUSED_STREAM`.
 
-The h2spec conformance suite runs in CI in strict mode.
+The h2spec conformance suite runs in CI in strict mode, on a plain port and on a TLS port.
+
+## HTTPS
+
+The server can speak HTTPS without a proxy. Rust does the TLS work with rustls and its `ring` crypto provider. There is no OpenSSL. TLS is off by default. When it is off, nothing changes.
+
+```dart
+NativeHttpServer server = await NativeHttpServer.bind(
+  443,
+  http2: true,
+  tls: TlsOptions(certificatePath: 'fullchain.pem', keyPath: 'privkey.pem'),
+);
+```
+
+Options of `TlsOptions`:
+
+- `certificatePath`: a PEM file. The certificate is first, then the intermediate certificates. An example is `fullchain.pem` of certbot.
+- `keyPath`: a PEM file with the private key of the certificate (PKCS #8, PKCS #1 or SEC1). An example is `privkey.pem` of certbot.
+
+How it works:
+
+- Rust reads the two files at `bind`. A bad file, or a key of a different certificate, throws a `TlsException` at `bind`.
+- A TLS port speaks only TLS. A plain HTTP client gets no answer, and the connection closes.
+- The server uses TLS 1.2 and TLS 1.3, the rustls defaults. There are no cipher options.
+- With `http2: true`, the client selects HTTP/2 or HTTP/1.1 in the handshake (ALPN `h2` or `http/1.1`). With `http2: false`, the server offers only `http/1.1`.
+- The handshake must end in `idleTimeout`. There is no other TLS limit.
+- HTTP/1.1, HTTP/2, WebSocket (`wss://`), gRPC and streamed answers work on the TLS port. Your handlers stay the same.
+- `request.requestedUri` has the `https` scheme.
+- At a clean close, the server sends the TLS `close_notify` alert. When the server cuts a connection (for example after an error), it does not send `close_notify`. Thus the client can see that the data is not complete.
+
+### Reload the certificate
+
+Use `reloadCertificate()` to get a new certificate without a restart. An example is after certbot renews the certificate.
+
+```dart
+await server.reloadCertificate();
+```
+
+- The method reads the same two files again.
+- New connections get the new certificate. Open connections keep the old certificate until they close.
+- If a file is bad, the method throws a `TlsException`. The server keeps the old certificate.
+- All servers in the process that use the same two files get the new certificate. This includes the servers of other isolates and the servers with a different `http2` value. A relative path and an absolute path to the same file are the same file. Thus one call is sufficient.
+- The server does not watch the files and does not catch signals. Your app decides when to call the method, for example on `SIGHUP` or from a scheduled task.
+
+### Not included
+
+- ACME: the server does not get or renew a certificate (for example from Let's Encrypt). Use certbot or a similar tool, then call `reloadCertificate()`.
+- Redirect from port 80: the server does not send `http://` visitors to `https://`. Bind a second plain server for this.
+- mTLS: the server does not ask the client for a certificate.
+- SNI: one port has one certificate. The server does not select a certificate for each domain.
 
 ## WebSocket
 
@@ -185,7 +234,7 @@ Answers:
 
 The server implements the `dart:io` API. These parts are different on purpose. The tests in `test/dart_io/` come from the Dart SDK. Each skipped test there names one of these differences.
 
-- There is no TLS. A proxy ends TLS. `bindSecure` and `listenOn` do not exist.
+- `bindSecure` and `listenOn` do not exist. For TLS, give `tls` to `bind` (see [HTTPS](#https)), or use a proxy that ends TLS. There is no `SecurityContext`, and `request.certificate` is always `null`.
 - There is no `detachSocket` and no `HttpSession`. `connectionsInfo()` and `sessionTimeout` do nothing. `idleTimeout` is an argument of `bind`.
 - Rust reads the whole request body before your handler runs. A request that the client cuts short never reaches the handler. The connection closes at once.
 - A custom `reasonPhrase` is not sent. The answer has the standard phrase of the status code.
@@ -222,7 +271,7 @@ Uint8List? plain = AesGcm.open(key, sealed, aad);  // null when changed
 
 ## Security notes
 
-- On the open internet, run the server behind a reverse proxy, for example nginx or a load balancer. The proxy must end TLS, limit the request rate and drop slow clients.
+- On the open internet, run the server behind a reverse proxy, for example nginx or a load balancer. The proxy must limit the request rate and drop slow clients. The proxy can also end TLS, or the server can do it (see [HTTPS](#https)).
 - Set limits that are correct for your app: `maxBodySize`, `maxMultipartSize`, `bodyTimeout`, `maxConnections` and `idleTimeout`.
 - A different process can bind the same port and take some of the connections. On Linux, that is a process of the same OS user (`SO_REUSEPORT`). On macOS, it is a process that binds a more specific address.
 - An example on macOS is `127.0.0.1` while the server listens on all interfaces. Run the server as its own user, on a host that you control.
@@ -243,10 +292,10 @@ The CI and Fuzz badges at the top show the last result on `main`. CI runs the te
 | --- | --- | --- |
 | Dart tests of the `dart:io` server, from the Dart SDK | 48 files, 755 tests pass, 66 skipped | The server gives the same results as the `dart:io` server. |
 | Request parser inputs from the Dart SDK (part of the 755 tests) | 519 tests | Bad, split and too large requests. Each request goes in as 1 piece, in 10-byte pieces and in 1-byte pieces. |
-| Other Dart tests of this package | 129 tests | The server, the headers, HTTP/2, WebSocket and AES-GCM. |
-| Rust unit tests | 179 tests | The parser, the body reader, the limits and the HTTP/2 frames. |
-| [h2spec](https://github.com/summerwind/h2spec) (strict mode) | all specs but 1 | The HTTP/2 conformance suite. |
-| Fuzz tests | 6 targets | Random input on the parsers and on a full connection. Refer to [Fuzz tests](#fuzz-tests). |
+| Other Dart tests of this package | 136 tests | The server, the headers, HTTP/2, WebSocket, HTTPS and AES-GCM. |
+| Rust unit tests | 199 tests | The parser, the body reader, the limits, the HTTP/2 frames and TLS. |
+| [h2spec](https://github.com/summerwind/h2spec) (strict mode) | all specs but 1 on a plain port, all specs on a TLS port | The HTTP/2 conformance suite. |
+| Fuzz tests | 7 targets | Random input on the parsers, on a full connection and on the TLS handshake. Refer to [Fuzz tests](#fuzz-tests). |
 
 The SDK tests are in `test/dart_io/`. Each file has the same name as its source file in [`tests/standalone/io`](https://github.com/dart-lang/sdk/tree/main/tests/standalone/io) of the Dart SDK.
 
@@ -275,6 +324,7 @@ The fuzz targets are in `native/fuzz/`. CI runs each target for 60 seconds when 
 - `hpack`: random HTTP/2 header blocks (HPACK) on one decoder. It must not panic. The decoded list must stay below the size limit, and the table size must stay correct. Each decoded block is encoded again and must decode to the same fields.
 - `h2_conn`: random bytes after the HTTP/2 preface, on one connection, with cuts as in `conn`. When Dart does not answer, one piece and random pieces must give the same records and the same bytes back.
   With answers (full or streamed), each frame that the server writes must be complete and valid. Nothing can come after a GOAWAY with an error. No stream can end two times. `STREAM_SENT` must not count more bytes than the answers have.
+- `tls_handshake`: random bytes as the client side of a TLS connection, through the same read and write code as a real connection. It must not panic or stop. One piece and random pieces must give the same result.
 
 To run one target on your computer:
 

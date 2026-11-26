@@ -145,6 +145,8 @@ jobs:
   # preface is not HTTP/2, so it goes to HTTP/1.1 and gets 400 (by design,
   # not a GOAWAY). h2spec has no exclude flag, so the job lists all specs
   # with 3.5/1 alone in place of 3.5.
+  # Then all specs on a TLS port (`--tls`, h2spec -t): there ALPN picks
+  # HTTP/2, so a bad preface closes the connection and 3.5/2 passes.
   h2spec:
     runs-on: ubuntu-latest
     steps:
@@ -168,8 +170,12 @@ jobs:
         run: |
           dart pub get
           dart run tool/h2spec_server.dart 8080 > server.log 2>&1 &
-          for _ in $(seq 60); do grep -q listening server.log && exit 0; sleep 1; done
-          cat server.log
+          dart run tool/h2spec_server.dart 8443 --tls > tls.log 2>&1 &
+          for _ in $(seq 60); do
+            grep -q listening server.log && grep -q listening tls.log && exit 0
+            sleep 1
+          done
+          cat server.log tls.log
           exit 1
       - name: h2spec
         env:
@@ -182,6 +188,11 @@ jobs:
             echo "::error::h2spec did not fail on a failed test"
             exit 1
           fi
+      # -k: the test certificate is not trusted
+      - name: h2spec on TLS
+        env:
+          H2SPEC: summerwind/h2spec:2.6.0@sha256:5f4a65c30cae8569558ced048b4bfe0dcf01a221e36767ae504ccd8348a7aeb0
+        run: docker run --rm --network host "$H2SPEC" -p 8443 -t -k -P /stream --strict
 
   # every PR builds the 5 targets of both libraries, so a Windows break
   # shows before a release. A release builds only its own package.

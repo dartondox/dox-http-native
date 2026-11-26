@@ -4,7 +4,7 @@ import 'dart:ffi';
 /// the library as the code asset of this file.
 
 /// The ABI version the Dart side expects. Must match `ABI_VERSION` in Rust.
-const int abiVersion = 10;
+const int abiVersion = 11;
 
 @Native<Int32 Function()>(symbol: 'dox_version', isLeaf: true)
 external int doxVersion();
@@ -53,6 +53,23 @@ external int doxBind(
   int maxStreams,
   int resetBurst,
   int resetRate,
+);
+
+/// HTTPS: reads the PEM files at the UTF-8 paths [cert] and [key] and uses
+/// them for each new connection of [handle]. Call it right after
+/// [doxBind], and again to reload. Returns 0, or < 0 and nothing changes:
+/// -1 the certificate file can not be read, -2 it has no certificate, -3
+/// the key file can not be read, -4 it has no key, -5 the key does not fit
+/// the certificate, -6 a path is not UTF-8.
+@Native<Int64 Function(Int64, Pointer<Uint8>, Int64, Pointer<Uint8>, Int64)>(
+  symbol: 'dox_tls',
+)
+external int doxTls(
+  int handle,
+  Pointer<Uint8> cert,
+  int certLength,
+  Pointer<Uint8> key,
+  int keyLength,
 );
 
 @Native<Int32 Function(Int64)>(symbol: 'dox_bound_port', isLeaf: true)

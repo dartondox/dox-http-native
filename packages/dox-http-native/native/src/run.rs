@@ -78,6 +78,7 @@ use tungstenite::protocol::{CloseFrame, Role, WebSocketConfig, WebSocketContext}
 use tungstenite::{Error as WsError, Message, Utf8Bytes};
 
 use crate::h2::{H2, PREFACE};
+use crate::tls::{self, Certs, Tls};
 use crate::{
     BODY_END, CLOSE_WAIT, DRAIN_MAX, EXTERNAL_MIN, Key, MAX_HEAD, MAX_RESERVE, MIN_QUEUE, POST,
     REQ_HEAD, REQUEST_GONE, RES_HEAD, SEND_WAIT, STREAM_GONE, STREAM_SENT, WS_BINARY, WS_CLOSED,
@@ -354,6 +355,8 @@ struct Ws {
 
 struct Conn {
     sock: TcpStream,
+    /// HTTPS: all socket bytes go through rustls (see tls.rs). None: plain
+    tls: Option<Box<Tls>>,
     peer: [u8; 18],
     /// read bytes: `rpos..rlen` is not parsed yet. All of it is initialized.
     /// Empty while nothing waits: then a read uses the core's shared buffer
@@ -722,6 +725,7 @@ impl Drop for Msgs {
 /// waits on a write, Rust writes the buffer itself.
 struct WsIo<'a> {
     sock: &'a TcpStream,
+    tls: &'a mut Option<Box<Tls>>,
     out: &'a mut Vec<u8>,
     /// bytes it may still read in this turn
     left: usize,
@@ -736,7 +740,10 @@ impl Read for WsIo<'_> {
         }
         let max = buf.len().min(self.left);
         let mut sock = self.sock;
-        let k = sock.read(&mut buf[..max])?;
+        let k = match self.tls {
+            None => sock.read(&mut buf[..max])?,
+            Some(t) => tls::read(t, &mut sock, &mut buf[..max])?,
+        };
         self.left -= k;
         Ok(k)
     }
@@ -799,6 +806,7 @@ impl Conn {
     fn new(sock: TcpStream, peer: [u8; 18], now: Instant) -> Self {
         Conn {
             sock,
+            tls: None,
             peer,
             // made by the first read: an idle connection holds no buffer
             rbuf: Vec::new(),
@@ -833,6 +841,28 @@ impl Conn {
         self.wbuf.len() - self.wpos
     }
 
+    /// TLS after the handshake, with no partial request: an end of the
+    /// server gets `close_notify`, so the client sees a clean end.
+    fn clean_tls_close(&self) -> bool {
+        self.tls.as_ref().is_some_and(|t| !t.conn.is_handshaking())
+            && self.rpos == self.rlen
+            && self.body.is_none()
+            && !self.shut
+    }
+
+    /// Bytes that went to the socket so far: plain bytes, or TLS bytes.
+    /// It grows with each socket write, so the timers see progress. Only
+    /// for "did it grow", not for the stream marks (see `written`).
+    fn progress(&self) -> u64 {
+        self.written + self.tls.as_ref().map_or(0, |t| t.sent)
+    }
+
+    /// true while bytes wait for the socket: answer bytes, or TLS records
+    /// of rustls alone (eg. the handshake)
+    fn unsent(&self) -> bool {
+        self.pending() > 0 || self.tls.as_ref().is_some_and(|t| t.conn.wants_write())
+    }
+
     fn live_ws(&self) -> bool {
         self.ws.as_ref().is_some_and(|w| w.live)
     }
@@ -850,6 +880,9 @@ impl Conn {
 
     /// Reads what the socket has. False on a socket error.
     fn read(&mut self) -> bool {
+        if let Some(t) = self.tls.as_mut() {
+            t.left = WS_READ; // see `Tls::left`
+        }
         loop {
             if self.rpos == self.rlen {
                 self.rpos = 0;
@@ -874,7 +907,11 @@ impl Conn {
                     self.rbuf.resize(size, 0);
                 }
             }
-            match (&self.sock).read(&mut self.rbuf[self.rlen..]) {
+            let got = match self.tls.as_mut() {
+                None => (&self.sock).read(&mut self.rbuf[self.rlen..]),
+                Some(t) => tls::read(t, &mut &self.sock, &mut self.rbuf[self.rlen..]),
+            };
+            match got {
                 Ok(0) => {
                     self.eof = true;
                     return true;
@@ -883,7 +920,8 @@ impl Conn {
                     self.rlen += k;
                     // a short read: the socket is empty now. New bytes give
                     // a new edge, so no extra read that ends in WouldBlock.
-                    if self.rlen < self.rbuf.len() && !self.hup {
+                    // Not on TLS: rustls may have read only a part of it.
+                    if self.rlen < self.rbuf.len() && !self.hup && self.tls.is_none() {
                         return true;
                     }
                 }
@@ -930,7 +968,14 @@ impl Conn {
 
     /// Writes `wbuf`. False on a socket error.
     fn flush(&mut self) -> bool {
-        while self.wpos < self.wbuf.len() {
+        if let Some(t) = self.tls.as_mut() {
+            let Some(k) = tls::write(t, &mut &self.sock, &self.wbuf[self.wpos..]) else {
+                return false;
+            };
+            self.wpos += k;
+            self.written += k as u64;
+        }
+        while self.tls.is_none() && self.wpos < self.wbuf.len() {
             match (&self.sock).write(&self.wbuf[self.wpos..]) {
                 Ok(0) => return false,
                 Ok(k) => {
@@ -1035,6 +1080,13 @@ impl Conn {
         let k = data.len().min(PREFACE.len());
         if data[..k] != PREFACE[..k] {
             self.sniff = false;
+            if self.tls.is_some() {
+                // ALPN said h2, but this is no HTTP/2 preface: close
+                self.rpos = self.rlen;
+                self.closing = true;
+                self.shut = true;
+                return true;
+            }
             return false;
         }
         if k < PREFACE.len() {
@@ -1101,6 +1153,10 @@ impl Conn {
         date: &[u8],
         now: Instant,
     ) -> Result<(), usize> {
+        // TLS: the handshake picks the protocol (ALPN), not the first bytes
+        if let Some(h2) = self.tls.as_mut().and_then(|t| t.pick()) {
+            self.sniff = h2;
+        }
         if self.sniff && self.sniff(idx, lim) {
             return Ok(());
         }
@@ -1586,6 +1642,8 @@ struct Core {
     /// lists reused per call
     dead: Vec<usize>,
     touched: Vec<usize>,
+    /// HTTPS: the certificate for new connections (see tls.rs)
+    certs: Option<Arc<Certs>>,
 }
 
 impl Core {
@@ -1629,6 +1687,7 @@ impl Core {
             scratch: Vec::new(),
             dead: Vec::new(),
             touched: Vec::new(),
+            certs: None,
         })
     }
 
@@ -1798,6 +1857,13 @@ impl Core {
                             self.kill(idx);
                         }
                     }
+                    // TLS keep-alive idle (no partial head): close with
+                    // `close_notify` first. The send stall timer bounds it.
+                    Due::Head if c.clean_tls_close() => {
+                        c.closing = true;
+                        c.shut = true;
+                        self.service(idx);
+                    }
                     _ => self.kill(idx),
                 },
                 _ => {}
@@ -1848,7 +1914,7 @@ impl Core {
                         // close is only seen here, see `Due::Gone`
                         self.arm_timer(idx);
                     }
-                    if writable && self.conns[idx].pending() > 0 {
+                    if writable && self.conns[idx].unsent() {
                         self.service(idx);
                     }
                 }
@@ -1878,6 +1944,13 @@ impl Core {
             }
             match listener.accept() {
                 Ok((mut sock, addr)) => {
+                    let tls = match &self.certs {
+                        None => None,
+                        Some(certs) => match certs.accept() {
+                            Some(t) => Some(t),
+                            None => continue, // no TLS state: drop it
+                        },
+                    };
                     let _ = sock.set_nodelay(true);
                     // Linux copies the keep-alive of the listener (see
                     // `Core::new`) to the accepted socket. macOS copies
@@ -1904,7 +1977,9 @@ impl Core {
                         continue;
                     }
                     let mut conn = Conn::new(sock, peer_bytes(addr), self.now);
-                    conn.sniff = self.limits.http2;
+                    // TLS: ALPN picks HTTP/2 after the handshake (`parse`)
+                    conn.sniff = self.limits.http2 && tls.is_none();
+                    conn.tls = tls;
                     conn.queued = true; // the request is often there already
                     entry.insert(conn);
                     self.ready.push_back(idx);
@@ -1961,6 +2036,7 @@ impl Core {
             let Conn {
                 ws,
                 sock,
+                tls,
                 wbuf,
                 wpos,
                 ..
@@ -1973,6 +2049,7 @@ impl Core {
                 ws.bytes = ws.bytes.saturating_sub(m.len());
                 let mut io = WsIo {
                     sock,
+                    tls: &mut *tls,
                     out: &mut *wbuf,
                     left: 0,
                 };
@@ -1987,13 +2064,14 @@ impl Core {
                 }
             }
         }
-        let before = c.written;
+        let before = c.progress();
+        let written = c.written;
         let data = c.h2.as_ref().map_or(0, |h| h.data_sent);
         loop {
             if let Some(h2) = c.h2.as_mut() {
                 h2.send(&mut c.wbuf, c.wpos, c.written, &mut c.marks);
             }
-            if c.pending() > 0 && !c.flush() {
+            if c.unsent() && !c.flush() {
                 self.kill(idx);
                 return;
             }
@@ -2002,6 +2080,11 @@ impl Core {
                 break;
             }
         }
+        // `moved`: any socket write, also TLS records of rustls alone (eg.
+        // a KeyUpdate). Only progress for the send stall. `wrote`: answer
+        // bytes, which alone count as activity (idle time, h2 ACKs out).
+        let moved = c.progress() > before;
+        let wrote = c.written > written;
         if let Some(h2) = c.h2.as_mut() {
             h2.stall_mark(now);
             for (seq, kind, code, data) in h2.to_dart.drain(..) {
@@ -2024,13 +2107,15 @@ impl Core {
                 self.streams.remove(&sid);
             }
             c.shut |= h2.over();
-            if c.written > before {
+            if wrote {
                 h2.flushed(); // our ACKs are on their way
             }
         }
         // a write starts to wait: make sure its timer runs
         let blocked = c.h2.as_ref().is_some_and(|h| h.blocked());
-        let wait_starts = c.stuck.is_none() && (c.pending() > 0 || blocked);
+        // TLS: the records of a clean close (`close_notify`) wait too
+        let waits = c.pending() > 0 || (c.shut && c.unsent());
+        let wait_starts = c.stuck.is_none() && (waits || blocked);
         while let Some(&(end, sid, n)) = c.marks.front() {
             if end > c.written {
                 break;
@@ -2042,21 +2127,21 @@ impl Core {
         // see `due`) counts from the last write. HTTP/2: PING and SETTINGS
         // ACKs do not count, only streams that open, close or send.
         let active = match c.h2.as_mut() {
-            Some(h2) => std::mem::take(&mut h2.stirred) || (c.written > before && h2.open() > 0),
-            None => c.written > before,
+            Some(h2) => std::mem::take(&mut h2.stirred) || (wrote && h2.open() > 0),
+            None => wrote,
         };
         if active {
             c.since = now;
         }
         // HTTP/2: a closed window with data waiting also counts as stuck
-        if c.pending() == 0 && !blocked {
+        if !waits && !blocked {
             c.stuck = None;
         } else if c.stuck.is_none()
             // a blocked HTTP/2 window: ACKs and PINGs are no progress, only DATA is
             || if blocked {
                 c.h2.as_ref().is_some_and(|h| h.data_sent > data)
             } else {
-                c.written > before
+                moved
             }
         {
             c.stuck = Some(now);
@@ -2082,6 +2167,23 @@ impl Core {
         }
         let mut linger = false;
         if c.pending() == 0 && c.shut && c.linger.is_none() {
+            if let Some(t) = c.tls.as_mut() {
+                // once: rustls sends it only one time. Close the socket
+                // only when it is out, else the client sees a cut. A client
+                // that does not read gets the send stall timer.
+                t.conn.send_close_notify();
+                if !c.flush() {
+                    self.kill(idx);
+                    return;
+                }
+                if c.unsent() {
+                    if c.stuck.is_none() {
+                        c.stuck = Some(now);
+                        self.arm_timer(idx);
+                    }
+                    return;
+                }
+            }
             if self.stopped || c.ws.is_some() {
                 self.kill(idx);
                 return;
@@ -2094,6 +2196,11 @@ impl Core {
         } else if c.finished() && !go_on {
             // not when it reads on: requests that the client sent before it
             // closed can wait in the buffer (more than MAX_INFLIGHT)
+            if c.clean_tls_close() {
+                // the client closed its side: end ours with `close_notify`
+                c.shut = true;
+                return self.service(idx);
+            }
             self.kill(idx);
             return;
         }
@@ -2132,13 +2239,18 @@ impl Core {
         let Conn {
             ws,
             sock,
+            tls,
             wbuf,
             wpos,
             ..
         } = c;
         let ws = ws.as_mut().unwrap();
+        if let Some(t) = tls.as_mut() {
+            t.left = WS_READ; // see `Tls::left`
+        }
         let mut io = WsIo {
             sock,
+            tls,
             out: wbuf,
             left: WS_READ,
         };
@@ -2170,7 +2282,8 @@ impl Core {
                 Ok(_) => {}
                 Err(WsError::Io(e)) if e.kind() == ErrorKind::WouldBlock => {
                     // the share of this turn is used up: more may wait
-                    again = io.left == 0;
+                    again = io.left == 0
+                        || io.tls.as_mut().is_some_and(|t| std::mem::take(&mut t.more));
                     break None;
                 }
                 Err(WsError::Io(e)) if e.kind() == ErrorKind::Interrupted => {}
@@ -2203,6 +2316,7 @@ impl Core {
                 ws.code = Some((u16::from(code), Vec::new()));
                 let mut io = WsIo {
                     sock: &c.sock,
+                    tls: &mut c.tls,
                     out: &mut c.wbuf,
                     left: 0,
                 };
@@ -2707,6 +2821,11 @@ impl Core {
                     self.kill(idx);
                     continue;
                 }
+                if c.tls.as_mut().is_some_and(|t| std::mem::take(&mut t.more)) {
+                    // the next call reads on (see `Tls::left`)
+                    c.queued = true;
+                    self.ready.push_back(idx);
+                }
                 if c.finished() {
                     self.kill(idx);
                 } else if c.eof {
@@ -2741,10 +2860,14 @@ impl Core {
             let c = &mut self.conns[idx];
             c.queued = false;
             self.ready.pop_front();
+            let more = c.tls.as_mut().is_some_and(|t| std::mem::take(&mut t.more));
             if c.eof || c.h2.is_some() || c.body.as_ref().is_some_and(|b| b.last == self.now) {
                 self.arm_timer(idx); // `Due::Gone`, `Due::Body` or `Due::H2Body`
             }
             self.service(idx);
+            if more {
+                self.queue(idx); // TLS read budget used up: the next call reads on
+            }
         }
         self.kill_dead();
         // the WebSocket and stream messages, whole records only
@@ -3160,6 +3283,51 @@ pub extern "C" fn dox_bind(
     };
     *native.helper.lock().unwrap() = Some(t);
     Arc::into_raw(native) as i64
+}
+
+/// HTTPS: reads the certificate chain and the key (PEM files, UTF-8
+/// paths) and uses them for each new connection. The first call makes the
+/// port a TLS port. Dart makes it right after `dox_bind`, before the first
+/// `dox_run`, so no connection is accepted without TLS. A later call is a
+/// reload: open connections keep their certificate. Servers of this
+/// process with the same files get the new certificate too (see tls.rs).
+/// Returns 0, or < 0 and nothing changes: -1 the certificate file can not
+/// be read, -2 it has no certificate, -3 the key file can not be read,
+/// -4 it has no key, -5 rustls refused the pair (eg. a key of another
+/// certificate), -6 a path is not UTF-8.
+///
+/// # Safety
+/// `handle` must come from `dox_bind` and not be unbound. `cert` and `key`
+/// must point to `cert_len` and `key_len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dox_tls(
+    handle: i64,
+    cert: *const u8,
+    cert_len: i64,
+    key: *const u8,
+    key_len: i64,
+) -> i64 {
+    let s = unsafe { &*(handle as *const Native) };
+    if cert.is_null() || key.is_null() {
+        return -6;
+    }
+    let path = |p: *const u8, n: i64| {
+        let b = unsafe { std::slice::from_raw_parts(p, n.max(0) as usize) };
+        std::str::from_utf8(b).map(std::path::PathBuf::from)
+    };
+    let (Ok(cert), Ok(key)) = (path(cert, cert_len), path(key, key_len)) else {
+        return -6;
+    };
+    // the files are read without the core: a slow disk must not hold up
+    // the idle helper or Dart
+    let http2 = s.core.lock().unwrap().limits.http2;
+    match Certs::share(&cert, &key, http2) {
+        Ok(certs) => {
+            s.core.lock().unwrap().certs = Some(certs);
+            0
+        }
+        Err(code) => code,
+    }
 }
 
 /// The port of a server (useful for port 0).
@@ -4254,6 +4422,112 @@ pub mod fuzz {
     /// When Dart does not answer, the output hangs only on the bytes, not
     /// on how they came in: all at once or in pieces must give the same.
     /// With answers, the frames must be valid.
+    /// A fake socket for [tls_handshake]: gives `data` in pieces (each
+    /// piece ends in WouldBlock, like an empty socket) and drops writes.
+    struct Pieces<'a> {
+        data: &'a [u8],
+        pos: usize,
+        /// where the current piece ends
+        end: usize,
+        rng: u32,
+        /// 0: all at once
+        step: usize,
+    }
+
+    impl Read for Pieces<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos == self.data.len() {
+                return Ok(0);
+            }
+            if self.pos == self.end {
+                return Err(ErrorKind::WouldBlock.into());
+            }
+            let k = buf.len().min(self.end - self.pos);
+            buf[..k].copy_from_slice(&self.data[self.pos..self.pos + k]);
+            self.pos += k;
+            Ok(k)
+        }
+    }
+
+    impl Write for Pieces<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Pieces<'_> {
+        /// The next piece: true when there is one.
+        fn next_piece(&mut self) -> bool {
+            if self.end == self.data.len() {
+                return false;
+            }
+            self.end = if self.step == 0 {
+                self.data.len()
+            } else {
+                (self.end + 1 + next(&mut self.rng) % self.step).min(self.data.len())
+            };
+            true
+        }
+    }
+
+    /// Feeds `p` to a new TLS connection the way `Conn::read` does, and
+    /// writes its answers like `Conn::flush`. Returns (it failed, the
+    /// handshake is over, plain text bytes).
+    fn tls_feed(p: &mut Pieces) -> (bool, bool, usize) {
+        static CFG: OnceLock<Arc<rustls::ServerConfig>> = OnceLock::new();
+        let cfg = CFG.get_or_init(|| {
+            let cert = include_bytes!("../../test/certs/cert1.pem");
+            let key = include_bytes!("../../test/certs/key1.pem");
+            tls::config(tls::Keys::alone(tls::certified(cert, key).unwrap()), true)
+        });
+        let mut t = Tls::new(rustls::ServerConnection::new(cfg.clone()).unwrap());
+        let mut buf = vec![0u8; READ_ROOM];
+        let mut plain = 0;
+        while p.next_piece() {
+            loop {
+                match tls::read(&mut t, p, &mut buf) {
+                    Ok(0) => return (false, !t.conn.is_handshaking(), plain),
+                    Ok(k) => plain += k,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(_) => return (true, false, plain),
+                }
+            }
+            // the answers (eg. ServerHello): rustls must take and give them
+            assert_eq!(tls::write(&mut t, p, b"ok"), Some(2));
+            assert!(!t.conn.wants_write());
+            let _ = t.pick();
+        }
+        (false, !t.conn.is_handshaking(), plain)
+    }
+
+    /// Random bytes as the client side of a TLS connection, in pieces
+    /// (byte 0 picks their size). No panic, no hang, and the pieces must
+    /// not change the result.
+    pub fn tls_handshake(data: &[u8]) {
+        let [seed, body @ ..] = data else {
+            return;
+        };
+        let mut whole = Pieces {
+            data: body,
+            pos: 0,
+            end: 0,
+            rng: 1,
+            step: 0,
+        };
+        let mut parts = Pieces {
+            data: body,
+            pos: 0,
+            end: 0,
+            rng: u32::from(*seed) | 1,
+            step: 64,
+        };
+        assert_eq!(tls_feed(&mut whole), tls_feed(&mut parts));
+    }
+
     pub fn h2_conn(data: &[u8]) {
         let [seed, small, size, rest @ ..] = data else {
             return;

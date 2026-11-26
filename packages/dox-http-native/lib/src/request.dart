@@ -121,7 +121,8 @@ class NativeRequest extends Stream<Uint8List> implements HttpRequest {
       return absolute;
     }
     String host = headers.value(HttpHeaders.hostHeader) ?? '127.0.0.1';
-    return Uri.parse('http://$host$_target');
+    String scheme = server.tls == null ? 'http' : 'https';
+    return Uri.parse('$scheme://$host$_target');
   }
 
   @override
