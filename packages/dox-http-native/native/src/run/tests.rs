@@ -175,7 +175,13 @@ fn turn(core: &mut Core, inb: &mut [u8], out: &mut Vec<u8>, budget: i64) -> Vec<
 /// Runs the test app on a thread. Returns the port and every record that
 /// is not a request.
 fn serve(lim: Limits) -> (u16, Arc<Mutex<Vec<Rec>>>) {
-    let (mut core, port) = new_core(lim);
+    let (core, port) = new_core(lim);
+    (port, run_app(core))
+}
+
+/// Runs the test app on `core` on a thread. Returns every record that is
+/// not a request.
+fn run_app(mut core: Core) -> Arc<Mutex<Vec<Rec>>> {
     let log = Arc::new(Mutex::new(Vec::new()));
     let seen = log.clone();
     std::thread::spawn(move || {
@@ -189,7 +195,7 @@ fn serve(lim: Limits) -> (u16, Arc<Mutex<Vec<Rec>>>) {
             }
         }
     });
-    (port, log)
+    log
 }
 
 fn connect(port: u16) -> StdStream {
@@ -2027,4 +2033,270 @@ fn write_then_close(s: &StdStream, bytes: Vec<u8>) -> std::thread::JoinHandle<()
         w.write_all(&bytes).unwrap();
         w.shutdown(std::net::Shutdown::Write).unwrap();
     })
+}
+
+// ---- TLS (HTTPS) ----
+
+use crate::tls::tests::{CA, path};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, ServerName};
+
+type TlsStream<S = StdStream> = rustls::StreamOwned<rustls::ClientConnection, S>;
+
+/// A test core with the certificate `cert1.pem`.
+fn tls_core(lim: Limits) -> (Core, u16) {
+    let (mut core, port) = new_core(lim);
+    let certs = Certs::share(&path("cert1.pem"), &path("key1.pem"), lim.http2).unwrap();
+    core.certs = Some(certs);
+    (core, port)
+}
+
+fn serve_tls(lim: Limits) -> (u16, Arc<Mutex<Vec<Rec>>>) {
+    let (core, port) = tls_core(lim);
+    (port, run_app(core))
+}
+
+/// A client that trusts the test CA and offers `alpn`.
+fn tls_client(alpn: &[&[u8]]) -> rustls::ClientConnection {
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(CertificateDer::from_pem_slice(CA).unwrap())
+        .unwrap();
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut cfg = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    cfg.alpn_protocols = alpn.iter().map(|a| a.to_vec()).collect();
+    let name = ServerName::try_from("localhost").unwrap();
+    rustls::ClientConnection::new(Arc::new(cfg), name).unwrap()
+}
+
+fn tls_connect(port: u16, alpn: &[&[u8]]) -> TlsStream {
+    rustls::StreamOwned::new(tls_client(alpn), connect(port))
+}
+
+/// Sends `req` over TLS and reads until the server closes. Err when it
+/// closes without `close_notify`.
+fn tls_send(port: u16, alpn: &[&[u8]], req: &[u8]) -> (std::io::Result<String>, Option<Vec<u8>>) {
+    let mut s = tls_connect(port, alpn);
+    s.write_all(req).unwrap();
+    let mut out = Vec::new();
+    let r = s.read_to_end(&mut out);
+    let alpn = s.conn.alpn_protocol().map(<[u8]>::to_vec);
+    (r.map(|_| String::from_utf8_lossy(&out).into_owned()), alpn)
+}
+
+/// HTTP/1.1 with no ALPN and with ALPN `http/1.1`. The server ends with
+/// `close_notify` (a clean `read_to_end`).
+#[test]
+fn tls_http1_with_and_without_alpn() {
+    let (port, _) = serve_tls(limits());
+    let req = b"GET /hi HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
+    for (alpn, want) in [
+        (&[][..], None),
+        (&[&b"http/1.1"[..]][..], Some(b"http/1.1".to_vec())),
+    ] {
+        let (got, picked) = tls_send(port, alpn, req);
+        let got = got.expect("close_notify");
+        assert!(
+            got.starts_with("HTTP/1.1 200") && got.ends_with("/hi"),
+            "{got:?}"
+        );
+        assert_eq!(picked, want);
+    }
+}
+
+/// ALPN `h2`: the connection speaks HTTP/2, the preface comes after the
+/// handshake. A client that offers only `h2` to a port without HTTP/2
+/// fails the handshake.
+#[test]
+fn tls_alpn_h2() {
+    use crate::h2::frame;
+    use crate::h2::hpack::encode_field;
+    let (port, _) = serve_tls(limits());
+    let mut s = tls_connect(port, &[b"h2", b"http/1.1"]);
+    let mut req = PREFACE.to_vec();
+    frame::write(&mut req, frame::SETTINGS, 0, 0, b"");
+    let mut block = Vec::new();
+    for (n, v) in [(":method", "GET"), (":scheme", "https"), (":path", "/h2")] {
+        encode_field(n.as_bytes(), v.as_bytes(), &mut block);
+    }
+    frame::write_headers(&mut req, 1, &block, true, 16 * 1024);
+    s.write_all(&req).unwrap();
+    assert_eq!(s.conn.alpn_protocol(), Some(&b"h2"[..]));
+    let (mut got, mut body, mut p) = (Vec::new(), Vec::new(), 0);
+    'read: loop {
+        let mut buf = [0u8; 4096];
+        let k = s.read(&mut buf).unwrap();
+        assert!(k > 0, "closed");
+        got.extend_from_slice(&buf[..k]);
+        while let Some(h) = frame::read_head(&got[p..]) {
+            let end = p + frame::HEAD + h.len;
+            if end > got.len() {
+                break;
+            }
+            if h.kind == frame::DATA && h.id == 1 {
+                body.extend_from_slice(&got[p + frame::HEAD..end]);
+            }
+            p = end;
+            if h.id == 1 && h.flags & frame::END_STREAM != 0 {
+                break 'read;
+            }
+        }
+    }
+    assert_eq!(body, b"/h2");
+
+    let (port, _) = serve_tls(Limits {
+        http2: false,
+        ..limits()
+    });
+    let mut s = tls_connect(port, &[b"h2"]);
+    let got = s.write_all(b"x").and_then(|_| s.read(&mut [0]));
+    assert!(got.is_err(), "{got:?}");
+}
+
+/// Plain HTTP on a TLS port gets no HTTP answer: the connection closes.
+#[test]
+fn tls_port_refuses_plain_http() {
+    let (port, _) = serve_tls(limits());
+    let start = Instant::now();
+    let got = send(port, b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+    assert!(!got.starts_with("HTTP"), "{got:?}");
+    assert!(start.elapsed() < Duration::from_secs(2), "not closed");
+}
+
+/// Writes one byte at a time with a pause: a handshake in many small
+/// pieces, and slow.
+struct Trickle(StdStream);
+
+impl Read for Trickle {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl Write for Trickle {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        std::thread::sleep(Duration::from_millis(1));
+        self.0.write(&buf[..buf.len().min(1)])
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+#[test]
+fn tls_handshake_in_pieces() {
+    let (port, _) = serve_tls(limits());
+    let mut s = rustls::StreamOwned::new(tls_client(&[]), Trickle(connect(port)));
+    s.write_all(b"GET /slow HTTP/1.1\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut out = Vec::new();
+    s.read_to_end(&mut out).unwrap();
+    let got = String::from_utf8_lossy(&out);
+    assert!(
+        got.starts_with("HTTP/1.1 200") && got.ends_with("/slow"),
+        "{got:?}"
+    );
+}
+
+/// A handshake that does not end in the idle timeout closes.
+#[test]
+fn tls_handshake_times_out() {
+    let (port, _) = serve_tls(Limits {
+        idle: Duration::from_millis(200),
+        ..limits()
+    });
+    let mut s = connect(port);
+    // half a record head
+    s.write_all(&[0x16, 0x03]).unwrap();
+    let start = Instant::now();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    assert!(start.elapsed() < Duration::from_secs(2), "not closed");
+}
+
+/// WebSocket over TLS: an echo, and 8 MiB from Dart to a client (more
+/// than the rustls buffer, so the write waits for the socket).
+#[test]
+fn tls_websocket() {
+    let (port, _) = serve_tls(limits());
+    let (mut ws, res) = tungstenite::client("wss://localhost/ws", tls_connect(port, &[])).unwrap();
+    assert_eq!(res.status(), 101);
+    ws.send(Message::text("hi")).unwrap();
+    assert_eq!(ws.read().unwrap(), Message::text("hi"));
+    let (mut ws, _) = tungstenite::client("wss://localhost/big", tls_connect(port, &[])).unwrap();
+    match ws.read().unwrap() {
+        Message::Binary(b) => assert_eq!(b.len(), 8 << 20),
+        m => panic!("{m:?}"),
+    }
+}
+
+/// A streamed answer over TLS.
+#[test]
+fn tls_streamed_answer() {
+    let (port, _) = serve_tls(limits());
+    let (got, _) = tls_send(
+        port,
+        &[],
+        b"GET /stream HTTP/1.1\r\nConnection: close\r\n\r\n",
+    );
+    let got = got.unwrap();
+    assert!(got.contains("transfer-encoding: chunked"), "{got:?}");
+    assert!(got.ends_with("2\r\nab\r\n3\r\ncde\r\n0\r\n\r\n"), "{got:?}");
+}
+
+/// The DER of the first certificate the server showed.
+fn shown(s: &TlsStream) -> Vec<u8> {
+    s.conn.peer_certificates().unwrap()[0].to_vec()
+}
+
+fn der(pem: &[u8]) -> Vec<u8> {
+    CertificateDer::from_pem_slice(pem).unwrap().to_vec()
+}
+
+/// A reload gives the new certificate to new connections. An open one
+/// keeps working. A bad file changes nothing.
+#[test]
+fn tls_reload() {
+    let dir = std::env::temp_dir().join(format!("dox-tls-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));
+    std::fs::copy(path("cert1.pem"), &cert).unwrap();
+    std::fs::copy(path("key1.pem"), &key).unwrap();
+    let (mut core, port) = new_core(limits());
+    core.certs = Some(Certs::share(&cert, &key, true).unwrap());
+    let _log = run_app(core);
+    let get = b"GET /a HTTP/1.1\r\nHost: a\r\n\r\n";
+    let answer = |s: &mut TlsStream| {
+        s.write_all(get).unwrap();
+        let mut buf = [0u8; 4096];
+        let k = s.read(&mut buf).unwrap();
+        assert!(buf[..k].starts_with(b"HTTP/1.1 200"));
+    };
+    let mut old = tls_connect(port, &[]);
+    answer(&mut old);
+    let cert1 = der(&std::fs::read(path("cert1.pem")).unwrap());
+    let cert2 = der(&std::fs::read(path("cert2.pem")).unwrap());
+    assert_eq!(shown(&old), cert1);
+
+    // reload: what `dox_tls` does with the same files
+    std::fs::copy(path("cert2.pem"), &cert).unwrap();
+    std::fs::copy(path("key2.pem"), &key).unwrap();
+    Certs::share(&cert, &key, true).unwrap();
+    let mut new = tls_connect(port, &[]);
+    answer(&mut new);
+    assert_eq!(shown(&new), cert2);
+    answer(&mut old);
+
+    // a bad file: an error, and the server keeps the certificate
+    std::fs::write(&cert, b"junk").unwrap();
+    assert_eq!(Certs::share(&cert, &key, true).err(), Some(tls::CERT_BAD));
+    let mut after = tls_connect(port, &[]);
+    answer(&mut after);
+    assert_eq!(shown(&after), cert2);
+    let _ = std::fs::remove_dir_all(dir);
 }

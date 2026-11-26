@@ -1,3 +1,15 @@
+## Unreleased
+
+- New: HTTPS without a proxy. It is off by default. When it is off, a plain connection uses the same code as before.
+  - `NativeHttpServer.bind(port, tls: TlsOptions(certificatePath: ..., keyPath: ...))` makes the port a TLS port. Rust does the TLS work with rustls and the `ring` crypto provider. There is no OpenSSL.
+  - A bad certificate file or key file throws a `TlsException` at `bind`.
+  - TLS 1.2 and TLS 1.3. With `http2: true`, ALPN selects HTTP/2 or HTTP/1.1. HTTP/1.1, HTTP/2, WebSocket and streamed answers work on the TLS port.
+  - A plain HTTP client on the TLS port gets no answer. The handshake must end in `idleTimeout`.
+  - `requestedUri` has the `https` scheme. A clean close sends the TLS `close_notify` alert.
+  - `server.reloadCertificate()` reads the two files again. New connections get the new certificate, and open connections keep the old certificate. A bad file throws a `TlsException`, and the server keeps the old certificate. All servers in the process that use the same files get the new certificate.
+  - Not included: ACME, a redirect from port 80, mTLS and SNI.
+- ABI version 11 (was 10). The new function is `dox_tls`. A library of an older version does not load. From pub.dev, the correct library downloads automatically. In a git checkout, run `cargo build --release` in `native/`.
+
 ## 3.2.5
 
 - Tests: the HTTP server tests of the Dart SDK (`tests/standalone/io`) now run against this server, in `test/dart_io/`.
