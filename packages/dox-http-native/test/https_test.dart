@@ -220,6 +220,22 @@ void main() {
       bindWith(tls.certificatePath, '${made.path}/key2.pem'),
       throwsA(isA<TlsException>()),
     );
+    // the check alone: the same errors, no server
+    tls.check();
+    expect(
+      TlsOptions(
+        certificatePath: '${dir.path}/none.pem',
+        keyPath: tls.keyPath,
+      ).check,
+      throwsA(isA<TlsException>()),
+    );
+    expect(
+      TlsOptions(
+        certificatePath: tls.certificatePath,
+        keyPath: '${made.path}/key2.pem',
+      ).check,
+      throwsA(isA<TlsException>()),
+    );
     // a server without tls has nothing to reload
     NativeHttpServer plain = await NativeHttpServer.bind(
       0,

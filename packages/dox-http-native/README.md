@@ -140,6 +140,19 @@ How it works:
 - `request.requestedUri` has the `https` scheme.
 - At a clean close, the server sends the TLS `close_notify` alert. When the server cuts a connection (for example after an error), it does not send `close_notify`. Thus the client can see that the data is not complete.
 
+### Check the files before the start
+
+Use `check()` to find a bad file before your app starts its isolates. Then the app fails one time, with one clear error.
+
+```dart
+TlsOptions tls = TlsOptions(certificatePath: 'cert.pem', keyPath: 'key.pem');
+tls.check();
+```
+
+- The method reads the two files as `bind` reads them.
+- If a file is bad, or the key is of a different certificate, the method throws a `TlsException`.
+- The method opens no port and changes no server.
+
 ### Reload the certificate
 
 Use `reloadCertificate()` to get a new certificate without a restart. An example is after certbot renews the certificate.

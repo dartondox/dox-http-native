@@ -7,8 +7,9 @@
   - A plain HTTP client on the TLS port gets no answer. The handshake must end in `idleTimeout`.
   - `requestedUri` has the `https` scheme. A clean close sends the TLS `close_notify` alert.
   - `server.reloadCertificate()` reads the two files again. New connections get the new certificate, and open connections keep the old certificate. A bad file throws a `TlsException`, and the server keeps the old certificate. All servers in the process that use the same files get the new certificate.
+  - `TlsOptions.check()` reads the two files as `bind` reads them, and throws a `TlsException` for a bad file. It opens no port. Use it to find a bad file before an app starts its isolates.
   - Not included: ACME, a redirect from port 80, mTLS and SNI.
-- ABI version 11 (was 10). The new function is `dox_tls`. A library of an older version does not load. From pub.dev, the correct library downloads automatically. In a git checkout, run `cargo build --release` in `native/`.
+- ABI version 11 (was 10). The new functions are `dox_tls` and `dox_tls_check`. A library of an older version does not load. From pub.dev, the correct library downloads automatically. In a git checkout, run `cargo build --release` in `native/`.
 
 ## 3.2.5
 
