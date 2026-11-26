@@ -1,4 +1,4 @@
-## Unreleased
+## 3.2.6
 
 - New: HTTPS without a proxy. It is off by default. When it is off, a plain connection uses the same code as before.
   - `NativeHttpServer.bind(port, tls: TlsOptions(certificatePath: ..., keyPath: ...))` makes the port a TLS port. Rust does the TLS work with rustls and the `ring` crypto provider. There is no OpenSSL.
