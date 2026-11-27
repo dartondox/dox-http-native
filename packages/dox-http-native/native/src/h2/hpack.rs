@@ -402,7 +402,7 @@ pub(super) fn write_int(mut value: usize, prefix: u32, flags: u8, out: &mut Vec<
 }
 
 /// A plain (not Huffman) string literal.
-fn write_str(s: &[u8], out: &mut Vec<u8>) {
+pub(super) fn write_str(s: &[u8], out: &mut Vec<u8>) {
     write_int(s.len(), 7, 0x00, out);
     out.extend_from_slice(s);
 }
