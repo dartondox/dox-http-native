@@ -45,6 +45,13 @@ jobs:
           dart pub get
           dart format --output=none --set-exit-if-changed .
           dart analyze --fatal-infos .
+      # the checks of pub.dev (eg. a private key in a file), so a release
+      # does not fail at the publish step
+      - name: Publish dry run
+        run: |
+          for p in packages/dox-http-native packages/dox-http-client; do
+            (cd "$p" && dart pub publish --dry-run)
+          done
 
   # also on a release tag: a red test stops the build, the release and the publish
   test-native:
