@@ -385,6 +385,20 @@ pub(crate) fn encode_field(name: &[u8], value: &[u8], out: &mut Vec<u8>) {
     write_str(value, out);
 }
 
+/// A literal with incremental indexing: the client adds the field to its
+/// dynamic table, and later blocks name it with one index byte.
+pub(crate) fn encode_insert(name: &[u8], value: &[u8], out: &mut Vec<u8>) {
+    let index = STATIC
+        .iter()
+        .position(|(n, _)| *n == name)
+        .map_or(0, |i| i + 1);
+    write_int(index, 6, 0x40, out);
+    if index == 0 {
+        write_str(name, out);
+    }
+    write_str(value, out);
+}
+
 /// Writes an integer with an N-bit prefix and the `flags` bits above it.
 pub(super) fn write_int(mut value: usize, prefix: u32, flags: u8, out: &mut Vec<u8>) {
     let mask = (1usize << prefix) - 1;
