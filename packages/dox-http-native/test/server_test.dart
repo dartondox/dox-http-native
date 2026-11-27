@@ -33,6 +33,10 @@ void handle(HttpRequest req) async {
       res.write('{"a":1}');
     case '/long':
       res.write('a' * 1000);
+    case '/json-long':
+      // only the content type changes: the headers stay the defaults
+      res.headers.contentType = ContentType.json;
+      res.write('{"a":"${'a' * 1000}"}');
     case '/jpeg':
       res.headers.contentType = ContentType('image', 'jpeg');
       res.add(List<int>.filled(1000, 7));
@@ -1029,6 +1033,105 @@ void main() {
     );
     expect(plain.toLowerCase(), contains('vary: accept-encoding'));
     expect(plain, endsWith('a' * 1000));
+    await zip.close();
+  });
+
+  /// the count of header lines `name: ...` in a raw answer
+  int lines(String answer, String name) {
+    String head = answer.substring(0, answer.indexOf('\r\n\r\n'));
+    return head
+        .toLowerCase()
+        .split('\r\n')
+        .where((String l) => l.startsWith('$name:'))
+        .length;
+  }
+
+  /// [body] of a raw answer, gunzipped when it says gzip
+  String bodyOf(String answer) {
+    int at = answer.indexOf('\r\n\r\n') + 4;
+    List<int> body = latin1.encode(answer.substring(at));
+    return answer.toLowerCase().contains('content-encoding: gzip')
+        ? utf8.decode(gzip.decode(body))
+        : utf8.decode(body);
+  }
+
+  const String gzipGet = 'Accept-Encoding: gzip\r\nConnection: close\r\n\r\n';
+
+  test('compress: a JSON answer with the default headers', () async {
+    NativeHttpServer zip = await start(0)
+      ..autoCompress = true;
+    for (int i = 0; i < 3; i++) {
+      String out = await raw(zip.port, 'GET /json-long HTTP/1.1\r\n$gzipGet');
+      expect(lines(out, 'vary'), 1);
+      expect(lines(out, 'content-encoding'), 1);
+      expect(lines(out, 'content-type'), 1);
+      expect(out.toLowerCase(), contains('content-type: application/json'));
+      expect(bodyOf(out), '{"a":"${'a' * 1000}"}');
+      String plain = await raw(
+        zip.port,
+        'GET /json-long HTTP/1.1\r\nConnection: close\r\n\r\n',
+      );
+      expect(lines(plain, 'vary'), 1);
+      expect(lines(plain, 'content-encoding'), 0);
+      expect(bodyOf(plain), '{"a":"${'a' * 1000}"}');
+    }
+    await zip.close();
+  });
+
+  test('compress: default headers with Vary', () async {
+    NativeHttpServer zip = await start(0)
+      ..autoCompress = true;
+    // it names Accept-Encoding already: no second line
+    zip.defaultResponseHeaders.set(HttpHeaders.varyHeader, 'Accept-Encoding');
+    for (String path in <String>['/long', '/json-long']) {
+      String out = await raw(zip.port, 'GET $path HTTP/1.1\r\n$gzipGet');
+      expect(lines(out, 'vary'), 1, reason: path);
+      expect(lines(out, 'content-encoding'), 1, reason: path);
+    }
+    // another Vary: Accept-Encoding is added. The change of the defaults
+    // after the first answers is seen.
+    zip.defaultResponseHeaders.set(HttpHeaders.varyHeader, 'Origin');
+    for (String path in <String>['/long', '/json-long']) {
+      String out = await raw(zip.port, 'GET $path HTTP/1.1\r\n$gzipGet');
+      expect(out.toLowerCase(), contains('vary: origin'), reason: path);
+      expect(out.toLowerCase(), contains('vary: accept-encoding'));
+      expect(lines(out, 'vary'), 2, reason: path);
+      expect(bodyOf(out), contains('a' * 1000));
+    }
+    await zip.close();
+  });
+
+  test('compress: default headers that say not to gzip', () async {
+    NativeHttpServer zip = await start(0)
+      ..autoCompress = true;
+    zip.defaultResponseHeaders.set(HttpHeaders.contentEncodingHeader, 'br');
+    String out = await raw(zip.port, 'GET /json-long HTTP/1.1\r\n$gzipGet');
+    expect(lines(out, 'content-encoding'), 1);
+    expect(out.toLowerCase(), contains('content-encoding: br'));
+    expect(out, endsWith('"}'));
+    zip.defaultResponseHeaders.removeAll(HttpHeaders.contentEncodingHeader);
+    // a default content type that is compressed already
+    zip.defaultResponseHeaders.contentType = ContentType('image', 'png');
+    out = await raw(zip.port, 'GET /long HTTP/1.1\r\n$gzipGet');
+    expect(lines(out, 'content-encoding'), 0);
+    expect(out, endsWith('a' * 1000));
+    // the answer sets its own type: that one counts
+    out = await raw(zip.port, 'GET /json-long HTTP/1.1\r\n$gzipGet');
+    expect(lines(out, 'content-encoding'), 1);
+    expect(bodyOf(out), '{"a":"${'a' * 1000}"}');
+    await zip.close();
+  });
+
+  test('compress: the default headers are not changed', () async {
+    NativeHttpServer zip = await start(0)
+      ..autoCompress = true;
+    await raw(zip.port, 'GET /json-long HTTP/1.1\r\n$gzipGet');
+    await raw(zip.port, 'GET /long HTTP/1.1\r\n$gzipGet');
+    expect(zip.defaultResponseHeaders.value(HttpHeaders.varyHeader), isNull);
+    expect(
+      zip.defaultResponseHeaders.value(HttpHeaders.contentEncodingHeader),
+      isNull,
+    );
     await zip.close();
   });
 

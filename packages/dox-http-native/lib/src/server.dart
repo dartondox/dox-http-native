@@ -777,12 +777,14 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
         ? _defaults()
         : (type == null ? null : _typed(type));
     if (lines != null) {
-      _ensure(lines.length);
-      _out.setRange(_len, _len + lines.length, lines);
-      _len += lines.length;
+      _raw(lines);
     } else {
       headers.forEachLine(_line);
     }
+    if (_varyLine) _raw(_varyBytes);
+    if (_encodingLine) _raw(_encodingBytes);
+    _varyLine = false;
+    _encodingLine = false;
     String? server = serverHeader;
     if (server != null) _line(HttpHeaders.serverHeader, server);
     if (res.hasCookies) {
@@ -797,6 +799,8 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   void send(NativeRequest req, NativeResponse res) {
     if (_handle == 0) return;
     List<int> body = res.takeBody();
+    _varyLine = false;
+    _encodingLine = false;
     // kind bit 8: Rust gzips the body, off this isolate
     bool zip = autoCompress && body.length > 256 && _gzip(req, res);
     // kind bits 12 to 15: the gzip level
@@ -936,7 +940,10 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   /// body could be gzipped, it also adds `Vary: Accept-Encoding`, so a
   /// shared cache does not give gzip to a client that can not read it.
   bool _gzip(NativeRequest req, NativeResponse res) {
-    HttpHeaders headers = res.headers;
+    NativeHeaders headers = res.headers;
+    if (headers.isShared || headers.sharedType != null) {
+      return _gzipShared(req, headers);
+    }
     if (headers.value(HttpHeaders.contentEncodingHeader) != null) {
       return false;
     }
@@ -951,6 +958,65 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
     }
     headers.set(HttpHeaders.contentEncodingHeader, 'gzip');
     return true;
+  }
+
+  /// [_gzip] for headers that are still the server defaults, maybe with
+  /// a content type. A read or a change would copy them, and the cached
+  /// lines of [_headerLines] would not be used. So nothing is changed:
+  /// [_headerLines] writes the `vary` and `content-encoding` lines after
+  /// the cached lines.
+  bool _gzipShared(NativeRequest req, NativeHeaders headers) {
+    NativeHeaders defaults = defaultResponseHeaders;
+    if (defaults.version != _zipVersion) {
+      _zipVersion = defaults.version;
+      _defaultsEncoded =
+          defaults.value(HttpHeaders.contentEncodingHeader) != null;
+      _defaultsVary = _varies(defaults[HttpHeaders.varyHeader]);
+      _defaultsCompressed = _compressed(
+        defaults.value(HttpHeaders.contentTypeHeader),
+      );
+    }
+    if (_defaultsEncoded) return false;
+    ContentType? type = headers.sharedType;
+    bool compressed = _defaultsCompressed;
+    if (type != null) {
+      if (!identical(type, _zipTypeFor)) {
+        _zipTypeFor = type;
+        _zipTypeCompressed = _compressed(type.toString());
+      }
+      compressed = _zipTypeCompressed;
+    }
+    if (compressed) return false;
+    _varyLine = !_defaultsVary;
+    if (!_acceptsGzip(req.headers.value(HttpHeaders.acceptEncodingHeader))) {
+      return false;
+    }
+    _encodingLine = true;
+    return true;
+  }
+
+  int _zipVersion = -1;
+  bool _defaultsEncoded = false;
+  bool _defaultsVary = false;
+  bool _defaultsCompressed = false;
+  ContentType? _zipTypeFor;
+  bool _zipTypeCompressed = false;
+
+  /// set by [_gzipShared] for the next [_headerLines]
+  bool _varyLine = false;
+  bool _encodingLine = false;
+
+  static final Uint8List _varyBytes = Uint8List.fromList(
+    'vary: Accept-Encoding\r\n'.codeUnits,
+  );
+  static final Uint8List _encodingBytes = Uint8List.fromList(
+    'content-encoding: gzip\r\n'.codeUnits,
+  );
+
+  void _raw(Uint8List bytes) {
+    _ensure(bytes.length);
+    _out.setRange(_len, _len + bytes.length, bytes);
+    _len += bytes.length;
   }
 
   /// true when [vary] names `Accept-Encoding` (or is `*`) already.
