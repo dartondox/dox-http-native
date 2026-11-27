@@ -337,6 +337,10 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   /// takes more CPU for a smaller body. For a 6.7 kB JSON body, level 1
   /// took 13.5 us for 1,421 bytes, and level 6 took 32.6 us for 1,270
   /// bytes. The client reads every level the same way.
+  ///
+  /// Levels 10 to 12 are slow, and each uses 9 MB of memory. One helper
+  /// thread gzips all answers of this server, so a slow gzip makes the
+  /// other gzipped answers wait.
   int get compressLevel => _compressLevel;
   set compressLevel(int value) {
     RangeError.checkValueInInterval(value, 1, 12, 'compressLevel');

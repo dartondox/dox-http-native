@@ -1638,6 +1638,8 @@ struct Core {
     waker: Arc<Waker>,
     zip: Option<mpsc::Sender<Job>>,
     zipped: Arc<Mutex<Vec<Zipped>>>,
+    /// gzips here when the helper thread could not start
+    zippers: Option<Zippers>,
     /// the read buffer lent to each connection in turn (see `Conn::lend`).
     /// The loop runs one connection at a time, so one is enough.
     scratch: Vec<u8>,
@@ -1686,6 +1688,7 @@ impl Core {
             waker,
             zip: None,
             zipped: Arc::new(Mutex::new(Vec::new())),
+            zippers: None,
             scratch: Vec::new(),
             dead: Vec::new(),
             touched: Vec::new(),
@@ -2739,8 +2742,8 @@ impl Core {
                     }
                 });
             if started.is_err() {
-                // no thread: zip here
-                let out = job.run(&mut Zippers::default());
+                // no thread: zip here, with compressors kept for the next jobs
+                let out = job.run(self.zippers.get_or_insert_with(Zippers::default));
                 self.zipped.lock().unwrap().push((job.idx, job.seq, out));
                 return;
             }

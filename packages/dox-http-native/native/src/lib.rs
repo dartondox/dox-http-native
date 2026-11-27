@@ -331,6 +331,9 @@ fn peer_bytes(addr: SocketAddr) -> [u8; 18] {
 /// libdeflate compresses a whole body in one call. It is faster than a
 /// stream compressor: a 6.7 kB JSON body takes 13.5 us at level 1, where
 /// flate2 took 35.7 us at its default level 6.
+///
+/// A compressor takes 203 kB at level 1, 668 kB at levels 2 to 9 and
+/// 9 MB at levels 10 to 12.
 #[derive(Default)]
 struct Zippers([Option<libdeflater::Compressor>; 13]);
 
@@ -347,6 +350,9 @@ impl Zippers {
         // the bound is always enough room
         let n = z.gzip_compress(data, &mut out).unwrap_or(0);
         out.truncate(n);
+        // the room was the size of the body: HTTP/2 keeps this Vec until
+        // it is sent
+        out.shrink_to_fit();
         out
     }
 }

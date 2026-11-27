@@ -156,13 +156,13 @@ fn app(r: &Rec, out: &mut Vec<u8>) {
                 &b"hello ".repeat(100),
             ),
             // the gzip level in kind bits 12 to 15
-            "/zip12" => ans(
+            t if t.starts_with("/zip/") => ans(
                 out,
                 r.id,
                 200,
-                0x100 | (12 << 12),
+                0x100 | (t[5..].parse::<u16>().unwrap() << 12),
                 b"content-encoding: gzip\r\n",
-                &b"level twelve ".repeat(300),
+                &ZIP_TEXT,
             ),
             t => ans(out, r.id, 200, 0, b"", &[t.as_bytes(), &r.body].concat()),
         },
@@ -873,25 +873,37 @@ fn gzip_runs_on_the_helper_thread() {
     assert_eq!(back, b"hello ".repeat(100));
 }
 
+/// a body that gzips to different bytes at each level
+static ZIP_TEXT: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| {
+    (0..20_000u32)
+        .map(|i| b"abcdefgh ijklmnop"[(i.wrapping_mul(2654435761) >> 28) as usize % 17])
+        .collect()
+});
+
 #[test]
 fn gzip_takes_the_level_of_the_kind() {
     let (port, _) = serve(limits());
-    let r = {
-        let mut s = connect(port);
-        s.write_all(b"GET /zip12 HTTP/1.1\r\nConnection: close\r\n\r\n")
+    let mut z = Zippers::default();
+    for level in 1..=12u8 {
+        let r = {
+            let mut s = connect(port);
+            s.write_all(
+                format!("GET /zip/{level} HTTP/1.1\r\nConnection: close\r\n\r\n").as_bytes(),
+            )
             .unwrap();
-        let mut out = Vec::new();
-        let _ = s.read_to_end(&mut out);
-        out
-    };
-    let at = r.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
-    let mut back = Vec::new();
-    flate2::read::GzDecoder::new(&r[at..])
-        .read_to_end(&mut back)
-        .unwrap();
-    assert_eq!(back, b"level twelve ".repeat(300));
-    // the same bytes as level 12 here
-    assert_eq!(&r[at..], &Zippers::default().gzip(&back, 12)[..]);
+            let mut out = Vec::new();
+            let _ = s.read_to_end(&mut out);
+            out
+        };
+        let at = r.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let mut back = Vec::new();
+        flate2::read::GzDecoder::new(&r[at..])
+            .read_to_end(&mut back)
+            .unwrap();
+        assert_eq!(back, *ZIP_TEXT, "level {level}");
+        // the same bytes as this level here
+        assert_eq!(&r[at..], &z.gzip(&ZIP_TEXT, level)[..], "level {level}");
+    }
 }
 
 /// The gzip thread wakes the poll while a call waits. That call must send
