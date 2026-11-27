@@ -975,6 +975,44 @@ void main() {
     await zip.close();
   });
 
+  test('compress: every level from 1 to 12 gives the body', () async {
+    NativeHttpServer zip = await start(0)
+      ..autoCompress = true;
+    expect(zip.compressLevel, 1);
+    for (int level = 1; level <= 12; level++) {
+      zip.compressLevel = level;
+      HttpClientRequest req = await client.get('127.0.0.1', zip.port, '/long');
+      HttpClientResponse res = await req.close();
+      expect(res.headers.value(HttpHeaders.contentEncodingHeader), 'gzip');
+      expect(await utf8.decodeStream(res), 'a' * 1000, reason: 'level $level');
+    }
+    // The level reaches Rust: byte 8 of a gzip body (XFL) is 4 at level
+    // 1, 0 at levels 2 to 7 and 2 at levels 8 to 12. This also runs with
+    // `connection: close` (kind bit 9 next to the level).
+    for ((int, int) want in <(int, int)>[(1, 4), (5, 0), (12, 2)]) {
+      zip.compressLevel = want.$1;
+      String out = await raw(
+        zip.port,
+        'GET /long HTTP/1.1\r\nAccept-Encoding: gzip\r\n'
+        'Connection: close\r\n\r\n',
+      );
+      List<int> body = latin1.encode(
+        out.substring(out.indexOf('\r\n\r\n') + 4),
+      );
+      expect(body[8], want.$2, reason: 'level ${want.$1}');
+      expect(utf8.decode(gzip.decode(body)), 'a' * 1000);
+    }
+    await zip.close();
+  });
+
+  test('compress: a level that is not 1 to 12 is refused', () async {
+    NativeHttpServer zip = await start(0);
+    expect(() => zip.compressLevel = 0, throwsRangeError);
+    expect(() => zip.compressLevel = 13, throwsRangeError);
+    expect(zip.compressLevel, 1);
+    await zip.close();
+  });
+
   test('compress: Vary: Accept-Encoding is sent', () async {
     NativeHttpServer zip = await start(0)
       ..autoCompress = true;

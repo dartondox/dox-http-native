@@ -56,7 +56,7 @@
 //!   own side, then reads and drops what is left for up to [LINGER]
 //!   ("lingering close"). Else the OS could send a reset and the client
 //!   could lose the last answer (eg. a 413).
-//! - gzip (kind bit 0x100) runs on one helper thread per server, so the
+//! - gzip (kind bit 0x100, the level in kind bits 12 to 15) runs on one helper thread per server, so the
 //!   isolate does not wait for it.
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
@@ -82,7 +82,7 @@ use crate::tls::{self, Certs, Tls};
 use crate::{
     BODY_END, CLOSE_WAIT, DRAIN_MAX, EXTERNAL_MIN, Key, MAX_HEAD, MAX_RESERVE, MIN_QUEUE, POST,
     REQ_HEAD, REQUEST_GONE, RES_HEAD, SEND_WAIT, STREAM_GONE, STREAM_SENT, WS_BINARY, WS_CLOSED,
-    WS_TEXT, WS_UNACKED, bind, gzip, peer_bytes, post, rd16, rd32, unbind,
+    WS_TEXT, WS_UNACKED, Zippers, bind, peer_bytes, post, rd16, rd32, unbind,
 };
 
 const LISTENER: Token = Token(0);
@@ -1573,12 +1573,14 @@ struct Job {
     way: Way,
     /// HTTP/2: only the zipped body, the H2 code makes the frames
     h2: bool,
+    /// the gzip level, 1 to 12 (kind bits 12 to 15)
+    level: u8,
 }
 
 impl Job {
     /// The answer: zipped and rendered (HTTP/1.1), or only zipped (HTTP/2).
-    fn run(&self) -> Vec<u8> {
-        let zipped = gzip(&self.body);
+    fn run(&self, z: &mut Zippers) -> Vec<u8> {
+        let zipped = z.gzip(&self.body, self.level);
         if self.h2 {
             return zipped;
         }
@@ -2432,6 +2434,7 @@ impl Core {
                         said: false,
                     },
                     h2: true,
+                    level: (kind >> 12) as u8,
                 };
                 self.zip(job);
             } else if kind & 0xff == 1 {
@@ -2474,6 +2477,7 @@ impl Core {
                     date: date.clone(),
                     way,
                     h2: false,
+                    level: (kind >> 12) as u8,
                 };
                 self.zip(job);
                 return;
@@ -2726,16 +2730,17 @@ impl Core {
             let started = std::thread::Builder::new()
                 .name("dox-http-gzip".into())
                 .spawn(move || {
+                    let mut z = Zippers::default();
                     // ends when the server drops the sender
                     for job in rx {
-                        let out = job.run();
+                        let out = job.run(&mut z);
                         results.lock().unwrap().push((job.idx, job.seq, out));
                         let _ = waker.wake();
                     }
                 });
             if started.is_err() {
                 // no thread: zip here
-                let out = job.run();
+                let out = job.run(&mut Zippers::default());
                 self.zipped.lock().unwrap().push((job.idx, job.seq, out));
                 return;
             }

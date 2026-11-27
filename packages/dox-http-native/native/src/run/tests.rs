@@ -155,6 +155,15 @@ fn app(r: &Rec, out: &mut Vec<u8>) {
                 b"content-encoding: gzip\r\n",
                 &b"hello ".repeat(100),
             ),
+            // the gzip level in kind bits 12 to 15
+            "/zip12" => ans(
+                out,
+                r.id,
+                200,
+                0x100 | (12 << 12),
+                b"content-encoding: gzip\r\n",
+                &b"level twelve ".repeat(300),
+            ),
             t => ans(out, r.id, 200, 0, b"", &[t.as_bytes(), &r.body].concat()),
         },
         // echo text and binary
@@ -862,6 +871,27 @@ fn gzip_runs_on_the_helper_thread() {
         .read_to_end(&mut back)
         .unwrap();
     assert_eq!(back, b"hello ".repeat(100));
+}
+
+#[test]
+fn gzip_takes_the_level_of_the_kind() {
+    let (port, _) = serve(limits());
+    let r = {
+        let mut s = connect(port);
+        s.write_all(b"GET /zip12 HTTP/1.1\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        out
+    };
+    let at = r.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    let mut back = Vec::new();
+    flate2::read::GzDecoder::new(&r[at..])
+        .read_to_end(&mut back)
+        .unwrap();
+    assert_eq!(back, b"level twelve ".repeat(300));
+    // the same bytes as level 12 here
+    assert_eq!(&r[at..], &Zippers::default().gzip(&back, 12)[..]);
 }
 
 /// The gzip thread wakes the poll while a call waits. That call must send
