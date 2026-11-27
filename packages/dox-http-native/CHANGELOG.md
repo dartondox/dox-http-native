@@ -1,3 +1,8 @@
+## Unreleased
+
+- Faster: `autoCompress` gzips with libdeflate, not with flate2. libdeflate compresses a whole body in one call. The native library builds it from C source, so no system library is necessary.
+- New: `NativeHttpServer.compressLevel`, the gzip level of `autoCompress`, from 1 (fast) to 12 (small). The default is 1. A level that is not 1 to 12 throws a `RangeError`. For a 6.7 kB JSON body, the gzip time goes from 35.7 µs (flate2, level 6) to 13.5 µs (level 1). The body is 1,421 bytes, not 1,271 bytes. libdeflate at level 6 takes 32.6 µs for 1,270 bytes. Levels 10 to 12 are slow and use 9 MB each, and they make the other gzipped answers of the server wait. The client reads every level the same way. Set `compressLevel = 6` to get about the same size as before.
+
 ## 3.2.6
 
 - New: HTTPS without a proxy. It is off by default. When it is off, a plain connection uses the same code as before.

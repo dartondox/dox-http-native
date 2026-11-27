@@ -235,7 +235,7 @@ Requests:
 
 Answers:
 
-- `autoCompress`: Rust gzips the body on a helper thread, not on the isolate.
+- `autoCompress`: Rust gzips the body on a helper thread, not on the isolate. It uses libdeflate. `compressLevel` sets the level, from 1 (fast, the default) to 12 (small).
 - A small body goes out in one piece on `close`.
 - When `addStream` passes 64 KB, the answer starts, and the remaining body goes out in parts. A large file does not stay in memory.
 - `flush()` also starts the answer: the head and the bytes so far go out. Later writes go out immediately, for example server-sent events from a timer.

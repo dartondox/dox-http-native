@@ -28,6 +28,14 @@ permissions:
 env:
   # the oldest glibc that the Linux libraries load on
   GLIBC: "2.34"
+  # zig's clang 21 refuses the AVX-512 code of libdeflate (the gzip of
+  # dox_http_native): it wants an `evex512` target feature that libdeflate
+  # does not name. Apple clang and gcc build it. These two switches of
+  # libdeflate leave that code out for x86-64 Linux. CRC-32 then uses the
+  # PCLMULQDQ code: about 0.1 us more for a 6.7 kB body.
+  CFLAGS_x86_64_unknown_linux_gnu: >-
+    -DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI
+    -DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_VPCLMULQDQ
 
 jobs:
   # Pub workspace: one `dart pub get` at the root links all packages.
