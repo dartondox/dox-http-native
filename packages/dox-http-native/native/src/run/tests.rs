@@ -2778,6 +2778,7 @@ fn tls_records_without_plain_text_do_not_hold_the_loop() {
     let (other_go, other_wait) = mpsc::channel::<()>();
     let (ready_tx, ready) = mpsc::channel::<&str>();
     let tx = ready_tx.clone();
+    let (len_tx, flood_len) = mpsc::channel::<usize>();
     std::thread::spawn(move || {
         let sock =
             socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
@@ -2800,6 +2801,7 @@ fn tls_records_without_plain_text_do_not_hold_the_loop() {
         }
         assert!(blob.len() > 4 * WS_READ);
         s.sock.write_all(&blob).unwrap();
+        len_tx.send(blob.len()).unwrap();
         tx.send("flooded").unwrap();
         let _ = flood_wait.recv();
     });
@@ -2838,6 +2840,15 @@ fn tls_records_without_plain_text_do_not_hold_the_loop() {
     let mut got = String::new();
     flood_go.send(()).unwrap();
     while ready.recv_timeout(Duration::from_secs(5)).unwrap() != "flooded" {}
+    // write_all only means the bytes left the client: macOS hands loopback
+    // bytes over in parts. Wait until the whole flood is in the server's
+    // socket, so the one call below meets all of it on every OS.
+    let want = flood_len.recv_timeout(Duration::from_secs(5)).unwrap();
+    let mut peek = vec![0u8; want];
+    while core.conns[flood].sock.peek(&mut peek).unwrap_or(0) < want {
+        assert!(Instant::now() < end, "the flood did not arrive");
+        std::thread::sleep(Duration::from_millis(1));
+    }
     other_go.send(()).unwrap();
     while ready.recv_timeout(Duration::from_secs(5)).unwrap() != "asked" {}
     std::thread::sleep(Duration::from_millis(50));
