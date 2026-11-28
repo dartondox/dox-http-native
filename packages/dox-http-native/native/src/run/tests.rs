@@ -2857,3 +2857,84 @@ fn tls_records_without_plain_text_do_not_hold_the_loop() {
     }
     drop((flood_go, other_go));
 }
+
+/// The spare write buffers: `lend` gives one only to a connection with no
+/// buffer, `give` takes back only an empty one, and the spares stay under
+/// WPOOL_BYTES (a big buffer is freed, not kept).
+#[test]
+fn wpool_lends_and_takes_back_only_empty_buffers() {
+    let mut pool = WPool::default();
+    let mut wbuf = Vec::with_capacity(1024);
+    wbuf.extend_from_slice(b"not written");
+    let mut wpos = 3;
+    pool.give(&mut wbuf, &mut wpos);
+    assert_eq!(
+        (pool.bufs.len(), wbuf.len(), wpos),
+        (0, 11, 3),
+        "bytes wait"
+    );
+    wpos = wbuf.len();
+    pool.give(&mut wbuf, &mut wpos);
+    assert_eq!((pool.bufs.len(), pool.bytes), (1, 1024));
+    assert_eq!((wbuf.capacity(), wpos), (0, 0));
+    let mut other = Vec::with_capacity(8);
+    pool.lend(&mut other);
+    assert_eq!(other.capacity(), 8, "a connection with a buffer keeps it");
+    pool.lend(&mut wbuf);
+    assert!(wbuf.capacity() >= 1024 && wbuf.is_empty());
+    assert_eq!((pool.bufs.len(), pool.bytes), (0, 0));
+    pool.keep(Vec::with_capacity(KEEP_WBUF + 1));
+    assert!(pool.bufs.is_empty(), "a big buffer is kept");
+    for _ in 0..WPOOL_BYTES / KEEP_WBUF + 4 {
+        pool.keep(Vec::with_capacity(KEEP_WBUF));
+    }
+    assert!(pool.bytes <= WPOOL_BYTES, "{}", pool.bytes);
+}
+
+/// Writes use the core's spare buffers: once its answers are written, an
+/// HTTP/2 or HTTP/1.1 keep-alive connection holds no write buffer, and
+/// the buffer waits in the core for the next connection that writes.
+#[test]
+fn answered_connections_hold_no_write_buffer() {
+    use crate::h2::frame;
+    use crate::h2::hpack::encode_field;
+    let (mut core, port) = new_core(limits());
+    let mut inb = vec![0u8; 1 << 18];
+    let mut out = Vec::new();
+    let mut h2 = PREFACE.to_vec();
+    frame::write(&mut h2, frame::SETTINGS, 0, 0, b"");
+    let mut block = Vec::new();
+    for (n, v) in [(":method", "GET"), (":scheme", "http"), (":path", "/h2")] {
+        encode_field(n.as_bytes(), v.as_bytes(), &mut block);
+    }
+    frame::write_headers(&mut h2, 1, &block, true, 16 * 1024);
+    let mut a = connect(port);
+    let mut b = connect(port);
+    accept(&mut core, &mut inb, 2);
+    a.write_all(&h2).unwrap();
+    b.write_all(b"GET /h1 HTTP/1.1\r\n\r\n").unwrap();
+    // both answers out: "/h2" in a DATA frame, "/h1" as the body
+    let (mut got_a, mut got_b) = (Vec::new(), Vec::new());
+    a.set_nonblocking(true).unwrap();
+    b.set_nonblocking(true).unwrap();
+    let end = Instant::now() + Duration::from_secs(5);
+    while !(got_a.ends_with(b"/h2") && got_b.ends_with(b"/h1")) && Instant::now() < end {
+        turn(&mut core, &mut inb, &mut out, 1000);
+        let mut buf = [0u8; 4096];
+        for (s, got) in [(&mut a, &mut got_a), (&mut b, &mut got_b)] {
+            if let Ok(k) = s.read(&mut buf) {
+                got.extend_from_slice(&buf[..k]);
+            }
+        }
+    }
+    assert!(got_a.ends_with(b"/h2"), "{got_a:?}");
+    assert!(got_b.ends_with(b"/h1"), "{got_b:?}");
+    for (_, c) in core.conns.iter() {
+        assert_eq!(
+            c.wbuf.capacity(),
+            0,
+            "an answered connection holds a buffer"
+        );
+    }
+    assert!(!core.wpool.bufs.is_empty(), "no spare buffer");
+}

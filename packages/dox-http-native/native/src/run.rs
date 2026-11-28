@@ -118,11 +118,11 @@ const WS_OUT_MAX: usize = 4 * WS_HOLD;
 const MAX_PENDING: usize = 1 << 20;
 /// Over this many bytes written, a write buffer drops what is written.
 const BIG_BUF: usize = 1 << 20;
-/// A write buffer bigger than this is freed once it is empty. Small
-/// answers keep their buffer (no new one per answer), but a big answer
-/// does not leave a big buffer on a keep-alive connection: with many
-/// connections that adds up.
+/// A write buffer bigger than this is freed once it is empty, not kept
+/// in the core's spare buffers (see [WPool]).
 const KEEP_WBUF: usize = 64 * 1024;
+/// Most bytes of spare write buffers one core keeps (see [WPool]).
+const WPOOL_BYTES: usize = 1 << 20;
 /// The longest body or idle timeout (a year). Longer is cut to this.
 const MAX_TIMEOUT: Duration = Duration::from_secs(365 * 24 * 3600);
 /// Most headers of one request. More gets 431.
@@ -1600,6 +1600,51 @@ impl Job {
 /// A done gzip job: the rendered answer.
 type Zipped = (usize, u32, Vec<u8>);
 
+/// The spare write buffers of a core. A connection holds a write buffer
+/// only while bytes wait in it: once all is written, the buffer comes back
+/// here (`give`), and the next connection that writes takes it (`lend`).
+/// So an idle connection holds no write buffer, like `Conn::lend` for the
+/// read side, and a busy one does not grow a new buffer from empty. The
+/// spares are capped at [WPOOL_BYTES]: more is freed.
+#[derive(Default)]
+struct WPool {
+    bufs: Vec<Vec<u8>>,
+    bytes: usize,
+}
+
+impl WPool {
+    /// Before writes: a connection with no write buffer gets a spare one.
+    fn lend(&mut self, wbuf: &mut Vec<u8>) {
+        if wbuf.capacity() == 0
+            && let Some(b) = self.bufs.pop()
+        {
+            self.bytes -= b.capacity();
+            *wbuf = b;
+        }
+    }
+
+    /// After the writes: an empty write buffer comes back. A buffer with
+    /// bytes not written yet stays with its connection.
+    fn give(&mut self, wbuf: &mut Vec<u8>, wpos: &mut usize) {
+        if *wpos < wbuf.len() || wbuf.capacity() == 0 {
+            return;
+        }
+        self.keep(std::mem::take(wbuf));
+        *wpos = 0;
+    }
+
+    /// Keeps `b` as a spare, emptied, if it is not too big.
+    fn keep(&mut self, mut b: Vec<u8>) {
+        let n = b.capacity();
+        if n == 0 || n > KEEP_WBUF || self.bytes + n > WPOOL_BYTES {
+            return; // freed here
+        }
+        b.clear();
+        self.bytes += n;
+        self.bufs.push(b);
+    }
+}
+
 /// All socket state of one server. Only the owner of the mutex touches it.
 struct Core {
     poll: Poll,
@@ -1643,6 +1688,8 @@ struct Core {
     /// the read buffer lent to each connection in turn (see `Conn::lend`).
     /// The loop runs one connection at a time, so one is enough.
     scratch: Vec<u8>,
+    /// the spare write buffers (see [WPool])
+    wpool: WPool,
     /// lists reused per call
     dead: Vec<usize>,
     touched: Vec<usize>,
@@ -1690,6 +1737,7 @@ impl Core {
             zipped: Arc::new(Mutex::new(Vec::new())),
             zippers: None,
             scratch: Vec::new(),
+            wpool: WPool::default(),
             dead: Vec::new(),
             touched: Vec::new(),
             certs: None,
@@ -1745,6 +1793,7 @@ impl Core {
             return;
         };
         let _ = self.poll.registry().deregister(&mut c.sock);
+        self.wpool.keep(std::mem::take(&mut c.wbuf));
         for s in &c.slots {
             if let Some((sid, _)) = s.stream
                 && self.streams.remove(&sid).is_some()
@@ -2072,6 +2121,7 @@ impl Core {
         let before = c.progress();
         let written = c.written;
         let data = c.h2.as_ref().map_or(0, |h| h.data_sent);
+        self.wpool.lend(&mut c.wbuf);
         loop {
             if let Some(h2) = c.h2.as_mut() {
                 h2.send(&mut c.wbuf, c.wpos, c.written, &mut c.marks);
@@ -2085,6 +2135,8 @@ impl Core {
                 break;
             }
         }
+        // all written: the buffer goes back to the core
+        self.wpool.give(&mut c.wbuf, &mut c.wpos);
         // `moved`: any socket write, also TLS records of rustls alone (eg.
         // a KeyUpdate). Only progress for the send stall. `wrote`: answer
         // bytes, which alone count as activity (idle time, h2 ACKs out).
@@ -2399,6 +2451,9 @@ impl Core {
         let idx = (id >> 32) as usize;
         let seq = id as u32;
         let date = &self.date.1;
+        if let Some(c) = self.conns.get_mut(idx) {
+            self.wpool.lend(&mut c.wbuf);
+        }
         if let Some(c) = self.conns.get_mut(idx)
             && let Some(h2) = c.h2.as_mut()
         {
@@ -2842,6 +2897,8 @@ impl Core {
                 continue;
             }
             let lent = c.lend(&mut self.scratch);
+            // parse writes too (eg. HTTP/2 SETTINGS and WINDOW_UPDATE)
+            self.wpool.lend(&mut c.wbuf);
             if !c.read() {
                 c.give_back(&mut self.scratch, lent);
                 self.ready.pop_front();

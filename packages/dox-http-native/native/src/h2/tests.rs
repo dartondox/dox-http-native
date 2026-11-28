@@ -4529,3 +4529,39 @@ mod conn {
         assert_eq!(ends, [1]);
     }
 }
+
+/// Each connection keeps a map of its streams, and with 100 open streams
+/// that map has 256 slots: one slot is the size of a stream. The fields
+/// that only gzip and streamed answers or bodies need are in `Rare`, so
+/// a plain stream stays small (it was 176 bytes, 48 kB per connection).
+#[test]
+fn stream_is_small() {
+    let n = std::mem::size_of::<super::stream::Stream>();
+    assert!(n <= 96, "a stream is {n} bytes");
+}
+
+/// 50 rounds of 100 streams that open and close: the slab keeps the
+/// slots of the 100 open at once and reuses them, so the memory of a busy
+/// connection does not grow with the streams it served.
+#[test]
+fn streams_reuse_their_slots() {
+    use super::stream::{Stream, Streams};
+    let mut m = Streams::default();
+    for round in 0..50u32 {
+        for i in 0..100 {
+            m.insert(round * 200 + 2 * i + 1, Stream::new(i, 0, false, None));
+        }
+        assert_eq!(m.len(), 100);
+        assert_eq!(m[&(round * 200 + 7)].seq, 3);
+        for i in 0..100 {
+            let s = m.remove(&(round * 200 + 2 * i + 1)).expect("open");
+            assert_eq!(s.seq, i);
+        }
+    }
+    assert!(m.is_empty() && m.values().next().is_none());
+    assert!(m.slab.capacity() <= 128, "{}", m.slab.capacity());
+    // the same id again replaces the stream, in the same slot
+    m.insert(1, Stream::new(1, 0, false, None));
+    m.insert(1, Stream::new(2, 0, false, None));
+    assert_eq!((m.len(), m.slab.len(), m[&1].seq), (1, 1, 2));
+}
