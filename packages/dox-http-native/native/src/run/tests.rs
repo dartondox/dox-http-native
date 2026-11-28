@@ -2949,3 +2949,55 @@ fn answered_connections_hold_no_write_buffer() {
     }
     assert!(!core.wpool.bufs.is_empty(), "no spare buffer");
 }
+
+#[test]
+fn push_dec_is_the_same_as_format() {
+    for n in [0u64, 1, 9, 10, 99, 100, 12345, u32::MAX as u64, u64::MAX] {
+        let mut buf = b"x".to_vec();
+        push_dec(&mut buf, n);
+        assert_eq!(buf, format!("x{n}").into_bytes(), "{n}");
+    }
+}
+
+/// Answers that come in order go straight into the write buffer; the
+/// others wait in their slot. Mixed, in one batch and over two batches,
+/// the client still gets every answer in the order of its requests.
+#[test]
+fn answers_in_and_out_of_order_stay_in_order() {
+    let (mut core, port) = new_core(limits());
+    let mut inb = vec![0u8; 1 << 18];
+    let mut s = connect(port);
+    let all: String = (0..10)
+        .map(|i| format!("GET /{i} HTTP/1.1\r\n\r\n"))
+        .collect();
+    s.write_all(all.as_bytes()).unwrap();
+    let reqs = collect(&mut core, &mut inb, 10);
+    assert_eq!(reqs.len(), 10);
+    // batch 1: 0 1 2 in order, then 5, then 3 (in order again), 4
+    let mut out = Vec::new();
+    for i in [0, 1, 2, 5, 3, 4] {
+        ans(&mut out, reqs[i].id, 200, 0, b"", reqs[i].target.as_bytes());
+    }
+    core.run(&out, &mut inb, 0).unwrap();
+    // batch 2: 7 waits for 6, then 6, 8, 9
+    let mut out = Vec::new();
+    for i in [7, 6, 8, 9] {
+        ans(&mut out, reqs[i].id, 200, 0, b"", reqs[i].target.as_bytes());
+    }
+    core.run(&out, &mut inb, 0).unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 65536];
+    while !String::from_utf8_lossy(&got).ends_with("/9") {
+        core.run(&[], &mut inb, 0).unwrap();
+        let k = s.read(&mut buf).unwrap();
+        got.extend_from_slice(&buf[..k]);
+    }
+    let text = String::from_utf8_lossy(&got);
+    let bodies: Vec<&str> = text
+        .split("\r\n\r\n")
+        .skip(1)
+        .map(|b| &b[..b.find("HTTP").unwrap_or(b.len())])
+        .collect();
+    let want: Vec<String> = (0..10).map(|i| format!("/{i}")).collect();
+    assert_eq!(bodies, want);
+}
