@@ -1,0 +1,6 @@
+# Compile each test file on its own. The default kernel compiler of
+# `dart test` shares one incremental compile between the files. Then
+# `aes_gcm_test.dart` sometimes fails with "No top-level method
+# '#doxAesGcmSeal#TTTT'": the FFI helper for a call with typed data
+# `.address` is lost. Apps (`dart build`, `dart run`) do not have this.
+compilers: [source]
