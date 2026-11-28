@@ -362,14 +362,17 @@ fn read_str<'a>(
 /// - name and value in the static table: indexed (1 byte)
 /// - only the name in it: literal without indexing, with the indexed name
 /// - else: literal without indexing, with a new name
+/// - a [secret] name: never indexed (RFC 7541 7.1.3), so no proxy puts it
+///   in a table either
 ///
 /// ponytail: no Huffman and no dynamic table. This is valid and safe. Add
 /// them when benchmarks show that header bytes matter.
 pub(crate) fn encode_field(name: &[u8], value: &[u8], out: &mut Vec<u8>) {
+    let never = secret(name);
     let mut name_index = 0;
     for (i, (n, v)) in STATIC.iter().enumerate() {
         if *n == name {
-            if *v == value {
+            if *v == value && !never {
                 write_int(i + 1, 7, 0x80, out);
                 return;
             }
@@ -378,11 +381,21 @@ pub(crate) fn encode_field(name: &[u8], value: &[u8], out: &mut Vec<u8>) {
             }
         }
     }
-    write_int(name_index, 4, 0x00, out);
+    write_int(name_index, 4, if never { 0x10 } else { 0x00 }, out);
     if name_index == 0 {
         write_str(name, out);
     }
     write_str(value, out);
+}
+
+/// A header that holds a secret. In a compression table, an attacker who
+/// can add text to the same connection could guess it from the sizes
+/// (RFC 7541 7.1). `name` is lowercase.
+pub(crate) fn secret(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"set-cookie" | b"cookie" | b"authorization" | b"proxy-authorization"
+    )
 }
 
 /// A literal with incremental indexing: the client adds the field to its
