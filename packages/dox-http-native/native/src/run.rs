@@ -367,6 +367,10 @@ struct Conn {
     /// `wpos..` is not written yet
     wbuf: Vec<u8>,
     wpos: usize,
+    /// the first `ready` slots have their whole answer in `wbuf`, in
+    /// order. An answer for slot `ready` can then go straight into `wbuf`
+    /// too, with no buffer of its own. `pump` sets it back to 0.
+    ready: usize,
     /// bytes written to the socket so far
     written: u64,
     /// stream bytes to tell Dart once `written` gets to the first value:
@@ -546,7 +550,9 @@ fn render_head(
     let no_body = status < 200 || status == 204 || status == 304;
     match len {
         Len::Exact(n) if !no_body => {
-            let _ = write!(buf, "content-length: {n}\r\n");
+            buf.extend_from_slice(b"content-length: ");
+            push_dec(buf, n as u64);
+            buf.extend_from_slice(b"\r\n");
         }
         Len::Chunked if !no_body => buf.extend_from_slice(b"transfer-encoding: chunked\r\n"),
         _ => {}
@@ -560,6 +566,21 @@ fn render_head(
     buf.extend_from_slice(b"\r\n");
 }
 
+/// Writes `n` in decimal, like `write!(buf, "{n}")` with no formatter.
+fn push_dec(buf: &mut Vec<u8>, mut n: u64) {
+    let mut d = [0u8; 20];
+    let mut at = d.len();
+    loop {
+        at -= 1;
+        d[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    buf.extend_from_slice(&d[at..]);
+}
+
 /// A status whose answer never has a body: 1xx, 204 and 304. A status
 /// out of range is sent as 500, which has one.
 fn no_body(status: u16) -> bool {
@@ -570,9 +591,11 @@ fn no_body(status: u16) -> bool {
 fn render(buf: &mut Vec<u8>, status: u16, lines: &[u8], body: &[u8], date: &[u8], w: Way) {
     // a HEAD answer with no body keeps the length that Dart set (the length
     // a GET would have). Dart then put the content-length line in `lines`.
-    let len = match length_line(lines) {
-        Some(Some(_)) if w.head && body.is_empty() => Len::Open,
-        _ => Len::Exact(body.len()),
+    // only a HEAD answer reads the lines: the others need no scan
+    let len = if w.head && body.is_empty() && matches!(length_line(lines), Some(Some(_))) {
+        Len::Open
+    } else {
+        Len::Exact(body.len())
     };
     render_head(buf, status, lines, b"", date, w, len);
     let no_body = status < 200 || status == 204 || status == 304;
@@ -814,6 +837,7 @@ impl Conn {
             rlen: 0,
             wbuf: Vec::new(),
             wpos: 0,
+            ready: 0,
             written: 0,
             marks: VecDeque::new(),
             slots: VecDeque::new(),
@@ -1064,6 +1088,8 @@ impl Conn {
                 break;
             }
         }
+        // the slots that were in `wbuf` are gone, or moved to it: count again
+        self.ready = 0;
         if self.slots.is_empty() {
             self.upgrading = false;
             if self.closing && self.body.is_none() && self.ws.is_none() {
@@ -2542,8 +2568,14 @@ impl Core {
             }
             0 => {
                 s.done = true;
-                if i == 0 {
+                if i == c.ready {
+                    // the answers in front are all in `wbuf`: this one goes
+                    // after them, with no buffer of its own. Nothing may go
+                    // after a closing answer.
                     render(&mut c.wbuf, status, lines, body, date, way);
+                    if !s.close {
+                        c.ready = i + 1;
+                    }
                 } else {
                     render(&mut s.out, status, lines, body, date, way);
                 }
