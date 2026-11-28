@@ -1907,7 +1907,10 @@ fn give_back(out: &mut Vec<u8>, id: u32, r: &mut Recv) {
 }
 
 /// Writes a header block. A size update that a new SETTINGS_HEADER_TABLE_SIZE
-/// of the client needs goes first (RFC 7541 4.2).
+/// of the client needs goes first (RFC 7541 4.2). It starts with size 0:
+/// after more than one SETTINGS the smallest size must come first, and 0
+/// is never more than it. Only [cache_head] puts entries in the table, and
+/// it builds them again after a change.
 fn write_block(
     out: &mut Vec<u8>,
     id: u32,
@@ -1918,8 +1921,11 @@ fn write_block(
 ) {
     match update.take() {
         Some(size) => {
-            let mut with = Vec::with_capacity(block.len() + 5);
-            hpack::write_int(size, 5, 0x20, &mut with);
+            let mut with = Vec::with_capacity(block.len() + 6);
+            with.push(0x20);
+            if size > 0 {
+                hpack::write_int(size, 5, 0x20, &mut with);
+            }
             with.extend_from_slice(block);
             frame::write_headers(out, id, &with, end_stream, max);
         }

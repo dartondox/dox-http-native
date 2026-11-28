@@ -1553,6 +1553,22 @@ mod conn {
         assert_eq!(d.table().0, 0);
     }
 
+    /// Two size changes before the next block: the update starts with 0,
+    /// the smallest, then gives the last size (RFC 7541 4.2).
+    #[test]
+    fn hpack_table_two_size_changes() {
+        let mut out = Vec::new();
+        let mut update = Some(4096);
+        super::super::write_block(&mut out, 1, &[0x88], true, 16384, &mut update);
+        assert_eq!(update, None);
+        // 9 bytes of frame header, then 0x20 (size 0), then 4096
+        assert_eq!(&out[9..], &[0x20, 0x3f, 0xe1, 0x1f, 0x88]);
+        let mut out = Vec::new();
+        let mut update = Some(0);
+        super::super::write_block(&mut out, 1, &[0x88], true, 16384, &mut update);
+        assert_eq!(&out[9..], &[0x20, 0x88]);
+    }
+
     /// A table too small for the lines: they go as literals, and the block
     /// still decodes.
     #[test]
