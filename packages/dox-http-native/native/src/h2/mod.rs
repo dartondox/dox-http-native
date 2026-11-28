@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use frame::{Error, Frame, Head};
 use hpack::{Decoded, Decoder, encode_field};
-use stream::{Recv, Stream};
+use stream::{Recv, Stream, Streams};
 
 use crate::run::{MAX_HEADERS, escape_target, length_line, parse_len, write_head};
 use crate::{BODY_END, BODY_PART, MAX_HEAD, REQ_HEAD};
@@ -302,7 +302,7 @@ pub(crate) struct H2 {
     peer_away: bool,
     /// a connection error: GOAWAY is sent, close once it is written
     dead: bool,
-    streams: HashMap<u32, Stream>,
+    streams: Streams,
     /// the last header lines from Dart, their status, and the block of
     /// `:status` and those lines: most answers repeat them
     head_lines: Vec<u8>,
@@ -431,7 +431,7 @@ impl H2 {
             away: false,
             peer_away: false,
             dead: false,
-            streams: HashMap::new(),
+            streams: Streams::default(),
             head_lines: Vec::new(),
             head_status: 0,
             head_cached: Vec::new(),
@@ -500,7 +500,7 @@ impl H2 {
     pub(crate) fn streamed(&self) -> impl Iterator<Item = u64> + '_ {
         self.streams
             .values()
-            .filter_map(|s| s.sid)
+            .filter_map(|s| s.sid())
             .chain(self.gone_streams.iter().copied())
             .chain(self.expired_streams.iter().copied())
             .chain(self.zombies.values().filter_map(|z| z.1))
@@ -950,7 +950,7 @@ impl H2 {
                 self.worked = true;
             }
             if !data.is_empty() {
-                s.owed += data.len() as u64;
+                s.rare().owed += data.len() as u64;
                 self.unacked += data.len() as u64;
                 // Join it to a part of this stream that waits for Dart:
                 // 1M frames of 1 byte must not be 1M records.
@@ -1022,8 +1022,8 @@ impl H2 {
             let Some((&victim, _)) = self
                 .streams
                 .iter()
-                .filter(|(_, s)| s.owed > 0)
-                .max_by_key(|(sid, s)| (s.owed, std::cmp::Reverse(**sid)))
+                .filter(|(_, s)| s.owed() > 0)
+                .max_by_key(|(sid, s)| (s.owed(), std::cmp::Reverse(**sid)))
             else {
                 break; // nothing to free (can not happen: n <= MAX_FRAME)
             };
@@ -1332,16 +1332,16 @@ impl H2 {
             self.seqs.remove(&s.seq);
             self.unsent -= s.unsent();
             // what Dart never acked will not be acked now
-            self.unacked -= s.owed;
+            self.unacked -= s.owed();
             // Dart knows the request once its body is whole (or streams)
             if !s.answered && s.known() {
                 self.gone.push(s.seq);
             }
             // Dart (or a gzip job) still works on it, or a streamed answer
             // is not over: it keeps its slot
-            if (!s.answered && s.known()) || s.zip.is_some() || (s.sid.is_some() && !s.done) {
-                self.zombies
-                    .insert(s.seq, (self.now, s.sid.filter(|_| !s.done)));
+            let sid = s.sid().filter(|_| !s.done);
+            if (!s.answered && s.known()) || s.zipping() || sid.is_some() {
+                self.zombies.insert(s.seq, (self.now, sid));
             }
             if s.streaming() {
                 self.to_dart.push((s.seq, BODY_END, 1, Vec::new()));
@@ -1349,7 +1349,7 @@ impl H2 {
             if let Some(r) = &s.recv {
                 self.buffered -= r.data.len();
             }
-            if let Some(sid) = s.sid.filter(|_| !s.done) {
+            if let Some(sid) = sid {
                 self.gone_streams.push(sid);
             }
         }
@@ -1392,9 +1392,11 @@ impl H2 {
             return;
         };
         // never more than owed (also after the body ended)
-        let free = n.min(s.owed);
-        s.owed -= free;
-        self.unacked -= free;
+        if let Some(r) = s.rare.as_mut() {
+            let free = n.min(r.owed);
+            r.owed -= free;
+            self.unacked -= free;
+        }
         if let Some(r) = s.recv.as_mut().filter(|r| r.streamed) {
             // never more than the client used: the window stays <= ours
             let used = (STREAM_WINDOW - r.window) as u64;
@@ -1453,7 +1455,7 @@ impl H2 {
         match self.due(seq) {
             Some((_, s)) if !s.head => {
                 s.answered = true;
-                s.zip = Some((status, lines.to_vec()));
+                s.rare().zip = Some((status, lines.to_vec()));
                 true
             }
             _ => false,
@@ -1468,7 +1470,11 @@ impl H2 {
         let Some(&id) = self.seqs.get(&seq) else {
             return;
         };
-        let Some((status, lines)) = self.streams.get_mut(&id).and_then(|s| s.zip.take()) else {
+        let Some((status, lines)) = self
+            .streams
+            .get_mut(&id)
+            .and_then(|s| s.rare.as_mut()?.zip.take())
+        else {
             return;
         };
         self.send_answer(id, status, &lines, body, date, out);
@@ -1544,8 +1550,9 @@ impl H2 {
             self.finish(out, id, false);
             return false;
         }
-        s.sid = Some(sid);
-        s.left = left;
+        let r = s.rare();
+        r.sid = Some(sid);
+        r.left = left;
         self.part(seq, first, false, true, b"", out);
         true
     }
@@ -1576,25 +1583,26 @@ impl H2 {
         let Some(s) = self.streams.get_mut(&id) else {
             return;
         };
-        if s.sid.is_none() || s.done {
+        if s.sid().is_none() || s.done {
             return;
         }
         let n = data.len() as u64;
-        if !ok || s.left.is_some_and(|l| n > l || (end && n < l)) {
+        let left = s.rare().left;
+        if !ok || left.is_some_and(|l| n > l || (end && n < l)) {
             // the body is not whole: the client must see it is cut. The
             // handler is over when this is the end: no zombie for it.
             s.done |= end;
             self.reset(out, id, frame::INTERNAL_ERROR);
             return;
         }
-        if let Some(l) = s.left.as_mut() {
+        if let Some(l) = s.rare().left.as_mut() {
             *l -= n;
         }
         s.push(data);
         self.unsent += data.len();
         s.done = end;
         if end {
-            push_lines(trailers, &mut s.trailers);
+            push_lines(trailers, &mut s.rare().trailers);
         }
         if s.unsent() > 0 {
             if !s.turn {
@@ -1603,13 +1611,13 @@ impl H2 {
             }
         } else if end {
             // all bytes are out: the trailers, or an empty DATA, end it
-            if s.trailers.is_empty() {
+            if s.trailers().is_empty() {
                 frame::write(out, frame::DATA, frame::END_STREAM, id, &[]);
             } else {
                 write_block(
                     out,
                     id,
-                    &s.trailers,
+                    s.trailers(),
                     true,
                     self.peer_frame,
                     &mut self.table_update,
@@ -1730,8 +1738,8 @@ impl H2 {
         // the whole body fits the windows and one frame, and no other
         // stream waits: one DATA frame now, with no copy of the body
         if self.turns.is_empty()
-            && s.trailers.is_empty()
-            && s.sid.is_none()
+            && s.trailers().is_empty()
+            && s.sid().is_none()
             && n <= self.peer_frame.min(MAX_FRAME)
             && (n as i64) <= self.window
             && (n as i64) <= s.window
@@ -1789,7 +1797,7 @@ impl H2 {
             misses = 0;
             let end = s.done && k == s.unsent();
             // with trailers, their HEADERS ends the stream
-            let flags = if end && s.trailers.is_empty() {
+            let flags = if end && s.trailers().is_empty() {
                 frame::END_STREAM
             } else {
                 0
@@ -1803,17 +1811,17 @@ impl H2 {
             self.pings_rate.n = 0; // see MAX_PINGS
             s.window -= k as i64;
             self.window -= k as i64;
-            if let Some(sid) = s.sid {
+            if let Some(sid) = s.sid() {
                 let at = written + (out.len() - wpos) as u64;
                 marks.push_back((at, sid, k as u64));
             }
             if end {
                 s.turn = false;
-                if !s.trailers.is_empty() {
+                if !s.trailers().is_empty() {
                     write_block(
                         out,
                         id,
-                        &s.trailers,
+                        s.trailers(),
                         true,
                         self.peer_frame,
                         &mut self.table_update,
