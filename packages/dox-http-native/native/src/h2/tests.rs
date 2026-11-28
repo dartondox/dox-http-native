@@ -1412,6 +1412,143 @@ mod conn {
         assert_eq!(c.h2.open(), 0);
     }
 
+    fn fields_of(block: &[u8]) -> Vec<String> {
+        decode(block)
+            .iter()
+            .map(|(n, v)| format!("{n}: {v}"))
+            .collect()
+    }
+
+    /// The block of `:status` and the lines is kept: the next answers with
+    /// the same lines reuse it, new lines or a new status make a new one.
+    #[test]
+    fn answers_reuse_the_header_block() {
+        let mut c = Client::new(250);
+        for id in [1, 3, 5, 7] {
+            c.get(id, GET);
+        }
+        let a = b"content-type: application/json\r\nx-a: 1\r\n";
+        let b = b"content-type: text/plain\r\n";
+        let date = "date: Thu, 01 Jan 2026 00:00:00 GMT";
+        let want = |status: &str, more: &[&str], len: usize| {
+            let mut v = vec![format!(":status: {status}")];
+            v.extend(more.iter().map(|s| s.to_string()));
+            v.push(format!("content-length: {len}"));
+            v.push(date.to_string());
+            v
+        };
+        let fs = c.answer(0, 200, a, b"one");
+        let more = ["content-type: application/json", "x-a: 1"];
+        assert_eq!(fields_of(&fs[0].1), want("200", &more, 3));
+        let fs = c.answer(1, 200, a, b"second body");
+        assert_eq!(fields_of(&fs[0].1), want("200", &more, 11));
+        let fs = c.answer(2, 200, b, b"x");
+        assert_eq!(
+            fields_of(&fs[0].1),
+            want("200", &["content-type: text/plain"], 1)
+        );
+        let fs = c.answer(3, 404, b, b"");
+        assert_eq!(
+            fields_of(&fs[0].1),
+            want("404", &["content-type: text/plain"], 0)
+        );
+        assert_eq!(c.h2.open(), 0);
+    }
+
+    /// A body that fits one frame and the windows goes out at once, with
+    /// END_STREAM, and the stream is done.
+    #[test]
+    fn a_small_body_goes_out_at_once() {
+        let mut c = Client::new(250);
+        c.get(1, GET);
+        let mut out = Vec::new();
+        c.h2.answer(0, 200, b"", b"hello", DATE, &mut out);
+        // in the answer itself, before any send(): no queue
+        let fs = frames(&out);
+        assert_eq!(
+            kinds(&fs),
+            vec![
+                (frame::HEADERS, frame::END_HEADERS, 1),
+                (frame::DATA, frame::END_STREAM, 1)
+            ]
+        );
+        assert_eq!(fs[1].1, b"hello");
+        assert_eq!(c.h2.open(), 0);
+        assert_eq!(c.h2.unsent, 0);
+        assert!(c.pump().is_empty());
+    }
+
+    /// A stream that waits keeps its turn: a small answer after it goes to
+    /// the queue too, and the order of the DATA frames is kept.
+    #[test]
+    fn a_small_body_waits_behind_a_queued_one() {
+        let mut c = Client::new(250);
+        c.get(1, GET);
+        c.get(3, GET);
+        // 100 kB: more than the stream window of 64 kB, so stream 1 waits
+        let big = vec![1u8; 100_000];
+        c.answer(0, 200, b"", &big);
+        assert!(c.h2.unsent > 0);
+        let fs = c.answer(1, 200, b"", b"small");
+        // only the HEADERS of stream 3 now: its body waits for its turn
+        assert_eq!(kinds(&fs), vec![(frame::HEADERS, frame::END_HEADERS, 3)]);
+        assert!(c.h2.unsent >= 5);
+        // more window: stream 1 and then stream 3 send
+        let mut w = Vec::new();
+        frame::write_window(&mut w, 0, 1 << 20);
+        frame::write_window(&mut w, 1, 1 << 20);
+        c.feed(&w);
+        let fs = c.pump();
+        let data: Vec<u32> = fs
+            .iter()
+            .filter(|(h, _)| h.kind == frame::DATA)
+            .map(|(h, _)| h.id)
+            .collect();
+        assert!(data.contains(&3), "{data:?}");
+        let end3 = fs
+            .iter()
+            .find(|(h, _)| h.kind == frame::DATA && h.id == 3)
+            .unwrap();
+        assert_eq!(end3.1, b"small");
+        assert_eq!(end3.0.flags, frame::END_STREAM);
+    }
+
+    /// A body bigger than one frame, or bigger than the stream window,
+    /// goes the queued way: split into frames, held by the window.
+    #[test]
+    fn a_big_or_blocked_body_is_queued() {
+        let mut c = Client::new(250);
+        c.get(1, GET);
+        let body = vec![2u8; 20_000];
+        let mut out = Vec::new();
+        c.h2.answer(0, 200, b"", &body, DATE, &mut out);
+        // no DATA in the answer: it waits for send()
+        assert_eq!(
+            kinds(&frames(&out)),
+            vec![(frame::HEADERS, frame::END_HEADERS, 1)]
+        );
+        let fs = c.pump();
+        let sizes: Vec<usize> = fs.iter().map(|(_, p)| p.len()).collect();
+        assert_eq!(sizes, vec![16_384, 3_616]);
+        assert_eq!(fs[1].0.flags, frame::END_STREAM);
+
+        // a stream window of 10 bytes: 10 go, the rest waits
+        let mut c = Client::new(250);
+        let mut s = Vec::new();
+        s.extend_from_slice(&4u16.to_be_bytes()); // INITIAL_WINDOW_SIZE
+        s.extend_from_slice(&10u32.to_be_bytes());
+        c.send(frame::SETTINGS, 0, 0, &s);
+        c.get(1, GET);
+        let fs = c.answer(0, 200, b"", b"twenty bytes of body");
+        let data: Vec<&Vec<u8>> = fs
+            .iter()
+            .filter(|(h, _)| h.kind == frame::DATA)
+            .map(|(_, p)| p)
+            .collect();
+        assert_eq!(data, vec![&b"twenty byt".to_vec()]);
+        assert_eq!(c.h2.open(), 1);
+    }
+
     #[test]
     fn send_windows() {
         let mut c = Client::new(250);

@@ -302,6 +302,13 @@ pub(crate) struct H2 {
     /// a connection error: GOAWAY is sent, close once it is written
     dead: bool,
     streams: HashMap<u32, Stream>,
+    /// the last header lines from Dart, their status, and the block of
+    /// `:status` and those lines: most answers repeat them
+    head_lines: Vec<u8>,
+    head_status: u16,
+    head_cached: Vec<u8>,
+    /// the header block of the answer being sent, kept to reuse its memory
+    head_buf: Vec<u8>,
     /// request seq to stream id
     seqs: HashMap<u32, u32>,
     /// streams with body bytes to send, in turn order
@@ -416,6 +423,10 @@ impl H2 {
             peer_away: false,
             dead: false,
             streams: HashMap::new(),
+            head_lines: Vec::new(),
+            head_status: 0,
+            head_cached: Vec::new(),
+            head_buf: Vec::new(),
             seqs: HashMap::new(),
             turns: VecDeque::new(),
             zombies: HashMap::new(),
@@ -1577,28 +1588,74 @@ impl H2 {
         if self.dead {
             return;
         }
-        let Some(s) = self.streams.get_mut(&id) else {
+        let Some(head) = self.streams.get(&id).map(|s| s.head) else {
             return;
         };
         let status = final_status(status);
         let no_body = status == 204 || status == 304;
         // a HEAD answer with no body keeps the length that Dart set
-        let len = (!no_body).then(|| match length_line(lines) {
-            Some(Some(n)) if s.head && body.is_empty() => n,
-            _ => body.len() as u64,
+        let len = (!no_body).then(|| {
+            if head
+                && body.is_empty()
+                && let Some(Some(n)) = length_line(lines)
+            {
+                return n;
+            }
+            body.len() as u64
         });
-        let silent = no_body || s.head || body.is_empty();
-        let block = head_block(status, lines, len, date);
+        let silent = no_body || head || body.is_empty();
+        // the block of `:status` and the lines: encoded again only when
+        // they change
+        if status != self.head_status || lines != &self.head_lines[..] {
+            self.head_cached.clear();
+            status_field(status, &mut self.head_cached);
+            push_lines(lines, &mut self.head_cached);
+            self.head_status = status;
+            self.head_lines.clear();
+            self.head_lines.extend_from_slice(lines);
+        }
+        let mut block = std::mem::take(&mut self.head_buf);
+        block.clear();
+        block.extend_from_slice(&self.head_cached);
+        if let Some(n) = len {
+            length_field(n, &mut block);
+        }
+        date_field(date, &mut block);
         frame::write_headers(out, id, &block, silent, self.peer_frame);
+        self.head_buf = block;
         if silent {
             self.finish(out, id, false);
-        } else {
-            s.body = body.to_vec();
-            self.unsent += body.len();
-            s.done = true;
-            s.turn = true;
-            self.turns.push_back(id);
+            return;
         }
+        let n = body.len();
+        let Some(s) = self.streams.get_mut(&id) else {
+            return;
+        };
+        // the whole body fits the windows and one frame, and no other
+        // stream waits: one DATA frame now, with no copy of the body
+        if self.turns.is_empty()
+            && s.trailers.is_empty()
+            && s.sid.is_none()
+            && n <= self.peer_frame.min(MAX_FRAME)
+            && (n as i64) <= self.window
+            && (n as i64) <= s.window
+        {
+            frame::write(out, frame::DATA, frame::END_STREAM, id, body);
+            s.wrote = true;
+            s.stalled = None;
+            s.window -= n as i64;
+            s.done = true;
+            self.window -= n as i64;
+            self.data_sent += n as u64;
+            self.pings_rate.n = 0;
+            self.finish(out, id, true);
+            return;
+        }
+        s.body = body.to_vec();
+        self.unsent += n;
+        s.done = true;
+        s.turn = true;
+        self.turns.push_back(id);
     }
 
     /// Adds DATA frames to `out` while less than [HOLD] waits there and
@@ -1742,6 +1799,24 @@ fn give_back(out: &mut Vec<u8>, id: u32, r: &mut Recv) {
         r.window += r.acked as i64;
         r.acked = 0;
     }
+}
+
+/// `content-length: n`: a literal with the name of static entry 28, and
+/// the digits with no `String` in between.
+fn length_field(n: u64, out: &mut Vec<u8>) {
+    let mut digits = [0u8; 20];
+    let mut at = digits.len();
+    let mut v = n;
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    hpack::write_int(28, 4, 0x00, out);
+    hpack::write_str(&digits[at..], out);
 }
 
 fn status_field(status: u16, out: &mut Vec<u8>) {
