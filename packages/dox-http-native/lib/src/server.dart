@@ -455,6 +455,11 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   /// the requests of the batch being read. Kept, so no list per batch.
   final List<NativeRequest> _batch = <NativeRequest>[];
 
+  /// the ids of the requests of this batch that were answered at once.
+  /// Only ids: the answered requests are garbage before the batch ends,
+  /// so the young space of the heap stays small under load.
+  final List<int> _answeredIds = <int>[];
+
   /// Frees an external body when Dart is done with it.
   static final Pointer<NativeFinalizerFunction> _freeBody =
       Native.addressOf<NativeFinalizerFunction>(doxFreeBody);
@@ -471,6 +476,8 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
       if (!res.isClosed && !res.headSent) res.markGone();
       return;
     }
+    // answered at once: nothing waits
+    if (_answeredIds.contains(id)) return;
     // An open request of an earlier batch whose `done` is not read yet:
     // Rust handled every answer Dart gave before this batch, so it is
     // still live. ponytail: at most [maxGoneIds] ids, the oldest go first.
@@ -479,6 +486,9 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
     if (goneIds.length >= maxGoneIds) goneIds.remove(goneIds.first);
     goneIds.add(id);
   }
+
+  /// the body of a request with none: no view per request
+  static final Uint8List _noBody = Uint8List(0);
 
   /// The requests and messages from one `dox_run` call.
   void _onBatch(Uint8List b) {
@@ -497,13 +507,13 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
         int blen = d.getUint32(p + 20, Endian.little);
         int remotePort = d.getUint16(p + 24, Endian.little);
         int q = p + 28;
-        Uint8List ip = Uint8List.sublistView(b, q, q + 16);
+        int ipAt = q;
         q += 16;
         String method = _method(b, q, mlen);
         q += mlen;
         String target = String.fromCharCodes(b, q, q + tlen);
         q += tlen;
-        Uint8List headers = Uint8List.sublistView(b, q, q + hlen);
+        int headersAt = q;
         q += hlen;
         // flag bit 2: the body is in native memory (address, token,
         // length), freed by its finalizer
@@ -516,6 +526,8 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
                       d.getUint64(q + 8, Endian.little),
                     ),
                   )
+            : blen == 0
+            ? _noBody
             : Uint8List.sublistView(b, q, q + blen);
         p = q + blen;
         int kind = (flags >> 8) & 0xff;
@@ -550,14 +562,16 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
           continue;
         }
         _open++;
-        NativeRequest req = NativeRequest(
+        NativeRequest req = NativeRequest.inBatch(
           this,
           id,
           method,
           target,
-          headers,
+          b,
+          headersAt,
+          hlen,
           body,
-          ip,
+          ipAt,
           remotePort,
           http10: flags & 1 == 1,
           http2: flags & 8 == 8,
@@ -567,6 +581,14 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
         if (flags & 16 == 16) bodies[id] = req;
         _batch.add(req);
         _requests.add(req);
+        // most handlers answer at once: the request needs no copy at the
+        // end of the batch, so the list lets it go now
+        if (req.isAnswered &&
+            !req.isWebSocketUpgrade &&
+            identical(_batch.last, req)) {
+          _batch.removeLast();
+          _answeredIds.add(id);
+        }
       }
     } finally {
       // a request still open after its batch (an async handler, a stream)
@@ -577,6 +599,7 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
         if (!req.isAnswered || req.isWebSocketUpgrade) req.detach(b);
       }
       _batch.clear();
+      _answeredIds.clear();
       // Rust stops reading WebSocket frames while Dart is too far behind
       if (wsBytes > 0) {
         sendWebSocket(wsBytes, NativeWebSocket.kindAck, 0, const <int>[]);
@@ -929,11 +952,14 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
     // is short, and a microtask pump that is already queued is not delayed.
     if (_partsWaiting || ++_chain & 15 == 0 || _waitedUs >= _budgetUs) {
       _waitedUs = 0;
-      Timer.run(_pump);
+      Timer.run(_pumpCallback);
     } else {
-      scheduleMicrotask(_pump);
+      scheduleMicrotask(_pumpCallback);
     }
   }
+
+  /// [_pump] as one closure: a tear-off makes a new one on each use
+  late final void Function() _pumpCallback = _pump;
 
   /// true when the client takes gzip and the body is not encoded yet.
   /// Then it sets `content-encoding` and Rust gzips the body. When the

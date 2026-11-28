@@ -84,4 +84,49 @@ void main() {
       expect(plain, greaterThan(1000));
     });
   });
+
+  group('NativeRequest.plainQueryOf', () {
+    test('plain targets give the text after ?', () {
+      expect(NativeRequest.plainQueryOf('/'), '');
+      expect(NativeRequest.plainQueryOf('/a?'), '');
+      expect(NativeRequest.plainQueryOf('/a?x=1&y=2'), 'x=1&y=2');
+      expect(NativeRequest.plainQueryOf('/a?b=/../c?d'), 'b=/../c?d');
+    });
+
+    test('other targets need the full parse', () {
+      for (String t in <String>[
+        '//a?x=1',
+        '/a/../b?x=1',
+        '/a?x=%41',
+        '/a?x=1 2',
+        '/a?x="',
+        '/a?x=<b>',
+        '/a?x=é',
+        '/a?x=1#f',
+        '/a?x={}',
+        'http://h/a?x=1',
+      ]) {
+        expect(NativeRequest.plainQueryOf(t), isNull, reason: t);
+      }
+    });
+
+    test('a plain query is always the same as uri.query', () {
+      const String chars = "/ab.%?#=&-_~!\$'()*+,;:@ \"<>\\^`{|}é09AZ[]";
+      Random r = Random(11);
+      int plain = 0;
+      for (int i = 0; i < 200000; i++) {
+        int len = 1 + r.nextInt(12);
+        StringBuffer b = StringBuffer('/p?');
+        for (int k = 0; k < len; k++) {
+          b.write(chars[r.nextInt(chars.length)]);
+        }
+        String t = b.toString();
+        String? q = NativeRequest.plainQueryOf(t);
+        if (q == null) continue;
+        plain++;
+        expect(q, Uri.parse(t).query, reason: t);
+      }
+      expect(plain, greaterThan(1000));
+    });
+  });
 }

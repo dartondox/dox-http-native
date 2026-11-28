@@ -574,6 +574,43 @@ void main() {
     await s.close();
   });
 
+  test('a request in a batch reads its headers and ip from offsets, and '
+      'detach copies them', () async {
+    NativeHttpServer s = await NativeHttpServer.bind(0, address: '127.0.0.1');
+    Uint8List batch = Uint8List.fromList(<int>[
+      9, 9, // other bytes
+      ...<int>[1, 0, 1, 0, 120, 121], // header x: y
+      ...List<int>.filled(16, 0)..[15] = 1, // ip ::1
+    ]);
+    for (bool early in <bool>[false, true]) {
+      NativeRequest req = NativeRequest.inBatch(
+        s,
+        1,
+        'GET',
+        '/',
+        batch,
+        2,
+        6,
+        Uint8List(0),
+        8,
+        5,
+        http10: false,
+      );
+      if (early) {
+        expect(req.headers.value('x'), 'y');
+        expect(req.connectionInfo.remoteAddress.address, '::1');
+      }
+      req.detach(batch);
+      Uint8List copy = Uint8List.fromList(batch);
+      batch.fillRange(0, batch.length, 0);
+      expect(req.headers.value('x'), 'y');
+      expect(req.connectionInfo.remoteAddress.address, '::1');
+      expect(req.connectionInfo.remotePort, 5);
+      batch.setAll(0, copy);
+    }
+    await s.close();
+  });
+
   test('POST body comes back the same', () async {
     List<int> body = List<int>.generate(1000, (int i) => i % 256);
     HttpClientRequest req = await client.post('127.0.0.1', port, '/echo');

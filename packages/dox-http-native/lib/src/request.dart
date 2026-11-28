@@ -20,15 +20,36 @@ class NativeRequest extends Stream<Uint8List> implements HttpRequest {
     this.id,
     this.method,
     this._target,
-    this._rawHeaders,
+    Uint8List rawHeaders,
     this._body,
-    this._ip,
+    Uint8List ip,
     this._remotePort, {
     required this._http10,
     this._http2 = false,
     this.isStreamed = false,
     this.isWebSocketUpgrade = false,
-  });
+  }) : _rawHeaders = rawHeaders,
+       _ip = ip;
+
+  /// For the server: the headers and the address stay offsets into
+  /// [batch] until they are read, so a request that never reads them
+  /// makes no view object for them.
+  NativeRequest.inBatch(
+    this.server,
+    this.id,
+    this.method,
+    this._target,
+    Uint8List batch,
+    this._headersAt,
+    this._headersLength,
+    this._body,
+    this._ipAt,
+    this._remotePort, {
+    required this._http10,
+    this._http2 = false,
+    this.isStreamed = false,
+    this.isWebSocketUpgrade = false,
+  }) : _batch = batch;
 
   final NativeHttpServer server;
 
@@ -40,9 +61,24 @@ class NativeRequest extends Stream<Uint8List> implements HttpRequest {
 
   final String _target;
   // not final: [detach] swaps views into the batch for copies
-  Uint8List _rawHeaders;
+  Uint8List? _rawHeaders;
   Uint8List _body;
-  Uint8List _ip;
+  Uint8List? _ip;
+
+  /// the batch of [NativeRequest.inBatch], until [detach]
+  Uint8List? _batch;
+  int _headersAt = 0;
+  int _headersLength = 0;
+  int _ipAt = 0;
+
+  Uint8List get _headerBytes => _rawHeaders ??= Uint8List.sublistView(
+    _batch!,
+    _headersAt,
+    _headersAt + _headersLength,
+  );
+
+  Uint8List get _ipBytes =>
+      _ip ??= Uint8List.sublistView(_batch!, _ipAt, _ipAt + 16);
   final int _remotePort;
   final bool _http10;
 
@@ -62,7 +98,7 @@ class NativeRequest extends Stream<Uint8List> implements HttpRequest {
 
   @override
   NativeHeaders get headers =>
-      _headers ??= NativeHeaders.request(_rawHeaders, http10: _http10);
+      _headers ??= NativeHeaders.request(_headerBytes, http10: _http10);
 
   @override
   late final Uri uri = _uri(_target);
@@ -77,8 +113,16 @@ class NativeRequest extends Stream<Uint8List> implements HttpRequest {
   /// `//`, no `#`, no segment that starts with `.`, and only characters
   /// that a path keeps as they are (no `%`, no space, no non-ASCII).
   static String? plainPath(String target) {
+    int end = _plainPathEnd(target);
+    if (end < 0) return null;
+    return end == target.length ? target : target.substring(0, end);
+  }
+
+  /// The end of the plain path of [target] (see [plainPath]), -1 when it
+  /// is not plain.
+  static int _plainPathEnd(String target) {
     int n = target.length;
-    if (n == 0 || target.codeUnitAt(0) != 0x2f) return null;
+    if (n == 0 || target.codeUnitAt(0) != 0x2f) return -1;
     int prev = 0x2f;
     for (int i = 1; i < n; i++) {
       int c = target.codeUnitAt(i);
@@ -86,16 +130,34 @@ class NativeRequest extends Stream<Uint8List> implements HttpRequest {
         // `?`: the rest is the query. A `#` in it changes the query, not
         // the path, but stay with the full parse for it.
         for (int j = i + 1; j < n; j++) {
-          if (target.codeUnitAt(j) == 0x23) return null;
+          if (target.codeUnitAt(j) == 0x23) return -1;
         }
-        return target.substring(0, i);
+        return i;
       }
-      if (c >= 128 || !_pathSafe[c]) return null;
+      if (c >= 128 || !_pathSafe[c]) return -1;
       // `//`, or a segment that starts with `.` (`/.`, `/..`, `/.well-known`)
-      if (prev == 0x2f && (c == 0x2f || c == 0x2e)) return null;
+      if (prev == 0x2f && (c == 0x2f || c == 0x2e)) return -1;
       prev = c;
     }
-    return target;
+    return n;
+  }
+
+  /// The query of the target (the text after `?`, `''` for none), when it
+  /// is the same text as `uri.query`: the path is plain (see [plainPath])
+  /// and the query has only characters that a [Uri] query keeps as they
+  /// are (no `%`, no space, no non-ASCII). Else null: read [uri].
+  String? plainQuery() => plainQueryOf(_target);
+
+  /// [plainQuery] of [target].
+  static String? plainQueryOf(String target) {
+    int end = _plainPathEnd(target);
+    if (end < 0) return null;
+    if (end == target.length) return '';
+    for (int i = end + 1; i < target.length; i++) {
+      int c = target.codeUnitAt(i);
+      if (c >= 128 || !(c == 0x3f || _pathSafe[c])) return null;
+    }
+    return target.substring(end + 1);
   }
 
   /// ASCII characters that a [Uri] path keeps as they are: letters,
@@ -136,11 +198,14 @@ class NativeRequest extends Stream<Uint8List> implements HttpRequest {
     if (headers != null) {
       headers.detach();
       _rawHeaders = _none;
-    } else if (_rawHeaders.buffer == buffer) {
-      _rawHeaders = Uint8List.fromList(_rawHeaders);
+    } else {
+      Uint8List raw = _headerBytes;
+      if (raw.buffer == buffer) _rawHeaders = Uint8List.fromList(raw);
     }
     if (_body.buffer == buffer) _body = Uint8List.fromList(_body);
-    if (_ip.buffer == buffer) _ip = Uint8List.fromList(_ip);
+    Uint8List ip = _ipBytes;
+    if (ip.buffer == buffer) _ip = Uint8List.fromList(ip);
+    _batch = null;
   }
 
   static final Uint8List _none = Uint8List(0);
@@ -202,7 +267,7 @@ class NativeRequest extends Stream<Uint8List> implements HttpRequest {
 
   @override
   late final HttpConnectionInfo connectionInfo = _ConnectionInfo(
-    InternetAddress.fromRawAddress(_ip),
+    InternetAddress.fromRawAddress(_ipBytes),
     _remotePort,
     server.port,
   );
@@ -232,7 +297,8 @@ class NativeRequest extends Stream<Uint8List> implements HttpRequest {
   /// bytes from Rust the listener did not take yet, in one buffer: a
   /// million tiny parts are one chunk, not a million objects. At most the
   /// stream window of Rust (1 MiB): the client waits for our acks.
-  final BytesBuilder _waiting = BytesBuilder();
+  /// Made on the first part: most requests have no streamed body.
+  late final BytesBuilder _waiting = BytesBuilder();
 
   /// sync: a part counts as taken once `add` returns (the listener's
   /// `onData` ran). A paused listener gets no part, so none is acked.
