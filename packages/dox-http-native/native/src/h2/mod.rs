@@ -1625,7 +1625,8 @@ impl H2 {
     /// lines fit the client's dynamic table, the first block clears the
     /// table (two size updates) and adds them, and the next blocks name
     /// them with one index byte each. The table changes only here, so it
-    /// holds exactly these fields until the lines change again.
+    /// holds exactly these fields until the lines change again. Lines with
+    /// a secret (eg. `set-cookie`) are never added.
     fn cache_head(&mut self, status: u16, lines: &[u8]) {
         let mut fields: Vec<(Vec<u8>, &[u8])> = Vec::new();
         each_line(lines, |name, value| fields.push((name, value)));
@@ -1633,7 +1634,10 @@ impl H2 {
         let cap = self.peer_table;
         self.head_cached.clear();
         status_field(status, &mut self.head_cached);
-        if fields.is_empty() || size > cap {
+        // a secret line never goes in the table (and changes on most
+        // answers, so the table gives nothing there)
+        let secret = fields.iter().any(|(name, _)| hpack::secret(name));
+        if fields.is_empty() || size > cap || secret {
             for (name, value) in &fields {
                 encode_field(name, value, &mut self.head_cached);
             }

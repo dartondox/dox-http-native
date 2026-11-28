@@ -1569,6 +1569,31 @@ mod conn {
         assert_eq!(&out[9..], &[0x20, 0x88]);
     }
 
+    /// A secret line (set-cookie) never goes in the client's table, and it
+    /// is sent as never indexed (RFC 7541 7.1.3).
+    #[test]
+    fn hpack_secret_lines_are_never_indexed() {
+        let mut c = Client::new(250);
+        let mut d = Decoder::new(4096);
+        for id in [1, 3] {
+            c.get(id, GET);
+        }
+        let a = b"content-type: application/json\r\nset-cookie: s=secret\r\n";
+        for seq in 0..2 {
+            let fs = c.answer(seq, 200, a, b"z");
+            let block = &fs[0].1;
+            let fields = fields_with(&mut d, block);
+            assert!(fields.contains(&"set-cookie: s=secret".to_string()));
+            // never indexed, with the name of static entry 55
+            assert!(block.windows(2).any(|w| w == [0x1f, 0x28]), "{block:?}");
+            assert_eq!(d.table().0, 0, "the table holds nothing");
+        }
+        let mut out = Vec::new();
+        encode_field(b"authorization", b"Bearer x", &mut out);
+        // never indexed, with the name of static entry 23
+        assert_eq!(&out[..2], &[0x1f, 0x08]);
+    }
+
     /// A table too small for the lines: they go as literals, and the block
     /// still decodes.
     #[test]
