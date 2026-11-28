@@ -1086,8 +1086,13 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
     int start = budget > 0 ? _clock.elapsedMicroseconds : 0;
     int n = doxRun(_handle, _outPtr, _len, _inPtr, _inList.length, budget);
     if (budget > 0) _waitedUs += _clock.elapsedMicroseconds - start;
+    int used = _len;
     _len = 0;
-    if (_out.length > 1 << 20) {
+    // A busy batch (thousands of JSON answers) can need many MB. The
+    // buffer is kept while batches use it, else each batch grows it again
+    // from 64 kB (a new buffer and a copy for each doubling). It is made
+    // small again after a batch that used less than a quarter of it.
+    if (_out.length > 1 << 20 && used * 4 < _out.length) {
       // do not keep a big body buffer forever
       doxFree(_outPtr, _out.length);
       _outPtr = doxAlloc(1 << 16);

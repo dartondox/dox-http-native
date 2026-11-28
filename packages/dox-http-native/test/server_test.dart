@@ -37,6 +37,9 @@ void handle(HttpRequest req) async {
       // only the content type changes: the headers stay the defaults
       res.headers.contentType = ContentType.json;
       res.write('{"a":"${'a' * 1000}"}');
+    case String p when p.startsWith('/big/'):
+      // 20 kB: many in one batch need a send buffer of many MB
+      res.write('${p.substring(5)}:${'b' * 20000}');
     case '/jpeg':
       res.headers.contentType = ContentType('image', 'jpeg');
       res.add(List<int>.filled(1000, 7));
@@ -716,6 +719,43 @@ void main() {
       for (int i = 0; i < 16; i++)
         i == 3 ? 'slow done' : (i == 9 ? 'body' : '$i'),
     ]);
+  });
+
+  /// The send buffer grows for a big batch, is kept for the next big
+  /// one, and is made small again after a small one. Each answer must
+  /// still be whole and in order.
+  test('big batches, then a small one: every answer is right', () async {
+    List<String> answers(String out) {
+      List<String> bodies = <String>[];
+      int at = 0;
+      while (true) {
+        int head = out.indexOf('\r\n\r\n', at);
+        if (head < 0) break;
+        String length = RegExp(
+          r'content-length: (\d+)',
+          caseSensitive: false,
+        ).firstMatch(out.substring(at, head))![1]!;
+        at = head + 4 + int.parse(length);
+        bodies.add(out.substring(head + 4, at));
+      }
+      return bodies;
+    }
+
+    for (int count in <int>[300, 300, 2, 300, 1]) {
+      String out = await raw(
+        port,
+        <String>[
+          for (int i = 0; i < count; i++)
+            'GET /big/$i HTTP/1.1\r\nHost: a\r\n'
+                '${i == count - 1 ? 'Connection: close\r\n' : ''}\r\n',
+        ].join(),
+      );
+      List<String> bodies = answers(out);
+      expect(bodies.length, count);
+      for (int i = 0; i < count; i++) {
+        expect(bodies[i], '$i:${'b' * 20000}', reason: 'batch $count, $i');
+      }
+    }
   });
 
   test('400 for garbage', () async {
