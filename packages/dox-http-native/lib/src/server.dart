@@ -647,8 +647,18 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
   late ByteData _outData = ByteData.sublistView(_out);
   int _len = 0;
 
-  Pointer<Uint8> _inPtr = doxAlloc(1 << 18);
-  late Uint8List _inList = _inPtr.asTypedList(1 << 18);
+  /// The batch of requests from Rust. 128 kB, not more: each batch is
+  /// copied into a Dart list, and a copy that is too big for the young
+  /// space goes to the old space and stays there as garbage until a full
+  /// GC. A smaller batch also keeps fewer requests alive at one time. On
+  /// the HttpArena json-h2c test (2 cores), 256 kB gave a peak of
+  /// 146 MiB, 128 kB gives 69 MiB. A request record is at most some 80 kB
+  /// (a body of 64 kB or more stays in native memory). A bigger
+  /// one grows the buffer, see [_pump].
+  static const int _inSize = 1 << 17;
+
+  Pointer<Uint8> _inPtr = doxAlloc(_inSize);
+  late Uint8List _inList = _inPtr.asTypedList(_inSize);
 
   /// requests given to the app and not answered yet
   int _open = 0;
@@ -1147,8 +1157,8 @@ class NativeHttpServer extends Stream<HttpRequest> implements HttpServer {
     if (_inList.length > 1 << 20) {
       // do not keep a big buffer forever
       doxFree(_inPtr, _inList.length);
-      _inPtr = doxAlloc(1 << 18);
-      _inList = _inPtr.asTypedList(1 << 18);
+      _inPtr = doxAlloc(_inSize);
+      _inList = _inPtr.asTypedList(_inSize);
     }
   }
 }
