@@ -165,6 +165,7 @@ const ACK_BATCH: u64 = STREAM_WINDOW as u64 / 2;
 const GRPC: &[u8] = b"application/grpc";
 
 // SETTINGS ids (RFC 9113 6.5.2)
+const HEADER_TABLE_SIZE: u16 = 1;
 const ENABLE_PUSH: u16 = 2;
 const MAX_CONCURRENT_STREAMS: u16 = 3;
 const INITIAL_WINDOW_SIZE: u16 = 4;
@@ -307,6 +308,14 @@ pub(crate) struct H2 {
     head_lines: Vec<u8>,
     head_status: u16,
     head_cached: Vec<u8>,
+    /// the block that adds the lines to the client's dynamic table, sent
+    /// once before [head_cached] (which names them by index)
+    head_first: Vec<u8>,
+    head_first_due: bool,
+    /// the client's SETTINGS_HEADER_TABLE_SIZE, at most our TABLE_SIZE
+    peer_table: usize,
+    /// a new table size: the next header block starts with its update
+    table_update: Option<usize>,
     /// the header block of the answer being sent, kept to reuse its memory
     head_buf: Vec<u8>,
     /// request seq to stream id
@@ -426,6 +435,10 @@ impl H2 {
             head_lines: Vec::new(),
             head_status: 0,
             head_cached: Vec::new(),
+            head_first: Vec::new(),
+            head_first_due: false,
+            peer_table: TABLE_SIZE,
+            table_update: None,
             head_buf: Vec::new(),
             seqs: HashMap::new(),
             turns: VecDeque::new(),
@@ -1074,8 +1087,15 @@ impl H2 {
                     }
                     self.peer_frame = v as usize;
                 }
-                // the rest does not matter to us: we never push, and our
-                // encoder uses no dynamic table
+                // the next header block must start with a size update
+                // (RFC 7541 4.2), and the table of the lines is built again
+                HEADER_TABLE_SIZE => {
+                    let cap = (v as usize).min(TABLE_SIZE);
+                    self.peer_table = cap;
+                    self.table_update = Some(cap);
+                    self.head_status = 0;
+                }
+                // the rest does not matter to us: we never push
                 _ => {}
             }
         }
@@ -1266,7 +1286,14 @@ impl H2 {
         status_field(status, &mut block);
         encode_field(b"content-length", b"0", &mut block);
         date_field(date, &mut block);
-        frame::write_headers(out, id, &block, true, self.peer_frame);
+        write_block(
+            out,
+            id,
+            &block,
+            true,
+            self.peer_frame,
+            &mut self.table_update,
+        );
         if !whole {
             frame::write_rst(out, id, frame::NO_ERROR);
             self.remember(id);
@@ -1489,7 +1516,11 @@ impl H2 {
         out: &mut Vec<u8>,
     ) -> bool {
         let max = self.peer_frame;
+        // write_block uses the due size update: take it before `s` borrows
+        // self. With no answer due it goes back.
+        let mut update = self.table_update.take();
         let Some((id, s)) = self.due(seq) else {
+            self.table_update = update;
             return false;
         };
         s.answered = true;
@@ -1501,7 +1532,14 @@ impl H2 {
             _ => None,
         };
         let silent = no_body || s.head;
-        frame::write_headers(out, id, &head_block(status, lines, left, date), silent, max);
+        write_block(
+            out,
+            id,
+            &head_block(status, lines, left, date),
+            silent,
+            max,
+            &mut update,
+        );
         if silent {
             self.finish(out, id, false);
             return false;
@@ -1568,12 +1606,57 @@ impl H2 {
             if s.trailers.is_empty() {
                 frame::write(out, frame::DATA, frame::END_STREAM, id, &[]);
             } else {
-                frame::write_headers(out, id, &s.trailers, true, self.peer_frame);
+                write_block(
+                    out,
+                    id,
+                    &s.trailers,
+                    true,
+                    self.peer_frame,
+                    &mut self.table_update,
+                );
             }
             // no DATA bytes (eg. a gRPC error with trailers only): no refund
             let paid = s.wrote;
             self.finish(out, id, paid);
         }
+    }
+
+    /// Encodes `:status` and Dart's `lines` for the next answers. When the
+    /// lines fit the client's dynamic table, the first block clears the
+    /// table (two size updates) and adds them, and the next blocks name
+    /// them with one index byte each. The table changes only here, so it
+    /// holds exactly these fields until the lines change again.
+    fn cache_head(&mut self, status: u16, lines: &[u8]) {
+        let mut fields: Vec<(Vec<u8>, &[u8])> = Vec::new();
+        each_line(lines, |name, value| fields.push((name, value)));
+        let size: usize = fields.iter().map(|(n, v)| n.len() + v.len() + 32).sum();
+        let cap = self.peer_table;
+        self.head_cached.clear();
+        status_field(status, &mut self.head_cached);
+        if fields.is_empty() || size > cap {
+            for (name, value) in &fields {
+                encode_field(name, value, &mut self.head_cached);
+            }
+            self.head_first_due = false;
+        } else {
+            let first = &mut self.head_first;
+            first.clear();
+            hpack::write_int(0, 5, 0x20, first);
+            hpack::write_int(cap, 5, 0x20, first);
+            status_field(status, first);
+            for (name, value) in &fields {
+                hpack::encode_insert(name, value, first);
+            }
+            // the last field added has the first dynamic index, 62
+            let k = fields.len();
+            for i in 0..k {
+                hpack::write_int(62 + (k - 1 - i), 7, 0x80, &mut self.head_cached);
+            }
+            self.head_first_due = true;
+        }
+        self.head_status = status;
+        self.head_lines.clear();
+        self.head_lines.extend_from_slice(lines);
     }
 
     fn send_answer(
@@ -1607,21 +1690,30 @@ impl H2 {
         // the block of `:status` and the lines: encoded again only when
         // they change
         if status != self.head_status || lines != &self.head_lines[..] {
-            self.head_cached.clear();
-            status_field(status, &mut self.head_cached);
-            push_lines(lines, &mut self.head_cached);
-            self.head_status = status;
-            self.head_lines.clear();
-            self.head_lines.extend_from_slice(lines);
+            self.cache_head(status, lines);
         }
         let mut block = std::mem::take(&mut self.head_buf);
         block.clear();
-        block.extend_from_slice(&self.head_cached);
+        let first = std::mem::take(&mut self.head_first_due);
+        if first {
+            // its own size updates come first: a due one is not needed
+            self.table_update = None;
+            block.extend_from_slice(&self.head_first);
+        } else {
+            block.extend_from_slice(&self.head_cached);
+        }
         if let Some(n) = len {
             length_field(n, &mut block);
         }
         date_field(date, &mut block);
-        frame::write_headers(out, id, &block, silent, self.peer_frame);
+        write_block(
+            out,
+            id,
+            &block,
+            silent,
+            self.peer_frame,
+            &mut self.table_update,
+        );
         self.head_buf = block;
         if silent {
             self.finish(out, id, false);
@@ -1714,7 +1806,14 @@ impl H2 {
             if end {
                 s.turn = false;
                 if !s.trailers.is_empty() {
-                    frame::write_headers(out, id, &s.trailers, true, self.peer_frame);
+                    write_block(
+                        out,
+                        id,
+                        &s.trailers,
+                        true,
+                        self.peer_frame,
+                        &mut self.table_update,
+                    );
                 }
                 self.finish(out, id, true);
             } else if s.unsent() > 0 {
@@ -1771,6 +1870,12 @@ fn head_block(status: u16, lines: &[u8], len: Option<u64>, date: &[u8]) -> Vec<u
 /// connection-specific ones, no content-length (Rust sets it). A line with
 /// no name (eg. a pseudo header `:x`) is dropped.
 fn push_lines(lines: &[u8], block: &mut Vec<u8>) {
+    each_line(lines, |name, value| encode_field(&name, value, block));
+}
+
+/// Calls `f` with the name (lowercase) and the value of each line that
+/// goes into an HTTP/2 block: see [push_lines].
+fn each_line<'a>(lines: &'a [u8], mut f: impl FnMut(Vec<u8>, &'a [u8])) {
     for line in lines.split(|&c| c == b'\n') {
         let Some(at) = line.iter().position(|&c| c == b':') else {
             continue;
@@ -1787,7 +1892,7 @@ fn push_lines(lines: &[u8], block: &mut Vec<u8>) {
         ) {
             continue;
         }
-        encode_field(&name, line[at + 1..].trim_ascii(), block);
+        f(name, line[at + 1..].trim_ascii());
     }
 }
 
@@ -1798,6 +1903,33 @@ fn give_back(out: &mut Vec<u8>, id: u32, r: &mut Recv) {
         frame::write_window(out, id, r.acked as u32);
         r.window += r.acked as i64;
         r.acked = 0;
+    }
+}
+
+/// Writes a header block. A size update that a new SETTINGS_HEADER_TABLE_SIZE
+/// of the client needs goes first (RFC 7541 4.2). It starts with size 0:
+/// after more than one SETTINGS the smallest size must come first, and 0
+/// is never more than it. Only [cache_head] puts entries in the table, and
+/// it builds them again after a change.
+fn write_block(
+    out: &mut Vec<u8>,
+    id: u32,
+    block: &[u8],
+    end_stream: bool,
+    max: usize,
+    update: &mut Option<usize>,
+) {
+    match update.take() {
+        Some(size) => {
+            let mut with = Vec::with_capacity(block.len() + 6);
+            with.push(0x20);
+            if size > 0 {
+                hpack::write_int(size, 5, 0x20, &mut with);
+            }
+            with.extend_from_slice(block);
+            frame::write_headers(out, id, &with, end_stream, max);
+        }
+        None => frame::write_headers(out, id, block, end_stream, max),
     }
 }
 

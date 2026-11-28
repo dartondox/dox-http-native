@@ -1412,13 +1412,6 @@ mod conn {
         assert_eq!(c.h2.open(), 0);
     }
 
-    fn fields_of(block: &[u8]) -> Vec<String> {
-        decode(block)
-            .iter()
-            .map(|(n, v)| format!("{n}: {v}"))
-            .collect()
-    }
-
     /// The block of `:status` and the lines is kept: the next answers with
     /// the same lines reuse it, new lines or a new status make a new one.
     #[test]
@@ -1437,22 +1430,162 @@ mod conn {
             v.push(date.to_string());
             v
         };
+        // one decoder for the connection: the blocks name table entries
+        let mut d = Decoder::new(4096);
         let fs = c.answer(0, 200, a, b"one");
         let more = ["content-type: application/json", "x-a: 1"];
-        assert_eq!(fields_of(&fs[0].1), want("200", &more, 3));
+        assert_eq!(fields_with(&mut d, &fs[0].1), want("200", &more, 3));
         let fs = c.answer(1, 200, a, b"second body");
-        assert_eq!(fields_of(&fs[0].1), want("200", &more, 11));
+        assert_eq!(fields_with(&mut d, &fs[0].1), want("200", &more, 11));
         let fs = c.answer(2, 200, b, b"x");
         assert_eq!(
-            fields_of(&fs[0].1),
+            fields_with(&mut d, &fs[0].1),
             want("200", &["content-type: text/plain"], 1)
         );
         let fs = c.answer(3, 404, b, b"");
         assert_eq!(
-            fields_of(&fs[0].1),
+            fields_with(&mut d, &fs[0].1),
             want("404", &["content-type: text/plain"], 0)
         );
         assert_eq!(c.h2.open(), 0);
+    }
+
+    /// Decodes with the decoder of the client: it keeps its dynamic table
+    /// from block to block, as a real client does.
+    fn fields_with(d: &mut Decoder, block: &[u8]) -> Vec<String> {
+        let mut out = Vec::new();
+        d.decode(block, usize::MAX, |n, v| {
+            out.push(format!(
+                "{}: {}",
+                String::from_utf8_lossy(n),
+                String::from_utf8_lossy(v)
+            ))
+        })
+        .unwrap();
+        out
+    }
+
+    /// The first answer adds the lines to the client's table; the next
+    /// ones name them with one byte each. New lines clear the table and
+    /// add theirs. The client decodes each block to the right fields.
+    #[test]
+    fn hpack_table_names_repeated_lines() {
+        let mut c = Client::new(250);
+        let mut d = Decoder::new(4096);
+        for id in (1..=11).step_by(2) {
+            c.get(id, GET);
+        }
+        let a = b"content-type: application/json\r\nx-frame-options: SAMEORIGIN\r\nvary: Accept-Encoding\r\n";
+        let b = b"content-type: text/plain\r\n";
+        let want = |more: &[&str], len: usize| {
+            let mut v = vec![":status: 200".to_string()];
+            v.extend(more.iter().map(|s| s.to_string()));
+            v.push(format!("content-length: {len}"));
+            v.push("date: Thu, 01 Jan 2026 00:00:00 GMT".to_string());
+            v
+        };
+        let more_a = [
+            "content-type: application/json",
+            "x-frame-options: SAMEORIGIN",
+            "vary: Accept-Encoding",
+        ];
+        let first = c.answer(0, 200, a, b"one");
+        assert_eq!(fields_with(&mut d, &first[0].1), want(&more_a, 3));
+        // starts with two size updates: 0, then 4096
+        assert_eq!(first[0].1[0], 0x20);
+        let second = c.answer(1, 200, a, b"two!");
+        assert_eq!(fields_with(&mut d, &second[0].1), want(&more_a, 4));
+        // :status (1 byte), 3 index bytes, then content-length and date
+        assert!(
+            second[0].1.len() < first[0].1.len() / 2,
+            "{:?}",
+            second[0].1
+        );
+        assert_eq!(&second[0].1[1..4], &[0x80 | 64, 0x80 | 63, 0x80 | 62]);
+        let third = c.answer(2, 200, a, b"3");
+        assert_eq!(fields_with(&mut d, &third[0].1), want(&more_a, 1));
+        // new lines: the table is cleared and gets these
+        let fs = c.answer(3, 200, b, b"plain");
+        assert_eq!(
+            fields_with(&mut d, &fs[0].1),
+            want(&["content-type: text/plain"], 5)
+        );
+        let fs = c.answer(4, 200, b, b"again");
+        assert_eq!(
+            fields_with(&mut d, &fs[0].1),
+            want(&["content-type: text/plain"], 5)
+        );
+        // and back: added again, not named by old indexes
+        let fs = c.answer(5, 200, a, b"back");
+        assert_eq!(fields_with(&mut d, &fs[0].1), want(&more_a, 4));
+        assert_eq!(c.h2.open(), 0);
+    }
+
+    fn table_size(c: &mut Client, size: u32) {
+        let mut s = Vec::new();
+        s.extend_from_slice(&1u16.to_be_bytes()); // HEADER_TABLE_SIZE
+        s.extend_from_slice(&size.to_be_bytes());
+        c.send(frame::SETTINGS, 0, 0, &s);
+    }
+
+    /// A client that sets SETTINGS_HEADER_TABLE_SIZE gets a size update at
+    /// the start of the next block (RFC 7541 4.2). With 0, nothing is
+    /// added to the table: each block names the lines in full.
+    #[test]
+    fn hpack_table_size_zero() {
+        let mut c = Client::new(250);
+        let mut d = Decoder::new(4096);
+        c.get(1, GET);
+        c.get(3, GET);
+        let a = b"content-type: application/json\r\n";
+        // the table is used first
+        let fs = c.answer(0, 200, a, b"x");
+        fields_with(&mut d, &fs[0].1);
+        table_size(&mut c, 0);
+        let fs = c.answer(1, 200, a, b"y");
+        let block = &fs[0].1;
+        // a size update to 0 first, and no field is added (no 0x40 form)
+        assert_eq!(block[0], 0x20);
+        let fields = fields_with(&mut d, block);
+        assert!(fields.contains(&"content-type: application/json".to_string()));
+        // the client's table: size 0, no entry
+        assert_eq!(d.max_size(), 0);
+        assert_eq!(d.table().0, 0);
+    }
+
+    /// Two size changes before the next block: the update starts with 0,
+    /// the smallest, then gives the last size (RFC 7541 4.2).
+    #[test]
+    fn hpack_table_two_size_changes() {
+        let mut out = Vec::new();
+        let mut update = Some(4096);
+        super::super::write_block(&mut out, 1, &[0x88], true, 16384, &mut update);
+        assert_eq!(update, None);
+        // 9 bytes of frame header, then 0x20 (size 0), then 4096
+        assert_eq!(&out[9..], &[0x20, 0x3f, 0xe1, 0x1f, 0x88]);
+        let mut out = Vec::new();
+        let mut update = Some(0);
+        super::super::write_block(&mut out, 1, &[0x88], true, 16384, &mut update);
+        assert_eq!(&out[9..], &[0x20, 0x88]);
+    }
+
+    /// A table too small for the lines: they go as literals, and the block
+    /// still decodes.
+    #[test]
+    fn hpack_table_too_small_for_the_lines() {
+        let mut c = Client::new(250);
+        let mut d = Decoder::new(4096);
+        table_size(&mut c, 100);
+        for id in [1, 3] {
+            c.get(id, GET);
+        }
+        let a = b"content-type: application/json\r\nx-frame-options: SAMEORIGIN\r\nx-a: 1\r\n";
+        for seq in 0..2 {
+            let fs = c.answer(seq, 200, a, b"z");
+            let fields = fields_with(&mut d, &fs[0].1);
+            assert_eq!(fields.len(), 6, "{fields:?}");
+            assert_eq!(fields[3], "x-a: 1");
+        }
     }
 
     /// A body that fits one frame and the windows goes out at once, with
