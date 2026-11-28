@@ -67,6 +67,46 @@ class NativeRequest extends Stream<Uint8List> implements HttpRequest {
   @override
   late final Uri uri = _uri(_target);
 
+  /// The path of the request, with no query. Always the same as
+  /// `uri.path`, but a plain target (like `/api/users?page=2`) makes no
+  /// [Uri]: the path is the text before `?` as it came.
+  late final String path = plainPath(_target) ?? uri.path;
+
+  /// The part of [target] before `?`, when [Uri] gives it back unchanged
+  /// as the path. Else null. Plain means: it starts with one `/`, has no
+  /// `//`, no `#`, no segment that starts with `.`, and only characters
+  /// that a path keeps as they are (no `%`, no space, no non-ASCII).
+  static String? plainPath(String target) {
+    int n = target.length;
+    if (n == 0 || target.codeUnitAt(0) != 0x2f) return null;
+    int prev = 0x2f;
+    for (int i = 1; i < n; i++) {
+      int c = target.codeUnitAt(i);
+      if (c == 0x3f) {
+        // `?`: the rest is the query. A `#` in it changes the query, not
+        // the path, but stay with the full parse for it.
+        for (int j = i + 1; j < n; j++) {
+          if (target.codeUnitAt(j) == 0x23) return null;
+        }
+        return target.substring(0, i);
+      }
+      if (c >= 128 || !_pathSafe[c]) return null;
+      // `//`, or a segment that starts with `.` (`/.`, `/..`, `/.well-known`)
+      if (prev == 0x2f && (c == 0x2f || c == 0x2e)) return null;
+      prev = c;
+    }
+    return target;
+  }
+
+  /// ASCII characters that a [Uri] path keeps as they are: letters,
+  /// digits, `-._~`, `!$&'()*+,;=`, `:@` and `/` (RFC 3986 pchar).
+  static final List<bool> _pathSafe = List<bool>.generate(128, (int c) {
+    if (c >= 0x30 && c <= 0x39) return true;
+    if (c >= 0x41 && c <= 0x5a) return true;
+    if (c >= 0x61 && c <= 0x7a) return true;
+    return "-._~!\$&'()*+,;=:@/".codeUnits.contains(c);
+  });
+
   /// A plain path (no query) skips the full parse. Same result.
   static Uri _uri(String target) {
     bool plain =
